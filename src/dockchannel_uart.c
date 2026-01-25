@@ -28,7 +28,6 @@ int dockchannel_uart_init(void)
     }
 
     printf("Initialized dockchannel UART at 0x%lx\n", uart_base);
-
     return 0;
 }
 
