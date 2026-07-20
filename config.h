@@ -13,7 +13,7 @@
 // Minimal build for bring-up
 //#define BRINGUP
 // Disable display configuration / bringup on desktop devices
-//#define NO_DISPLAY
+#define NO_DISPLAY
 
 // Print RTKit logs to the console
 //#define RTKIT_SYSLOG
@@ -24,7 +24,7 @@
 //#define TARGET_BOARD 0x34
 
 // Switch the DFU USB-C port to debugusb
-// #define USE_DEBUG_USB
+#define USE_DEBUG_USB
 
 #ifdef RELEASE
 # define FB_SILENT_MODE
