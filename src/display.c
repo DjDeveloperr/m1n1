@@ -103,6 +103,24 @@ static const display_config_t display_config_m2_ultra = {
     .die = 1,
 };
 
+/*
+ * T6050 keeps the internal display pipeline at the traditional paths.  Use the
+ * m1n1 DCP alias "dcp" (matching linux-asahi convention) and the T6050 pmgr
+ * device "DISP_CPU" (from the captured ADT; DISP0_CPU0 does not exist on
+ * T6050).  kboot uses dcp_alias when reserving the iBoot framebuffer for Linux.
+ *
+ * The four external T6050 pipelines use the ATC/DPXBAR/display-crossbar graph,
+ * not the legacy (lp)dptx-phy path below.  Keep this configuration internal
+ * only until that routing and ownership contract has a separate implementation.
+ */
+static const display_config_t display_config_m5_pro_max_internal = {
+    .dcp = "/arm-io/dcp",
+    .dcp_dart = "/arm-io/dart-dcp",
+    .disp_dart = "/arm-io/dart-disp0",
+    .pmgr_dev = "DISP_CPU",
+    .dcp_alias = "dcp",
+};
+
 #define abs(x) ((x) >= 0 ? (x) : -(x))
 
 u64 display_mode_fb_size(dcp_timing_mode_t *mode)
@@ -247,7 +265,9 @@ const display_config_t *display_get_config(void)
 {
     const display_config_t *conf = NULL;
 
-    if (adt_is_compatible(adt, 0, "J473AP"))
+    if (adt_is_compatible(adt, 0, "J714sAP"))
+        conf = &display_config_m5_pro_max_internal;
+    else if (adt_is_compatible(adt, 0, "J473AP"))
         conf = &display_config_m2;
     else if (adt_is_compatible(adt, 0, "J474sAP") || adt_is_compatible(adt, 0, "J475cAP"))
         conf = &display_config_m2_pro_max;
