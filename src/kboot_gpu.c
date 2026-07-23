@@ -490,6 +490,47 @@ static int fdt_set_aux_opp(void *dt, int gpu, const char *prop, const struct aux
     return 0;
 }
 
+static int dt_set_gpu_g17_carveouts(void *dt)
+{
+    /*
+     * G17 / M5 (T6050 and family) has no validated GPU support yet: there is no
+     * perf-state, power, firmware-ABI, initdata, or UATv2/PPL/KSM contract for
+     * it (see research/gpu/GPU_M3_M4_M5_IMPLEMENTATION_PLAN_2026-07-23.md).
+     *
+     * The only safe, correct action today is to reserve the GPU carveouts that
+     * iBoot already preloaded, so Linux does not reuse that memory. Every
+     * base/size comes straight from the live ADT /arm-io/sgx node (grade-A
+     * verified in research/gpu/G17_SGX_CARVEOUT_ADDRESS_ERRATUM_2026-07-23.md);
+     * nothing is hard-coded here. We publish no power tables, boot no firmware,
+     * derive no BPTP/SPTP, and write no GPU registers. This path is best-effort
+     * and must never abort an otherwise-good M5 boot.
+     */
+    printf("FDT: GPU: G17/M5 (chip 0x%x) unsupported; reserving Apple GPU "
+           "carveouts only, GPU compute disabled\n",
+           chip_id);
+
+    int sgx = adt_path_offset(adt, "/arm-io/sgx");
+    if (sgx < 0) {
+        printf("FDT: GPU: /arm-io/sgx not found, skipping GPU carveouts\n");
+        return 0;
+    }
+
+    /*
+     * Best-effort: if a target /reserved-memory node is absent (e.g. a DT
+     * without G17 GPU support), dt_set_region() logs and returns an error, but
+     * we deliberately ignore it and continue so boot is never aborted.
+     *
+     * gfx-shared-l2-region (the G17 PPL/L2 carveout) is intentionally NOT
+     * published: its ownership/semantics are still gated and no reserved-memory
+     * node consumes it yet.
+     */
+    dt_set_region(dt, sgx, "gfx-handoff", "/reserved-memory/uat-handoff");
+    dt_set_region(dt, sgx, "gfx-shared-region", "/reserved-memory/uat-pagetables");
+    dt_set_region(dt, sgx, "gpu-region", "/reserved-memory/uat-ttbs");
+
+    return 0;
+}
+
 int dt_set_gpu(void *dt)
 {
     bool has_cs_afr = false;
@@ -500,6 +541,16 @@ int dt_set_gpu(void *dt)
     u32 dies = 1;
 
     printf("FDT: GPU: Initializing GPU info\n");
+
+    /*
+     * G17 / M5 is recognized but unsupported. Reserve the iBoot-preloaded GPU
+     * carveouts and return cleanly before the G13/G14 power/initdata path,
+     * which has no G17 firmware ABI. Only T6050 is evidence-backed here; the
+     * rest of the G17X family (T6051/T6052) shares this carveout shape but is
+     * left gated until its ADT is captured.
+     */
+    if (chip_id == T6050)
+        return dt_set_gpu_g17_carveouts(dt);
 
     switch (chip_id) {
         case T8103:
