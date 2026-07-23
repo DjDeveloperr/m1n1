@@ -142,6 +142,77 @@ static const struct adt_tunable_info atc_tunables_t8122[] = {
     {"tunable_LN1_TX_SHM_CIO_DFLT", "apple,tunable-lane1-cio", 0x14000, 0x1000, true},
 };
 
+/*
+ * ============================= RFC SCAFFOLD =============================
+ * T6050 (Apple M5 Pro / M5 Max) ATC PHY fuse + tunable descriptor.
+ *
+ * STATUS: fail-closed scaffold. Nothing here is published; USB3/Thunderbolt
+ * stays unsupported (USB2 keeps working) until every UNKNOWN below is proven
+ * from silicon and M1N1_T6050_ATC_PROVEN is set to 1. DO NOT GUESS any value.
+ *
+ * VERIFIED (grade-A, captured J714s ADT research/device-tree-j714s-20260720.bin):
+ *   - the atc-phy nodes advertise compatibles "atc-phy,t6050" and "atc-phy,t6040";
+ *   - each /arm-io/atc-phyN node carries the ADT tunable property NAMES listed
+ *     in atc_tunables_t6050[] below. These replace the t8103/t8112/t8122-era
+ *     names entirely (new CIO4PLL / AUS40 / USB2PHY block layout).
+ *
+ * UNKNOWN (each blocks USB3/TB; must be read from silicon, never invented):
+ *   - reg_offset / reg_size: the register-window base+span each tunable name
+ *     programs. The t8103/t8112 offsets do NOT carry over.
+ *   - fdt_name: the apple,tunable-* class each ADT tunable maps to downstream.
+ *   - tunable-device / tunable-host: per-role composite tunables whose record
+ *     layout is not yet decoded (deliberately not listed below).
+ *   - whether T6050 consumes efuse-derived tunables at all and, if so, the
+ *     fuse_addr / fuse_bit / fuse_len / reg_offset / reg_mask per port. No
+ *     T6050 fuse map has been captured; none is fabricated here.
+ * =======================================================================
+ */
+#define M1N1_T6050_ATC_PROVEN 0 /* set to 1 only once every UNKNOWN above is proven */
+
+/*
+ * Tunable NAMES are grade-A (ADT). reg_offset/reg_size are UNKNOWN 0-sentinels
+ * and fdt_name is NULL until proven; every entry is marked non-required. Even if
+ * M1N1_T6050_ATC_PROVEN is flipped before these are filled, the reg_size == 0
+ * bounds check in dt_append_atc_tunable() rejects each record, so the consumer
+ * still fails closed. Fill from a proven driver contract, one line at a time.
+ */
+static const struct adt_tunable_info atc_tunables_t6050[] = {
+    /* ADT name (grade-A)               fdt_name  reg_offset  reg_size  required */
+    {"tunable_ATC0AXI2AF", NULL, 0, 0, false},            /* UNKNOWN window/class */
+    {"tunable_ATC0AXI2AF_LIOA", NULL, 0, 0, false},       /* UNKNOWN window/class */
+    {"tunable_ATC_FABRIC", NULL, 0, 0, false},            /* UNKNOWN window/class */
+    {"tunable_ATC_COMMON_CFG", NULL, 0, 0, false},        /* UNKNOWN window/class */
+    {"tunable_USB2PHY_HOST", NULL, 0, 0, false},          /* UNKNOWN window/class */
+    {"tunable_USB2PHY_DEV", NULL, 0, 0, false},           /* UNKNOWN window/class */
+    {"tunable_USB2PHY_DFLT", NULL, 0, 0, false},          /* UNKNOWN window/class */
+    {"tunable_AUS40CMN_SHM", NULL, 0, 0, false},          /* UNKNOWN window/class */
+    {"tunable_CIO4PLL_CORE", NULL, 0, 0, false},          /* UNKNOWN window/class */
+    {"tunable_AUSPLL_CORE", NULL, 0, 0, false},           /* UNKNOWN window/class */
+    {"tunable_LN0_RX_TOP_CIO_DFLT", NULL, 0, 0, false},   /* UNKNOWN window/class */
+    {"tunable_LN1_RX_TOP_CIO_DFLT", NULL, 0, 0, false},   /* UNKNOWN window/class */
+    {"tunable_LN0_RX_CFG_TX_OF_RXCLK", NULL, 0, 0, false},/* UNKNOWN window/class */
+    {"tunable_LN1_RX_CFG_TX_OF_RXCLK", NULL, 0, 0, false},/* UNKNOWN window/class */
+    {"tunable_UC_REGS_CIO_DFLT", NULL, 0, 0, false},      /* UNKNOWN window/class */
+    {"tunable_LN0_RX_EQ_CIO_DFLT", NULL, 0, 0, false},    /* UNKNOWN window/class */
+    {"tunable_LN1_RX_EQ_CIO_DFLT", NULL, 0, 0, false},    /* UNKNOWN window/class */
+    {"tunable_LN0_RX_EQ_DFLT", NULL, 0, 0, false},        /* UNKNOWN window/class */
+    {"tunable_LN1_RX_EQ_DFLT", NULL, 0, 0, false},        /* UNKNOWN window/class */
+};
+
+/*
+ * Fuse rows are UNKNOWN: no T6050 fuse map has been captured, and it is not even
+ * established that T6050 needs efuse-derived tunables. The single placeholder
+ * row exists only to shape-check struct atc_fuse_info and is inert: fuse_len
+ * 0xff forces read_fuse()'s (fuse_bit + fuse_len > 64) guard to reject it
+ * WITHOUT any MMIO read, so it is safe even if the gate is flipped early.
+ * Replace with proven per-port rows (and add matching "atc-phy,t6050" /
+ * "atc-phy,t6040" entries to atc_fuses[]) once they exist. DO NOT guess.
+ */
+static const struct atc_fuse_info atc_fuses_t6050_port0[] = {
+    /* {fuse_addr, fuse_bit, fuse_len, reg_offset, reg_mask} -- ALL UNKNOWN */
+    {0, 0, 0xff, 0, 0}, /* inert placeholder: read_fuse() rejects len>64, no read */
+};
+
 static const struct atc_fuse_info atc_fuses_t8103_port0[] = {
     {0x23d2bc434, 9, 6, CIO3PLL_DCO_NCTRL, CIO3PLL_DCO_COARSEBIN_EFUSE0},
     {0x23d2bc434, 15, 6, CIO3PLL_DCO_NCTRL, CIO3PLL_DCO_COARSEBIN_EFUSE1},
@@ -414,6 +485,40 @@ static int dt_append_atc_tunable(void *dt, int adt_node, int fdt_node,
     return 0;
 }
 
+/*
+ * RFC scaffold consumer for the T6050/T6040 ATC PHY. Fail-closed: while
+ * M1N1_T6050_ATC_PROVEN is 0 this only reports that USB3/Thunderbolt is
+ * unsupported and returns, publishing nothing. The gated-off body shows exactly
+ * where a proven descriptor plugs in and references the scaffold tables so they
+ * stay compile-shape-checked, but it never runs until the gate is set.
+ */
+static int dt_atc_setup_t6050(void *dt, int adt_node, int fdt_node, const char *adt_path)
+{
+    printf("FDT: ATC PHY %s: T6050/T6040 (M5) tunable+fuse descriptor unproven; "
+           "USB3/Thunderbolt unsupported, USB2 only\n",
+           adt_path);
+
+    if (!M1N1_T6050_ATC_PROVEN)
+        return 0; /* fail closed: nothing published, USB2 keeps working */
+
+    /*
+     * Gated off (M1N1_T6050_ATC_PROVEN == 0). Wiring shown for review only.
+     * Fill reg_offset/reg_size/fdt_name in atc_tunables_t6050[] and the per-port
+     * fuse rows first; the 0-size / out-of-range guards keep this inert until
+     * then, and any still-missing required tunable routes back to the caller's
+     * USB3/Thunderbolt cleanup path exactly as for other SoCs.
+     */
+    for (size_t i = 0; i < ARRAY_SIZE(atc_tunables_t6050); ++i) {
+        if (dt_append_atc_tunable(dt, adt_node, fdt_node, &atc_tunables_t6050[i]))
+            return -1;
+    }
+    if (dt_append_atc_fuses_helper(dt, fdt_node, atc_fuses_t6050_port0,
+                                   ARRAY_SIZE(atc_fuses_t6050_port0)))
+        return -1;
+
+    return 0;
+}
+
 static void dt_copy_atc_tunables(void *dt, const char *adt_path, const char *dt_alias, int port)
 {
     int ret;
@@ -433,6 +538,19 @@ static void dt_copy_atc_tunables(void *dt, const char *adt_path, const char *dt_
     int fdt_node = fdt_path_offset(dt, fdt_path);
     if (fdt_node < 0) {
         printf("FDT: Unable to find path %s for alias %s\n", fdt_path, dt_alias);
+        return;
+    }
+
+    /*
+     * T6050/T6040 (Apple M5) ATC PHY: recognized, but its tunable+fuse
+     * descriptor is not yet proven (see the RFC scaffold above). Hand off to the
+     * fail-closed consumer, which publishes nothing and leaves USB2 working,
+     * instead of walking the legacy tables that do not match this SoC's ADT
+     * tunable set (grade-A: research/device-tree-j714s-20260720.bin).
+     */
+    if (adt_is_compatible_at(adt, adt_node, "atc-phy,t6050", 0) ||
+        adt_is_compatible_at(adt, adt_node, "atc-phy,t6040", 0)) {
+        dt_atc_setup_t6050(dt, adt_node, fdt_node, adt_path);
         return;
     }
 
