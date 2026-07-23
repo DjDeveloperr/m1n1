@@ -1101,9 +1101,9 @@ struct adt_tunable_info {
 };
 
 static const struct adt_tunable_info usb4_nhi_tunables[] = {
-    {"hi_up_tx_desc_fabric_tunables", "apple,tunable-nhi", 0xf0000, 0x4000, true},
+    {"hi_up_tx_desc_fabric_tunables", "apple,tunable-nhi", 0xe8000, 0x4000, true},
     {"hi_up_tx_data_fabric_tunables", "apple,tunable-nhi", 0xec000, 0x4000, true},
-    {"hi_up_rx_desc_fabric_tunables", "apple,tunable-nhi", 0xe8000, 0x4000, true},
+    {"hi_up_rx_desc_fabric_tunables", "apple,tunable-nhi", 0xf0000, 0x4000, true},
     {"hi_up_wr_fabric_tunables", "apple,tunable-nhi", 0xf4000, 0x4000, true},
     {"hi_up_merge_fabric_tunables", "apple,tunable-nhi", 0xf8000, 0x4000, true},
     {"hi_dn_merge_fabric_tunables", "apple,tunable-nhi", 0xfc000, 0x4000, true},
