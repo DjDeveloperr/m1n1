@@ -424,6 +424,26 @@ static void dt_copy_atc_tunables(void *dt, const char *adt_path, const char *dt_
     if (adt_node < 0)
         return;
 
+    /*
+     * T6050 (Apple M5 Pro/Max), together with the T6040 die it shares an
+     * atc-phy compatible with, advertises an ATC PHY whose ADT tunable set is
+     * unlike every earlier generation -- e.g. tunable_ATC_COMMON_CFG,
+     * tunable_USB2PHY_{HOST,DEV,DFLT}, tunable_AUS40CMN_SHM, tunable_CIO4PLL_CORE
+     * and the tunable_LN{0,1}_RX_*_CIO_DFLT family (grade-A: captured J714s ADT,
+     * research/device-tree-j714s-20260720.bin). None of the tables below
+     * describe those tunables, and the matching efuse fields are unknown, so
+     * USB3/Thunderbolt cannot be configured. Recognize the PHY explicitly and
+     * fail closed to USB2 here, rather than walk the legacy tunable table and
+     * emit a misleading "ADT: tunable ... not found" error mid-way through.
+     */
+    if (adt_is_compatible_at(adt, adt_node, "atc-phy,t6050", 0) ||
+        adt_is_compatible_at(adt, adt_node, "atc-phy,t6040", 0)) {
+        printf("FDT: ATC PHY %s: T6050/T6040 (M5) tunable+fuse descriptor not yet "
+               "implemented; USB3/Thunderbolt unsupported, USB2 only\n",
+               adt_path);
+        return;
+    }
+
     const char *fdt_path = fdt_get_alias(dt, dt_alias);
     if (fdt_path == NULL) {
         printf("FDT: Unable to find alias %s\n", dt_alias);
