@@ -209,7 +209,7 @@ void aic_set_mask(int irq, bool active)
         write32(aic->base + aic->regs.mask_set + die * aic->intmaskset_stride + MASK_REG(irq),
                 MASK_BIT(irq));
     else
-        write32(aic->base + aic->regs.mask_clr + die * aic->intmaskset_stride + MASK_REG(irq),
+        write32(aic->base + aic->regs.mask_clr + die * aic->intmaskclear_stride + MASK_REG(irq),
                 MASK_BIT(irq));
 }
 

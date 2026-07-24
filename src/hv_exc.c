@@ -471,16 +471,6 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                 }
             }
             return true;
-        /* m1n1_windows change - advertise GIC */
-        case SYSREG_ISS(ID_AA64PFR0_EL1):
-            if(is_read) {
-                u64 pfr0_value = mrs(ID_AA64PFR0_EL1);
-                regs[rt] = pfr0_value | ((0x1 & 0xF) << 24);
-            }
-            else{
-                msr(ID_AA64PFR0_EL1, regs[rt]);
-            }
-            return true;
 #endif
         /* m1n1_windows change - Trap the ARM standard PMU regs */
         case SYSREG_ISS(SYS_PMCR_EL0):
@@ -1221,7 +1211,7 @@ void hv_exc_irq(struct exc_info *ctx)
     u64 misr = mrs(ICH_MISR_EL2);
     u64 eisr = mrs(ICH_EISR_EL2);
 
-    if(irq == 0 || type == 0){//maintenance IRQ?
+    if(type == 0){//maintenance IRQ?
         if(misr != 0 && eisr != 0){
             for(int lr = 0; lr < 8; lr++){
                 if(eisr & BIT(lr)){
@@ -1289,7 +1279,7 @@ void hv_exc_irq(struct exc_info *ctx)
     else{
         virq_t pending = { 
             .vintid = irq, 
-            .priority = 0x40, 
+            .priority = hv_vgic3_get_priority(irq),
             .active = false, 
             .pending = true,
             .hw_status = false,

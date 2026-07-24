@@ -81,7 +81,9 @@
 #define ITS_BASE_36_BIT 0xF20000000
 #define ITS_BASE_42_BIT 0x5200000000
 
-#define ENABLE_VGIC_LOGGING 1
+#ifndef ENABLE_VGIC_LOGGING
+#define ENABLE_VGIC_LOGGING 0
+#endif
 
 #if ENABLE_VGIC_LOGGING
 #define vgic_log(...) printf(__VA_ARGS__)
@@ -1671,6 +1673,7 @@ u64 hv_vgic3_read_lr(u32 lr_num){
             return mrs(ICH_LR7_EL2);
             break;
     }
+    return 0;
 }
 
 void hv_vgic3_write_lr(u32 lr_num, u64 lr_val){
@@ -1724,6 +1727,8 @@ void hv_vgic3_inject_irq(u32 vintid, u8 priority, bool active, bool pending, boo
     
 
     int free_lr = hv_vgic3_get_free_lr();
+    if (free_lr < 0)
+        return;
     hv_vgic3_write_lr(free_lr, val);
     sysop("isb");
 }
