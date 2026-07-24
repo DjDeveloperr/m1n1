@@ -739,9 +739,9 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
             //
             // sets an IRQ to pending
             //
-            u32 reg_num, irq_num;
+            u32 reg_num;
             reg_num = (relative_addr - GIC_DIST_ISPENDR0) / 4;
-            distributor->gicd_interrupt_set_pending_regs[reg_num];
+            *val = distributor->gicd_interrupt_set_pending_regs[reg_num];
             register_handled = true;
 
         }
@@ -905,10 +905,9 @@ static bool handle_vgic_redist_access(struct exc_info *ctx, u64 addr, u64 *val, 
                 //
                 // setting or clearing bits 25 and 24 (DPG1NS and DPG0) will trigger an RWP change.
                 //
-                if( ( ( (gicr_ctlr_new_val) & BIT(25) ) != 0 ) && ( (redistributors[cpu_num].rd_region.gicr_ctl_reg) & BIT(25) == 0 ) 
-                 || ( ( (gicr_ctlr_new_val) & BIT(24) ) != 0 ) && ( (redistributors[cpu_num].rd_region.gicr_ctl_reg) & BIT(24) == 0 ) 
-                 || ( ( (gicr_ctlr_new_val) & BIT(25) ) == 0 ) && ( (redistributors[cpu_num].rd_region.gicr_ctl_reg) & BIT(25) != 0 ) 
-                 || ( ( (gicr_ctlr_new_val) & BIT(24) ) == 0 ) && ( (redistributors[cpu_num].rd_region.gicr_ctl_reg) & BIT(24) != 0 ) ) {
+                if (((gicr_ctlr_new_val ^
+                      redistributors[cpu_num].rd_region.gicr_ctl_reg) &
+                     (BIT(25) | BIT(24))) != 0) {
                     //
                     // signal that RWP is going to be changed.
                     //
@@ -1734,9 +1733,8 @@ void hv_vgic3_inject_irq(u32 vintid, u8 priority, bool active, bool pending, boo
 }
 
 int hv_vgic3_do_iar1(void){
-    bool found = false;
     u8 found_priority = 0xff;
-    u8 found_lr = -1; 
+    int found_lr = -1;
     for(int lr = 0; lr < 8; lr++){
         u64 lr_val = hv_vgic3_read_lr(lr);
         if(lr_val & ICH_LR_STATE_PENDING){
