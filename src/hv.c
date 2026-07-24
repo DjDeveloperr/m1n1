@@ -83,6 +83,48 @@ void hv_init(void)
                  HCR_IMO | // Trap IRQ exceptions (for now)
                  HCR_FMO | // Trap FIQ exceptions (effectively required for now)
                  HCR_VM);  // Enable stage 2 translation
+#elif defined(ENABLE_NATIVE_AIC_PASSTHROUGH)
+    //
+    // windows-native-aic transform -- primary HCR_EL2 site (secondary cores inherit
+    // this exact value verbatim, see hv_secondary_info.hcr below and
+    // hv_init_secondary()). See docs/windows-native-aic.md for the full design.
+    //
+    // HCR_EL2.IMO (arm_cpu_regs.h:177, BIT(4)) is intentionally *not* OR'd in here.
+    // IMO and FMO (arm_cpu_regs.h:178, BIT(3)) independently gate whether physical
+    // Group 1 IRQ and FIQ exceptions are routed to EL2 instead of the guest's own EL1
+    // (this is what previously made every AIC-routed peripheral interrupt trap to EL2
+    // for translation into a vGIC injection, see the old hv_exc_irq() AIC-ack path).
+    // Clearing IMO means those physical IRQs now go straight to the guest at EL1 with
+    // zero EL2 involvement: Windows' native AIC HAL extension drives the real Apple
+    // AIC (mask/unmask/ack/EOI via AIC's own MMIO, already unhooked/passed through --
+    // see hv_vgic.c's hv_vgicv3_init()) exactly like it would on bare metal.
+    //
+    // HCR_EL2.FMO stays set: the Apple timer is FIQ-only (there is no IRQ-mode timer
+    // delivery on this hardware) and physical FIQs must keep trapping to EL2, because
+    // Windows bugchecks (0x2B/0x3D) if a raw FIQ is ever delivered to EL1. m1n1
+    // intercepts the timer FIQ, masks the physical source, and reflects it to the
+    // guest as an ordinary per-CPU AIC software IRQ with an explicit re-arm handshake
+    // -- see hv_update_fiq() and hv_timer_reflect_init() in hv_exc.c.
+    //
+    // HCR_EL2.TID3 is kept: it is unrelated to IRQ/FIQ routing. It still lets m1n1 OR
+    // in the "GICv3 CPU interface present" bit on a trapped ID_AA64PFR0_EL1 read
+    // (hv_exc.c, SYSREG_ISS(ID_AA64PFR0_EL1) case) for whatever UEFI/HAL GIC probing
+    // logic may still run before/alongside the native AIC HAL extension; the vGIC
+    // virtual CPU interface itself (ICH_*) is left enabled per-core (see
+    // hv_vgicv3_enable_virtual_interrupts() calls below and in hv_init_secondary())
+    // but is no longer used for timer delivery, only for the pre-existing, vestigial
+    // ICC_SGI1R_EL1 SGI-emulation path -- see docs/windows-native-aic.md.
+    //
+    hv_write_hcr(HCR_API | // Allow PAuth instructions
+                 HCR_APK | // Allow PAuth key registers
+                 HCR_TEA | // Trap external aborts
+                 HCR_RW |  // AArch64 guest
+                 HCR_TSC | // Trap SMC exceptions (only writable on Blizzard/Avalanche cores as the previous generations used a chicken bit for this.)
+                 HCR_TID3 | // Trap ID group 3 registers (AA64 PFR, MMFR, ISAR, AFR ID registers) - required to support the vanilla ArmGicDxe UEFI driver.
+                 HCR_AMO | // Trap SError exceptions
+                 // HCR_IMO intentionally omitted -- see comment above.
+                 HCR_FMO | // Trap FIQ exceptions -- timer-FIQ-only reflection, see above.
+                 HCR_VM);  // Enable stage 2 translation
 #else
     hv_write_hcr(HCR_API | // Allow PAuth instructions
                  HCR_APK | // Allow PAuth key registers
@@ -119,6 +161,16 @@ void hv_init(void)
     hv_vgicv3_init();
     init_vgic_irq_queues();
     //
+#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
+    //
+    // windows-native-aic: reserve the per-CPU AIC software IRQs used to reflect the
+    // timer FIQ (see hv_exc.c). Must run after hv_vgicv3_init() (which discovers
+    // vgic_nr_lrs and used to be the timer path's dependency; kept as the natural
+    // "vGIC/IRQ setup is done" point) and after smp_start_secondaries() (hv_init(),
+    // top of this function) so smp_cpu_count() is valid.
+    //
+    hv_timer_reflect_init();
+#endif
 #endif
 
     // Compute tick interval
@@ -171,6 +223,14 @@ void hv_start(void *entry, u64 regs[4])
     if (gxf_enabled())
         gl2_call(hv_set_gxf_vbar, 0, 0, 0, 0);
 
+    //
+    // windows-native-aic: this is the "secondary CPU path" half of the HCR_EL2 update
+    // in hv_init() above -- it snapshots whatever hv_init() just wrote (IMO clear,
+    // FMO set, when ENABLE_NATIVE_AIC_PASSTHROUGH is on) and hv_init_secondary() below
+    // applies the identical value, verbatim, to every other core via a plain
+    // msr(HCR_EL2, info->hcr). All cores therefore present AIC/the timer reflector to
+    // the guest identically; there is no per-core divergence to introduce here.
+    //
     hv_secondary_info.hcr = mrs(HCR_EL2);
     hv_secondary_info.hacr = mrs(HACR_EL2);
     hv_secondary_info.vtcr = mrs(VTCR_EL2);
@@ -249,6 +309,13 @@ static void hv_init_secondary(struct hv_secondary_info_t *info)
 
     msr(VBAR_EL1, _hv_vectors_start);
 
+    //
+    // windows-native-aic: secondary-CPU HCR_EL2 site. info->hcr is the value hv_init()
+    // computed on the boot CPU (see the primary HCR_EL2 comment there) captured by
+    // hv_start() above; this core gets the identical IMO-clear/FMO-set configuration,
+    // not a re-derived one, so there is nothing native-AIC-specific to add here beyond
+    // this note.
+    //
     msr(HCR_EL2, info->hcr);
     msr(HACR_EL2, info->hacr);
     msr(VTCR_EL2, info->vtcr);

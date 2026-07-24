@@ -132,6 +132,15 @@ void init_vgic_irq_queues(void);
 void hv_vgicv3_init_list_registers(void);
 int hv_vgicv3_enable_virtual_interrupts(void);
 #endif
+#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
+//
+// windows-native-aic: reserve and configure the per-CPU AIC software IRQs used by the
+// timer-FIQ reflector (hv_exc.c, hv_update_fiq()). Must run after AIC and SMP CPU
+// discovery are up (see the call site in hv_init(), hv.c) and before the guest can
+// take its first timer FIQ. See docs/windows-native-aic.md.
+//
+void hv_timer_reflect_init(void);
+#endif
 bool hv_handle_psci_smc(struct exc_info *ctx);
 int hv_handle_psci_smc_python_entry(uint64_t regs[4]);
 

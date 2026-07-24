@@ -68,7 +68,18 @@
  * the tentative solution is to do routing to any virtual CPU once we receive an IRQ, we can't assume
  * that the core that got the IRQ is the one that needs to be signaled. (for FIQs, because they're core specific,
  * we'll know which core needs to be signaled in those cases.)
- * 
+ *
+ * windows-native-aic (branch windows-native-aic, config.h: ENABLE_NATIVE_AIC_PASSTHROUGH):
+ * when that flag is on, everything above still applies to the *machinery* in this file, but
+ * hv_vgicv3_init() no longer installs the GICD/GICR/ITS hv_map_hook() MMIO traps described
+ * below -- the guest is not shown a GIC distributor at all, and instead drives the real AIC
+ * directly (its MMIO was never hooked in the first place; see docs/windows-native-aic.md). The
+ * distributor/redistributor in-memory state (vgicv3_dist/vgicv3_vcpu_redist) and the
+ * ICH_LR<n>_EL2 list-register helpers below are still allocated and initialized -- they're kept
+ * for the vestigial ICC_SGI1R_EL1 SGI-emulation path in hv_exc.c, not for the timer, which this
+ * design reflects via a per-CPU AIC software IRQ instead (hv_exc.c, hv_update_fiq() /
+ * hv_timer_reflect_init()).
+ *
  */
 #ifdef ENABLE_VGIC_MODULE
 #define DIST_BASE_36_BIT 0xF00000000
@@ -1935,23 +1946,58 @@ void hv_vgicv3_init(void)
     //
     // Map the vGIC distributor into unoccupied MMIO space.
     //
+    // windows-native-aic: this hv_map_hook() (and the redistributor/ITS ones below) is
+    // exactly what makes the guest see an emulated GICv3 distributor at dist_base
+    // instead of driving hardware directly. Under ENABLE_NATIVE_AIC_PASSTHROUGH we
+    // deliberately do NOT install it: the guest is meant to talk to the real AIC (its
+    // MMIO was never hooked here or anywhere else in this tree -- the only AIC-MMIO
+    // hook in the codebase is the opt-in host-debugger IRQ tracer in hv_aic.c, wired up
+    // on demand via proxy.c's hv_trace_irq(), never called from the boot path). The
+    // distributor struct above is still allocated/initialized -- hv_vgic3_get_priority()
+    // used to read it for the SPI (irq > 31) case when real AIC IRQs were translated
+    // into vGIC injections; that translation is gone too (see hv_exc.c's hv_exc_irq()),
+    // so in native-AIC-passthrough mode this struct is effectively unused, kept
+    // allocated only to minimize the diff and avoid a second flag axis. See
+    // docs/windows-native-aic.md.
+    //
+#ifndef ENABLE_NATIVE_AIC_PASSTHROUGH
     printf("HV vGIC DEBUG: mapping distributor into guest space\n");
     hv_map_hook(dist_base, handle_vgic_dist_access, 0x10000);
+#else
+    printf("HV vGIC DEBUG: native-AIC passthrough active, NOT mapping distributor into guest space\n");
+#endif
 
 
     /* Redistributor setup */
     printf("HV vGIC DEBUG: setting up redistributors\n");
     redistributors = heapblock_alloc(sizeof(vgicv3_vcpu_redist) * num_cpus);
     hv_vgicv3_init_redist_registers();
+    //
+    // windows-native-aic: same reasoning as the distributor above. The redistributor
+    // struct stays allocated/initialized because hv_vgic3_get_priority() still reads
+    // redistributors[cpu].sgi_region.gicr_ppi_ipriority_reg for PPI-range intids -- but
+    // in this design that's now moot too, since the timer no longer goes through
+    // hv_vgic3_get_priority()/list-register injection at all (it's an AIC software IRQ,
+    // see hv_exc.c). The guest never sees this MMIO region either way.
+    //
+#ifndef ENABLE_NATIVE_AIC_PASSTHROUGH
     printf("HV vGIC DEBUG: mapping redistributors into guest space\n");
     hv_map_hook(redist_base, handle_vgic_redist_access, ((0x20000) * num_cpus));
+#else
+    printf("HV vGIC DEBUG: native-AIC passthrough active, NOT mapping redistributors into guest space\n");
+#endif
 
     //
     // ITS setup (for MSIs - PCIe devices usually signal via these.)
     // Disabled for now, seems like direct injection into the guest is easier.
     //
+    // windows-native-aic: peripherals (PCIe/MSI included) now go straight through AIC
+    // like everything else -- there is no virtual ITS to present, so skip the hook.
+    //
     interrupt_translation_service = heapblock_alloc(sizeof(vgicv3_its));
+#ifndef ENABLE_NATIVE_AIC_PASSTHROUGH
     hv_map_hook(its_base, handle_vgic_its_access, 0x10000);
+#endif
 
     //vGIC setup is complete.
     vgic_inited = true;
