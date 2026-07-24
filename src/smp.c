@@ -508,6 +508,26 @@ int smp_get_id(uint64_t mpidr){
     return 0;
 }
 
+/*
+ * Number of CPU nodes actually populated in the ADT, i.e. the number of
+ * entries `smp_start_secondaries()` found while walking `/cpus` and
+ * recording each child's `cpu-id`/`reg` into `cpu_nodes[]` (above). This is
+ * the SoC's *real*, bin-aware core count -- e.g. a binned 10-core M2 Pro
+ * (T6020) reports 10 here, a full 12-core M2 Pro/Max reports 12 -- as
+ * opposed to a chip-id-keyed literal, which cannot distinguish bins of the
+ * same chip_id. Only valid after smp_start_secondaries() has run (hv_init()
+ * calls it before hv_vgicv3_init(), hv.c:64,119).
+ */
+int smp_cpu_count(void)
+{
+    int count = 0;
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+        if (cpu_nodes[cpu])
+            count++;
+    }
+    return count;
+}
+
 u64 smp_get_release_addr(int cpu, bool from_adt)
 {
     if(from_adt){

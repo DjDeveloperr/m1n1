@@ -1862,6 +1862,17 @@ void hv_vgicv3_init(void)
             its_base = ITS_BASE_42_BIT;
             num_cpus = 18;
             break;
+        case T6020:
+            // M2 Pro ships in two bins (10-core: 6P+4E, or 12-core: 8P+4E) --
+            // a chip_id-keyed literal cannot tell them apart, so num_cpus
+            // comes from the live ADT /cpus population (smp_start_secondaries()
+            // has already run by this point, hv.c:64,119), not a guessed
+            // constant. See docs/vgic-t6020-tables-and-init.md SS1.3.
+            dist_base = DIST_BASE_42_BIT;
+            redist_base = REDIST_BASE_42_BIT;
+            its_base = ITS_BASE_42_BIT;
+            num_cpus = (u16)smp_cpu_count();
+            break;
         // case T8010:
         // case T8015:
         // case T8011:
@@ -1885,11 +1896,6 @@ void hv_vgicv3_init(void)
             redist_base = REDIST_BASE_42_BIT;
             its_base = ITS_BASE_42_BIT;
             num_cpus = 20;
-        case T6020:
-            dist_base = DIST_BASE_42_BIT;
-            redist_base = REDIST_BASE_42_BIT;
-            its_base = ITS_BASE_42_BIT;
-            num_cpus = 10;
         case T6021:
             dist_base = DIST_BASE_42_BIT;
             redist_base = REDIST_BASE_42_BIT;
