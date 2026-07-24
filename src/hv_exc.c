@@ -1213,7 +1213,7 @@ void hv_exc_irq(struct exc_info *ctx)
 
     if(type == 0){//maintenance IRQ?
         if(misr != 0 && eisr != 0){
-            for(int lr = 0; lr < 8; lr++){
+            for(int lr = 0; lr < (int)hv_vgic3_num_lrs(); lr++){
                 if(eisr & BIT(lr)){
                     u64 lr_val = hv_vgic3_read_lr(lr);
                     u64 intd = (lr_val >> ICH_LR_VIRTUAL_SHIFT) & ICH_LR_VIRTUAL_MASK;

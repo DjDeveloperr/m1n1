@@ -602,6 +602,9 @@ u64 hv_vgic3_read_lr(u32 lr_num);
 
 void hv_vgic3_write_lr(u32 lr_num, u64 lr_val);
 
+/* Implemented ICH_LR<n>_EL2 count, discovered from ICH_VTR_EL2 at init. */
+u32 hv_vgic3_num_lrs(void);
+
 void hv_vgic3_inject_irq(u32 vintid, u8 priority, bool active, bool pending, bool hw_status, u64 hw_irq);
 
 int hv_vgic3_do_iar1(void);
@@ -625,12 +628,14 @@ typedef struct {
     virq_t     buf[VIRQ_QUEUE_SIZE];
     u32        head;
     u32        tail;
+    u32        dropped;   /* count of pushes rejected because the ring was full */
     spinlock_t p_lock;
 } virq_queue_t;
 
 static inline void virq_queue_init(virq_queue_t *q)
 {
     q->head = q->tail = 0;
+    q->dropped = 0;
     spin_init(&q->p_lock);
 }
 
@@ -645,6 +650,15 @@ static inline bool virq_queue_push(virq_queue_t *q, const virq_t *v)
         q->buf[head & (VIRQ_QUEUE_SIZE - 1)] = *v;
         __atomic_store_n(&q->head, head + 1, __ATOMIC_RELEASE);
         result = true;
+    } else {
+        /*
+         * The ring is full. Callers historically discarded this return value,
+         * so an overflow silently lost an interrupt (violating stress gate V0).
+         * Record it instead: the count is snapshotable out of band and turns a
+         * silent drop into an observable, diagnosable event without changing the
+         * fast path when the ring is not full.
+         */
+        q->dropped++;
     }
 
     sysop("dsb ishst");

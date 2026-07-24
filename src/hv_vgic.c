@@ -101,6 +101,13 @@ static u64 dist_base, redist_base, its_base;
 static u16 num_cpus;
 static bool vgic_inited;
 static u64 igrpen1;
+/*
+ * Number of implemented ICH_LR<n>_EL2 list registers. Derived at init from
+ * ICH_VTR_EL2.ListRegs instead of assuming eight: touching an unimplemented LR
+ * faults, and scanning eight when fewer exist is wasted hot-path work. Clamped
+ * to eight because hv_vgic3_read_lr/write_lr only encode ICH_LR0..ICH_LR7.
+ */
+static u32 vgic_nr_lrs = 8;
 
 
 static bool handle_vgic_its_access(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
@@ -1637,9 +1644,16 @@ u8 hv_vgic3_get_priority(u64 intd){
     return *reg_val;
 }
 
+u32 hv_vgic3_num_lrs(void)
+{
+    return vgic_nr_lrs;
+}
+
 int hv_vgic3_get_free_lr(void)
 {
-    u64 elrsr = mrs(ICH_ELRSR_EL2);
+    /* ELRSR bits above the implemented count are RES0, but mask defensively so
+     * a free-LR index is never reported for a register we cannot address. */
+    u64 elrsr = mrs(ICH_ELRSR_EL2) & (((u64)1 << vgic_nr_lrs) - 1);
     if (!elrsr)
         return -1;
     return __builtin_ctzll(elrsr);
@@ -1735,7 +1749,7 @@ void hv_vgic3_inject_irq(u32 vintid, u8 priority, bool active, bool pending, boo
 int hv_vgic3_do_iar1(void){
     u8 found_priority = 0xff;
     int found_lr = -1;
-    for(int lr = 0; lr < 8; lr++){
+    for(int lr = 0; lr < (int)vgic_nr_lrs; lr++){
         u64 lr_val = hv_vgic3_read_lr(lr);
         if(lr_val & ICH_LR_STATE_PENDING){
             u8 priority = (lr_val >> ICH_LR_PRIORITY_SHIFT) & ICH_LR_PRIORITY_MASK;
@@ -1759,7 +1773,7 @@ int hv_vgic3_do_iar1(void){
 
 void hv_vgic3_do_eoir1(u64 reg){
     u32 intd = reg & ICH_LR_VIRTUAL_MASK;
-    for(int lr = 0; lr < 8; lr++){
+    for(int lr = 0; lr < (int)vgic_nr_lrs; lr++){
         u64 lr_val = hv_vgic3_read_lr(lr);
         //vgic_log("CHECKING LR: 0x%lx %d %d %d\n", lr_val, intd, (lr_val >> ICH_LR_VIRTUAL_SHIFT) & ICH_LR_VIRTUAL_MASK, lr_val & ICH_LR_STATE_ACTIVE);
         if( ((lr_val >> ICH_LR_VIRTUAL_SHIFT) & ICH_LR_VIRTUAL_MASK) == intd && (lr_val & ICH_LR_STATE_ACTIVE)){
@@ -1772,7 +1786,7 @@ void hv_vgic3_do_eoir1(u64 reg){
 void hv_vgic3_set_igrpen1(u64 reg){
     igrpen1 = reg;
     if(reg == 0){
-        for(int lr = 0; lr < 8; lr++)
+        for(int lr = 0; lr < (int)vgic_nr_lrs; lr++)
             hv_vgic3_write_lr(lr, 0);
     }
 }
@@ -1801,6 +1815,16 @@ void hv_vgicv3_init(void)
 #ifdef ENABLE_VGIC_MODULE
     printf("HV vGIC DEBUG: start\n");
     vgic_inited = false;
+    //
+    // Discover the number of implemented list registers from ICH_VTR_EL2 rather
+    // than assuming eight. ICH_VTR_EL2.ListRegs (bits [4:0]) holds count-minus-one.
+    // Clamp to eight: hv_vgic3_read_lr/write_lr only encode ICH_LR0..ICH_LR7, so
+    // any extra implemented LRs stay unused until those helpers are extended.
+    //
+    vgic_nr_lrs = (u32)((mrs(ICH_VTR_EL2) & 0x1f) + 1);
+    if (vgic_nr_lrs > 8)
+        vgic_nr_lrs = 8;
+    printf("HV vGIC DEBUG: %u list registers implemented\n", vgic_nr_lrs);
     //
     // First things first - set the parameters appropriately based on whether
     // we're running on a 36-bit or 42-bit platform.
