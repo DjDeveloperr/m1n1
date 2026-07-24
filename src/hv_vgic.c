@@ -1635,8 +1635,20 @@ u8 hv_vgic3_get_priority(u64 intd){
         reg_val = (u8 *)&redistributors[smp_id()].sgi_region.gicr_ppi_ipriority_reg[reg_num];
     }
     else{
-        reg_num = (intd - 32) / 4;
-        reg_offset = (intd - 32) % 4;
+        //
+        // GICD_IPRIORITYR<n> (offset 0x400 + 4n) holds INTIDs 4n..4n+3, so the
+        // byte for INTID N lives at byte index N of the array. The MMIO handler
+        // stores at reg_num = (offset - GIC_DIST_IPRIORITYR0) / 4 == N / 4 with
+        // no -32 bias; read it back the same way. The previous (intd - 32) / 4
+        // returned the priority programmed for INTID (intd - 32).
+        //
+        // 255 words cover INTIDs 0..1019 (GICD_IPRIORITYR254); anything above
+        // that has no backing slot, so return the reset priority.
+        //
+        if(intd > 1019)
+            return 0;
+        reg_num = intd / 4;
+        reg_offset = intd % 4;
         reg_val = (u8 *)&distributor->gicd_interrupt_priority_regs[reg_num];
     }
     reg_val += reg_offset;
@@ -1732,7 +1744,12 @@ void hv_vgic3_inject_irq(u32 vintid, u8 priority, bool active, bool pending, boo
         val |= ICH_LR_STATE_PENDING;
     if(hw_status){
         val |= ICH_LR_HW;
-        val |= hw_irq << ICH_LR_PHYSICAL_SHIFT;
+        //
+        // pINTID is a 13-bit field (bits [44:32]); an unmasked value would
+        // spill into RES0 bits and, from bit 48 up, corrupt priority/group/
+        // HW/state. Callers must not pass a physical INTID above 0x1fff.
+        //
+        val |= (hw_irq & ICH_LR_PHYSICAL_MASK) << ICH_LR_PHYSICAL_SHIFT;
     }
     else{
         val |= ICH_LR_MAINTENANCE_IRQ;

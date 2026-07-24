@@ -453,7 +453,15 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                             continue;
                         if(MPIDR_AFF1(mpidr) != aff1)
                             continue;
-                        if(!(aff0_targets & BIT( MPIDR_AFF0(mpidr))))
+                        //
+                        // ICC_SGI1R_EL1: TargetList bit n addresses the PE with
+                        // Aff0 = (RS * 16) + n. rs was decoded above but never
+                        // applied, so any SGI with RS != 0 matched the wrong
+                        // cores (BIT(aff0) against an un-shifted 16-bit list).
+                        //
+                        if((int)(MPIDR_AFF0(mpidr) >> 4) != rs)
+                            continue;
+                        if(!(aff0_targets & BIT(MPIDR_AFF0(mpidr) & 0xf)))
                             continue;
                     } else{
                         return false;
