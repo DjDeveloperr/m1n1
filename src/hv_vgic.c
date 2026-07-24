@@ -1882,30 +1882,35 @@ void hv_vgicv3_init(void)
         //     its_base = ITS_BASE_36_BIT;
         //     break;
         case T6000:
-            dist_base = DIST_BASE_42_BIT;
-            redist_base = REDIST_BASE_42_BIT;
-            its_base = ITS_BASE_42_BIT;
-            num_cpus = 8; // cannot assume that we have 10 cores for M1 Pro
         case T6001:
-            dist_base = DIST_BASE_42_BIT;
-            redist_base = REDIST_BASE_42_BIT;
-            its_base = ITS_BASE_42_BIT;
-            num_cpus = 10;
         case T6002:
+            // M1 Pro / Max / Ultra (G13X; Ultra is a multi-die part). All share
+            // the 42-bit GIC bases. The core count is ADT-derived via
+            // smp_cpu_count(), never a chip_id literal: M1 Pro alone ships as an
+            // 8-core (6P+2E) or 10-core (8P+2E) bin under a single chip_id, so a
+            // hard-coded value is wrong for at least one bin.
+            //
+            // CRITICAL BUG FIXED HERE: these three cases (and T6021/T6022 below)
+            // previously had NO `break;` and fell through the entire T60xx/T602x
+            // chain into `default:`, which prints "unsupported chip_id" and
+            // `return`s -- so the vGIC never actually initialized on ANY M1
+            // Pro/Max/Ultra or M2 Max/Ultra machine. Each set of parameters now
+            // terminates. See docs/vgic-t6020-tables-and-init.md (same
+            // ADT-derived-count reasoning as the T6020 case above).
             dist_base = DIST_BASE_42_BIT;
             redist_base = REDIST_BASE_42_BIT;
             its_base = ITS_BASE_42_BIT;
-            num_cpus = 20;
+            num_cpus = (u16)smp_cpu_count();
+            break;
         case T6021:
-            dist_base = DIST_BASE_42_BIT;
-            redist_base = REDIST_BASE_42_BIT;
-            its_base = ITS_BASE_42_BIT;
-            num_cpus = 12;
         case T6022:
+            // M2 Max / M2 Ultra: same 42-bit bases, same ADT-derived count, and
+            // the same missing-`break;` fall-through fixed.
             dist_base = DIST_BASE_42_BIT;
             redist_base = REDIST_BASE_42_BIT;
             its_base = ITS_BASE_42_BIT;
-            num_cpus = 24;
+            num_cpus = (u16)smp_cpu_count();
+            break;
         // case T6030:
         // case T6031:
         // case 0x6032:
