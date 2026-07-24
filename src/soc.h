@@ -28,6 +28,7 @@
 #define T6030 0x6030
 #define T6031 0x6031
 #define T6034 0x6034
+#define T6050 0x6050
 
 #ifdef TARGET
 

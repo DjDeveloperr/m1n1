@@ -1839,6 +1839,12 @@ void hv_vgicv3_init(void)
             its_base = ITS_BASE_36_BIT;
             num_cpus = 8;
             break;
+        case T6050:
+            dist_base = DIST_BASE_42_BIT;
+            redist_base = REDIST_BASE_42_BIT;
+            its_base = ITS_BASE_42_BIT;
+            num_cpus = 18;
+            break;
         // case T8010:
         // case T8015:
         // case T8011:
@@ -1888,6 +1894,9 @@ void hv_vgicv3_init(void)
         //     redist_base = REDIST_BASE_42_BIT;
         //     its_base = ITS_BASE_42_BIT;
         //     break;
+        default:
+            printf("HV vGIC: unsupported chip_id 0x%x, not initializing vGIC\n", chip_id);
+            return;
     }
     //
     // Step 1 - distributor setup.
