@@ -81,6 +81,9 @@ struct hv_pcpu_data {
     virq_queue_t irq_queue;
     virq_queue_t sgi_queue;
     virq_queue_t timer_queue;
+    /* One pending bit per architectural SGI INTID (0..15). */
+    u32 sgi_queued_mask;
+    u32 sgi_coalesced;
 #endif
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
     //
@@ -137,9 +140,54 @@ void init_vgic_irq_queues(void) {
         virq_queue_init(&PERCPU_N(i, irq_queue));
         virq_queue_init(&PERCPU_N(i, sgi_queue));
         virq_queue_init(&PERCPU_N(i, timer_queue));
+        __atomic_store_n(&PERCPU_N(i, sgi_queued_mask), 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&PERCPU_N(i, sgi_coalesced), 0, __ATOMIC_RELAXED);
     }
 #endif
 }
+
+#ifdef ENABLE_VGIC_MODULE
+/*
+ * A GIC SGI is a pending state, not an edge counter.  Windows can write the
+ * same ICC_SGI1R target repeatedly while that SGI is already queued.  Keeping
+ * every write in a FIFO replays stale IPIs after EOI and can corrupt scheduler
+ * state during processor startup.  Keep at most one queued instance per
+ * target/INTID; once the target removes it from the queue, a new write can
+ * become the active+pending state in hv_vgic3_inject_irq().
+ */
+static bool hv_sgi_queue_push(int cpu, const virq_t *pending)
+{
+    if (cpu < 0 || cpu >= MAX_CPUS || pending->vintid >= 16)
+        return false;
+
+    u32 bit = (u32)BIT(pending->vintid);
+    if (__atomic_fetch_or(&PERCPU_N(cpu, sgi_queued_mask), bit,
+                          __ATOMIC_ACQ_REL) & bit) {
+        __atomic_fetch_add(&PERCPU_N(cpu, sgi_coalesced), 1,
+                           __ATOMIC_RELAXED);
+        return false;
+    }
+
+    if (virq_queue_push(&PERCPU_N(cpu, sgi_queue), pending))
+        return true;
+
+    __atomic_fetch_and(&PERCPU_N(cpu, sgi_queued_mask), ~bit,
+                       __ATOMIC_RELEASE);
+    return false;
+}
+
+static bool hv_sgi_queue_pop(virq_t *pending)
+{
+    if (!virq_queue_pop(&PERCPU(sgi_queue), pending))
+        return false;
+
+    if (pending->vintid < 16) {
+        u32 bit = (u32)BIT(pending->vintid);
+        __atomic_fetch_and(&PERCPU(sgi_queued_mask), ~bit, __ATOMIC_RELEASE);
+    }
+    return true;
+}
+#endif
 
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
 //
@@ -365,10 +413,8 @@ static void hv_carrier_drain_pending(struct exc_info *ctx)
 
     while (hv_vgic3_get_free_lr() != -1) {
         virq_t pending;
-        if (!virq_queue_pop(&PERCPU(sgi_queue), &pending))
+        if (!hv_sgi_queue_pop(&pending))
             break;
-        printf("HV: windows-native-aic: carrier inject CPU %d SGI %u with x18=0x%lx\n",
-               smp_id(), pending.vintid, ctx->regs[18]);
         hv_vgic3_inject_irq(pending.vintid, pending.priority, pending.active,
                             pending.pending, pending.hw_status, pending.hw_irq);
     }
@@ -867,21 +913,9 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                 if (hv_native_aic_windows_active() &&
                     !hv_native_aic_windows_ready() && regs[18] == 0) {
                     regs[rt] = 0x3ff;
-                    printf("HV: windows-native-aic: carrier IAR deferred on CPU %d with x18=0\n",
-                           smp_id());
                 } else {
                     regs[rt] = hv_vgic3_do_iar1();
                 }
-                if (regs[rt] != 0x3ff &&
-                    regs[rt] != HV_GIC_TIMER_P_INTID &&
-                    regs[rt] != HV_GIC_TIMER_V_INTID)
-                    printf("R: ICC_IAR1_EL1: CPU %d 0x%lx x18=0x%lx x19=0x%lx "
-                           "ELR=0x%lx SPSR=0x%lx\n",
-                           smp_id(), regs[rt], regs[18], regs[19], ctx->elr,
-                           ctx->spsr);
-            }
-            else{
-                printf("W: ICC_IAR1_EL1: 0x%lx\n", regs[rt]);
             }
             return true;
         case SYSREG_ISS(ICC_IGRPEN1_EL1):
@@ -906,13 +940,9 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
         case SYSREG_ISS(ICC_EOIR1_EL1):
             if(is_read) {
                 regs[rt] = 0;
-                printf("R: ICC_EOIR1_EL1: 0x%lx\n", regs[rt]);
             }
             else{
                 hv_vgic3_do_eoir1(regs[rt]);
-                if (regs[rt] != HV_GIC_TIMER_P_INTID &&
-                    regs[rt] != HV_GIC_TIMER_V_INTID)
-                    printf("W: ICC_EOIR1_EL1: 0x%lx\n", regs[rt]);
             }
             return true;
 #endif
@@ -993,8 +1023,8 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                         .hw_status = false,
                         .hw_irq = 0,
                     };
-                    virq_queue_push(&PERCPU_N(cpu, sgi_queue), &pending);
-                    smp_send_ipi(cpu);
+                    if (hv_sgi_queue_push(cpu, &pending))
+                        smp_send_ipi(cpu);
                 }
             }
             return true;
@@ -1864,7 +1894,7 @@ void hv_exc_irq(struct exc_info *ctx)
         //
         while(hv_vgic3_get_free_lr() != -1){
             virq_t pending;
-            if (!virq_queue_pop(&PERCPU(sgi_queue), &pending))
+            if (!hv_sgi_queue_pop(&pending))
                 break;
             hv_vgic3_inject_irq(
                 pending.vintid,
@@ -2070,10 +2100,8 @@ void hv_exc_fiq(struct exc_info *ctx)
             ctx->regs[18] != 0) {
             while(hv_vgic3_get_free_lr() != -1){//another CPU sent an IPI, check the sgi_queue
                 virq_t pending;
-                if (!virq_queue_pop(&PERCPU(sgi_queue), &pending))
+                if (!hv_sgi_queue_pop(&pending))
                     break;
-                printf("HV: windows-native-aic: FIQ inject CPU %d SGI %u x18=0x%lx\n",
-                       smp_id(), pending.vintid, ctx->regs[18]);
                 hv_vgic3_inject_irq(
                     pending.vintid,
                     pending.priority,
