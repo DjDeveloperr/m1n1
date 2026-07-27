@@ -103,21 +103,21 @@ static bool handle_native_aic_transition(struct exc_info *ctx, u64 addr, u64 *va
     bool config_write = write && width == 2 &&
                         addr == aic->base + AIC2_GLOBAL_CONFIG;
 
-    /*
-     * Windows' native controller callback handles Apple processor-local timer
-     * sources as raw EVENT values 2/3 and IPIs as EVENT(type=IPI, reason=OTHER).
-     * Hardware raises both sources as FIQ, so the EL2 reflector asserts an IRQ
-     * and this read supplies the matching Apple EVENT token without exposing a
-     * GIC or consuming a real AIC event.
-     */
-    if (!write && width == 2 && addr == aic->base + aic->regs.event &&
-        hv_native_aic_event_read(val)) {
-        return true;
-    }
-
     /* The hook replaces the normal identity mapping for this page. */
     if (!hv_pa_rw(ctx, addr, val, write, width))
         return false;
+
+    /*
+     * A post-handoff timer/IPI is signaled by a real AIC software-doorbell
+     * IRQ. Consume that physical EVENT first, then expose the processor-local
+     * source token expected by the Windows AIC HAL extension.
+     */
+    if (!write && width == 2 && addr == aic->base + aic->regs.event) {
+        u64 raw_event = *val;
+
+        if (hv_native_aic_event_read(raw_event, val))
+            return true;
+    }
 
     if (config_write && (*val & AIC2_GLOBAL_CONFIG_ENABLE) &&
         !__atomic_load_n(&mu_aic_ready, __ATOMIC_ACQUIRE) &&

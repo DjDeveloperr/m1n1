@@ -137,6 +137,7 @@ struct hv_pcpu_data {
     bool timer_v_reflection_pending;
     bool timer_p_event_unread;
     bool timer_v_event_unread;
+    bool native_doorbell_posted;
     bool carrier_timer_ready;
     bool carrier_x18_repair_logged;
     bool carrier_stack_defer_logged;
@@ -237,6 +238,7 @@ void hv_timer_reflect_init(void)
         PERCPU_N(cpu, timer_v_reflection_pending) = false;
         PERCPU_N(cpu, timer_p_event_unread) = false;
         PERCPU_N(cpu, timer_v_event_unread) = false;
+        PERCPU_N(cpu, native_doorbell_posted) = false;
         PERCPU_N(cpu, carrier_timer_ready) = false;
         PERCPU_N(cpu, carrier_x18_repair_logged) = false;
         PERCPU_N(cpu, carrier_stack_defer_logged) = false;
@@ -260,6 +262,7 @@ void hv_timer_native_enable(void)
     PERCPU(timer_v_reflection_pending) = false;
     PERCPU(timer_p_event_unread) = false;
     PERCPU(timer_v_event_unread) = false;
+    PERCPU(native_doorbell_posted) = false;
     hv_write_hcr(mrs(HCR_EL2) & ~HCR_VI);
     reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2,
             VM_TMR_FIQ_ENA_ENA_P | VM_TMR_FIQ_ENA_ENA_V);
@@ -271,11 +274,13 @@ void hv_timer_reflect_enable(void)
         aic_set_sw(HV_TIMER_P_SWIRQ(cpu), false);
         aic_set_sw(HV_TIMER_V_SWIRQ(cpu), false);
         PERCPU_N(cpu, carrier_timer_ready) = false;
+        PERCPU_N(cpu, native_doorbell_posted) = false;
     }
     PERCPU(timer_p_reflection_pending) = false;
     PERCPU(timer_v_reflection_pending) = false;
     PERCPU(timer_p_event_unread) = false;
     PERCPU(timer_v_event_unread) = false;
+    PERCPU(native_doorbell_posted) = false;
     reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2,
             VM_TMR_FIQ_ENA_ENA_P | VM_TMR_FIQ_ENA_ENA_V);
     printf("HV: windows-native-aic: enabled FIQ-to-AIC-EVENT timer bridge\n");
@@ -290,12 +295,41 @@ void hv_timer_reflect_hold(void)
         PERCPU_N(cpu, timer_v_reflection_pending) = false;
         PERCPU_N(cpu, timer_p_event_unread) = false;
         PERCPU_N(cpu, timer_v_event_unread) = false;
+        PERCPU_N(cpu, native_doorbell_posted) = false;
         PERCPU_N(cpu, carrier_timer_ready) = false;
     }
     hv_write_hcr(mrs(HCR_EL2) & ~HCR_VI);
     reg_clr(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2,
             VM_TMR_FIQ_ENA_ENA_P | VM_TMR_FIQ_ENA_ENA_V);
     printf("HV: windows-native-aic: holding timer bridge until Windows enables AIC2\n");
+}
+
+static void hv_native_aic_doorbell_sync(void)
+{
+    bool pending = PERCPU(ipi_pending) || PERCPU(timer_p_event_unread) ||
+                   PERCPU(timer_v_event_unread);
+    u64 hcr;
+
+    if (!hv_native_aic_windows_ready())
+        return;
+
+    hcr = mrs(HCR_EL2);
+    if (pending) {
+        PERCPU(native_doorbell_posted) = true;
+        /*
+         * AIC2 has no routable software-HW-IRQ facility: Linux likewise uses
+         * Fast IPIs rather than AIC1's MMIO IPI block.  Assert a CPU-local
+         * virtual IRQ only as the wakeup edge.  Windows still acknowledges
+         * its source through the trapped native AIC EVENT register below;
+         * no GIC list register or distributor state is involved.
+         */
+        if ((hcr & (HCR_IMO | HCR_VI)) != (HCR_IMO | HCR_VI))
+            hv_write_hcr(hcr | HCR_IMO | HCR_VI);
+    } else {
+        PERCPU(native_doorbell_posted) = false;
+        if (hcr & (HCR_IMO | HCR_VI))
+            hv_write_hcr(hcr & ~(HCR_IMO | HCR_VI));
+    }
 }
 #endif
 
@@ -616,6 +650,12 @@ static void hv_update_fiq(struct exc_info *ctx)
 
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
     if (hv_native_aic_windows_active() && hv_native_aic_windows_ready()) {
+        /* CONFIG is global, but HCR is per-CPU. Retire the startup carrier on
+         * every AP at its first post-handoff EL2 entry. */
+        if (hcr & HCR_IMO) {
+            hv_native_aic_enter_cpu();
+            hcr = mrs(HCR_EL2);
+        }
         /*
          * Windows owns AIC directly, but Apple wires the architectural timers
          * to FIQ.  Coalesce an asserted timer, suppress its physical FIQ, and
@@ -649,6 +689,7 @@ static void hv_update_fiq(struct exc_info *ctx)
             PERCPU(timer_v_reflection_pending) = false;
             PERCPU(timer_v_event_unread) = false;
         }
+        hv_native_aic_doorbell_sync();
     } else if (hv_native_aic_windows_active()) {
         /*
          * Windows calibrates its architectural clock before the AIC HAL
@@ -806,10 +847,12 @@ static void hv_update_fiq(struct exc_info *ctx)
 
     sysop("isb");
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
-    bool event_unread = PERCPU(ipi_pending) ||
-                        PERCPU(timer_p_event_unread) ||
-                        PERCPU(timer_v_event_unread);
     bool carrier_pending = hv_carrier_irq_pending();
+    bool native_pending = hv_native_aic_windows_ready() &&
+                          (PERCPU(ipi_pending) ||
+                           PERCPU(timer_p_event_unread) ||
+                           PERCPU(timer_v_event_unread));
+    hcr = mrs(HCR_EL2);
     if (carrier_pending && !PERCPU(carrier_vi_logged)) {
         printf("HV: windows-native-aic: carrier VI armed CPU %d ELR=0x%lx "
                "SPSR=0x%lx TPIDR=0x%lx\n",
@@ -817,11 +860,17 @@ static void hv_update_fiq(struct exc_info *ctx)
                mrs(TPIDR_EL1));
         PERCPU(carrier_vi_logged) = true;
     }
-    if ((hv_native_aic_windows_ready() && event_unread) || carrier_pending) {
+    if (native_pending) {
+        if ((hcr & (HCR_IMO | HCR_VI)) != (HCR_IMO | HCR_VI))
+            hv_write_hcr(hcr | HCR_IMO | HCR_VI);
+    } else if (carrier_pending) {
         if (!(hcr & HCR_VI))
             hv_write_hcr(hcr | HCR_VI);
     } else if (hcr & HCR_VI) {
-        hv_write_hcr(hcr & ~HCR_VI);
+        hcr &= ~HCR_VI;
+        if (hv_native_aic_windows_ready())
+            hcr &= ~HCR_IMO;
+        hv_write_hcr(hcr);
     }
 #elif !defined(ENABLE_VGIC_MODULE)
     if ((hcr & HCR_VF) && !fiq_pending) {
@@ -833,10 +882,42 @@ static void hv_update_fiq(struct exc_info *ctx)
 }
 
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
-bool hv_native_aic_event_read(u64 *event)
+bool hv_native_aic_event_read(u64 raw_event, u64 *event)
 {
+    u32 type = FIELD_GET(AIC_EVENT_TYPE, raw_event);
+    u32 die = FIELD_GET(AIC_EVENT_DIE, raw_event);
+    u32 irq = FIELD_GET(AIC_EVENT_NUM, raw_event);
+    u32 flat_irq = die * aic->max_irq + irq;
+    bool reserved = type == AIC_EVENT_TYPE_HW &&
+                    flat_irq >= HV_TIMER_SWIRQ_BASE &&
+                    flat_irq < HV_TIMER_SWIRQ_BASE + (2 * MAX_CPUS);
+
     if (!hv_native_aic_windows_ready() || event == NULL)
         return false;
+
+    if (raw_event != 0 && !reserved) {
+        /* A real native AIC source won arbitration ahead of the synthetic
+         * wakeup. Preserve it, then reassert the local wakeup if needed. */
+        hv_native_aic_doorbell_sync();
+        return false;
+    }
+
+    /*
+     * A reserved Mu timer reflector can race the ExitBootServices/Windows
+     * CONFIG transition on another CPU and remain latched after the bulk
+     * SW_CLEAR. These implementation-private IRQ numbers must never escape
+     * to the Windows controller: HalBeginSystemInterrupt treats the unknown
+     * line as a fatal controller result (0x5c/0x203). Consume the stale token
+     * before returning a pending processor-local source, or a spurious EVENT.
+     */
+    if (reserved) {
+        aic_set_sw(flat_irq, false);
+        aic_set_mask(flat_irq, true);
+        printf("HV: windows-native-aic: discarded stale reserved EVENT IRQ %u on CPU %d\n",
+               flat_irq, smp_id());
+    }
+
+    PERCPU(native_doorbell_posted) = false;
 
     /*
      * Fast IPIs are FIQ-class and are consumed by m1n1 for its own EL2
@@ -857,12 +938,10 @@ bool hv_native_aic_event_read(u64 *event)
         *event = 2;
         PERCPU(timer_p_event_unread) = false;
     } else {
-        return false;
+        *event = 0;
     }
 
-    if (!PERCPU(ipi_pending) && !PERCPU(timer_p_event_unread) &&
-        !PERCPU(timer_v_event_unread))
-        hv_write_hcr(mrs(HCR_EL2) & ~HCR_VI);
+    hv_native_aic_doorbell_sync();
     return true;
 }
 
@@ -946,8 +1025,8 @@ static void hv_timer_reflect_guest_rearm(bool physical, bool control_write, u64 
         PERCPU(timer_v_event_unread) = false;
         reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_V);
     }
-    if (!PERCPU(timer_p_event_unread) && !PERCPU(timer_v_event_unread))
-        hv_write_hcr(mrs(HCR_EL2) & ~HCR_VI);
+    hv_write_hcr(mrs(HCR_EL2) & ~HCR_VI);
+    hv_native_aic_doorbell_sync();
 }
 #endif
 
@@ -1822,7 +1901,16 @@ static bool hv_handle_msr(struct exc_info *ctx, u64 iss)
             u64 mpidr = (regs[rt] & 0xff) | (mrs(MPIDR_EL1) & 0xffff00);
             for (int i = 0; i < MAX_CPUS; i++)
                 if (mpidr == smp_get_mpidr(i)) {
-                    pcpu[i].ipi_queued = true;
+                    __atomic_store_n(&pcpu[i].ipi_queued, true,
+                                     __ATOMIC_RELEASE);
+                    /*
+                     * The target can take and clear the physical Fast-IPI as
+                     * soon as the system-register write is visible.  Publish
+                     * the guest-origin tag first; otherwise the target may
+                     * observe the FIQ before this cache line and discard the
+                     * Windows IPI as an EL2-only rendezvous.
+                     */
+                    sysop("dsb sy");
                     msr(SYS_IMP_APL_IPI_RR_LOCAL_EL1, regs[rt]);
                     return true;
                 }
@@ -1833,7 +1921,9 @@ static bool hv_handle_msr(struct exc_info *ctx, u64 iss)
             u64 mpidr = (regs[rt] & 0xff) | ((regs[rt] & 0xff0000) >> 8);
             for (int i = 0; i < MAX_CPUS; i++) {
                 if (mpidr == (smp_get_mpidr(i) & 0xffff)) {
-                    pcpu[i].ipi_queued = true;
+                    __atomic_store_n(&pcpu[i].ipi_queued, true,
+                                     __ATOMIC_RELEASE);
+                    sysop("dsb sy");
                     msr(SYS_IMP_APL_IPI_RR_GLOBAL_EL1, regs[rt]);
                     return true;
                 }
@@ -2312,9 +2402,9 @@ void hv_exc_fiq(struct exc_info *ctx)
             }
         }
 #endif
-        if (PERCPU(ipi_queued)) {
+        if (__atomic_exchange_n(&PERCPU(ipi_queued), false,
+                                __ATOMIC_ACQUIRE)) {
             PERCPU(ipi_pending) = true;
-            PERCPU(ipi_queued) = false;
         }
         msr(SYS_IMP_APL_IPI_SR_EL1, IPI_SR_PENDING);
         sysop("isb");
