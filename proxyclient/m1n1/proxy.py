@@ -332,6 +332,9 @@ class UartInterface(Reloadable):
             return self.reply(self.REQ_BOOT)
         except:
             # Over USB, reboots cause a reconnect
+            port = self.dev.port or ""
+            require_disconnect = "usbmodem" in port
+            saw_disconnect = not require_disconnect
             self.dev.close()
             print("Waiting for reconnection... ", end="")
             sys.stdout.flush()
@@ -341,9 +344,20 @@ class UartInterface(Reloadable):
                 try:
                     self.dev.open()
                 except serial.serialutil.SerialException:
+                    saw_disconnect = True
                     time.sleep(0.1)
                 else:
-                    break
+                    # macOS can leave the old cu.usbmodem node openable for a
+                    # short window after the target has reset. Accepting that
+                    # stale node makes chainload report "Connected" and then
+                    # time out before the replacement CDC device enumerates.
+                    # Require one observable disconnect for USB CDC ports;
+                    # UART transports keep their historical immediate-reopen
+                    # behavior.
+                    if saw_disconnect:
+                        break
+                    self.dev.close()
+                    time.sleep(0.1)
             else:
                 raise UartTimeout("Reconnection timed out")
             print(" Connected")
