@@ -8,6 +8,7 @@
 #include "string.h"
 #include "uart.h"
 #include "uartproxy.h"
+#include "utils.h"
 #include "hv_vgic.h"
 #include "aic.h"
 #include "aic_regs.h"
@@ -69,6 +70,24 @@ extern spinlock_t bhl;
 /* Standard GIC PPIs published by the Windows startup-carrier GTDT. */
 #define HV_GIC_TIMER_P_INTID     30
 #define HV_GIC_TIMER_V_INTID     27
+
+/*
+ * Windows ARM64 uses KPCR+0x24d8 (KPRCB.PanicStackBase) for synchronous
+ * kernel exceptions and KPCR+0x24e0 (KPRCB.InterruptStackBase) in
+ * KxSwitchStackAndPlayInterrupt. During AP startup TPIDR_EL1 becomes non-zero
+ * before both stacks are guaranteed writable. Treating TPIDR_EL1 alone as
+ * proof that the AP can receive a carrier SGI lets Windows take an exception
+ * or interrupt on an uninitialised stack; the resulting nested trap corrupts
+ * the PRCB and is later reported as CRITICAL_STRUCTURE_CORRUPTION (0x109).
+ *
+ * Keep this offset next to the carrier workaround rather than pretending it
+ * is architectural.  The checks are read-only and fail closed: both ends of
+ * the space consumed by KiKernelStackException must translate writable before
+ * m1n1 repairs x18 or drains an SGI to the AP.
+ */
+#define HV_WINDOWS_PANIC_STACK_SLOT_OFFSET 0x24d8
+#define HV_WINDOWS_INTERRUPT_STACK_SLOT_OFFSET 0x24e0
+#define HV_WINDOWS_PANIC_STACK_RESERVE     0x700
 #endif
 
 struct hv_pcpu_data {
@@ -77,6 +96,7 @@ struct hv_pcpu_data {
     u32 pmc_pending;
     u64 pmc_irq_mode;
     u64 exc_entry_pmcr0_cnt;
+    u64 guest_pmuserenr;
 #ifdef ENABLE_VGIC_MODULE
     virq_queue_t irq_queue;
     virq_queue_t sgi_queue;
@@ -119,6 +139,13 @@ struct hv_pcpu_data {
     bool timer_v_event_unread;
     bool carrier_timer_ready;
     bool carrier_x18_repair_logged;
+    bool carrier_stack_defer_logged;
+    bool carrier_stack_ready;
+    bool carrier_vi_logged;
+    bool carrier_irq_active;
+    u32 carrier_active_intid;
+    u32 carrier_iar_count;
+    u32 carrier_eoi_count;
 #endif
 } ALIGNED(64);
 
@@ -142,6 +169,7 @@ void init_vgic_irq_queues(void) {
         virq_queue_init(&PERCPU_N(i, timer_queue));
         __atomic_store_n(&PERCPU_N(i, sgi_queued_mask), 0, __ATOMIC_RELAXED);
         __atomic_store_n(&PERCPU_N(i, sgi_coalesced), 0, __ATOMIC_RELAXED);
+        PERCPU_N(i, guest_pmuserenr) = 0;
     }
 #endif
 }
@@ -211,6 +239,13 @@ void hv_timer_reflect_init(void)
         PERCPU_N(cpu, timer_v_event_unread) = false;
         PERCPU_N(cpu, carrier_timer_ready) = false;
         PERCPU_N(cpu, carrier_x18_repair_logged) = false;
+        PERCPU_N(cpu, carrier_stack_defer_logged) = false;
+        PERCPU_N(cpu, carrier_stack_ready) = false;
+        PERCPU_N(cpu, carrier_vi_logged) = false;
+        PERCPU_N(cpu, carrier_irq_active) = false;
+        PERCPU_N(cpu, carrier_active_intid) = 0x3ff;
+        PERCPU_N(cpu, carrier_iar_count) = 0;
+        PERCPU_N(cpu, carrier_eoi_count) = 0;
         aic_set_sw(HV_TIMER_P_SWIRQ(cpu), false);
         aic_set_sw(HV_TIMER_V_SWIRQ(cpu), false);
     }
@@ -377,8 +412,7 @@ static void hv_carrier_repair_x18(struct exc_info *ctx)
 {
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
     if (ctx == NULL || !hv_native_aic_windows_active() ||
-        hv_native_aic_windows_ready() ||
-        (FIELD_GET(SPSR_M, ctx->spsr) >> 2) != 1 || ctx->regs[18] != 0)
+        (FIELD_GET(SPSR_M, ctx->spsr) >> 2) != 1)
         return;
 
     /*
@@ -389,6 +423,57 @@ static void hv_carrier_repair_x18(struct exc_info *ctx)
      */
     u64 guest_pcr = mrs(TPIDR_EL1) & ~0xfffULL;
     if (guest_pcr == 0)
+        return;
+
+    /*
+     * Do not cache this translation. Windows changes AP page tables during
+     * bring-up and can tear the temporary KPCR mapping down after a startup
+     * timeout. A once-valid PanicStackBase is therefore not proof that a later
+     * carrier exception is safe.
+     */
+    u64 stack_slot = hv_translate(guest_pcr + HV_WINDOWS_PANIC_STACK_SLOT_OFFSET,
+                                  false, false, NULL);
+    u64 panic_stack = stack_slot ? read64(stack_slot) : 0;
+    u64 interrupt_stack_slot =
+        hv_translate(guest_pcr + HV_WINDOWS_INTERRUPT_STACK_SLOT_OFFSET,
+                     false, false, NULL);
+    u64 interrupt_stack = interrupt_stack_slot ? read64(interrupt_stack_slot) : 0;
+    bool panic_stack_ready = panic_stack >= HV_WINDOWS_PANIC_STACK_RESERVE &&
+                             hv_translate(panic_stack - 8, false, true, NULL) != 0 &&
+                             hv_translate(panic_stack - HV_WINDOWS_PANIC_STACK_RESERVE,
+                                          false, true, NULL) != 0;
+    bool interrupt_stack_ready =
+        interrupt_stack >= HV_WINDOWS_PANIC_STACK_RESERVE &&
+        hv_translate(interrupt_stack - 16, false, true, NULL) != 0 &&
+        hv_translate(interrupt_stack - HV_WINDOWS_PANIC_STACK_RESERVE,
+                     false, true, NULL) != 0;
+    bool stack_ready = panic_stack_ready && interrupt_stack_ready;
+    if (!stack_ready) {
+        if (PERCPU(carrier_stack_ready)) {
+            printf("HV: windows-native-aic: carrier CPU %d lost KPCR/panic-stack "
+                   "mapping (TPIDR=0x%lx panic=0x%lx interrupt=0x%lx "
+                   "ELR=0x%lx ESR=0x%lx FAR=0x%lx)\n",
+                   smp_id(), guest_pcr, panic_stack, interrupt_stack, ctx->elr,
+                   ctx->esr, ctx->far);
+        } else if (!PERCPU(carrier_stack_defer_logged)) {
+            printf("HV: windows-native-aic: deferring carrier CPU %d; "
+                   "exception stacks are not writable (TPIDR=0x%lx "
+                   "panic=0x%lx interrupt=0x%lx)\n",
+                   smp_id(), guest_pcr, panic_stack, interrupt_stack);
+            PERCPU(carrier_stack_defer_logged) = true;
+        }
+        PERCPU(carrier_stack_ready) = false;
+        return;
+    }
+
+    if (!PERCPU(carrier_stack_ready)) {
+        printf("HV: windows-native-aic: carrier CPU %d exception stacks ready "
+               "(panic=0x%lx interrupt=0x%lx)\n",
+               smp_id(), panic_stack, interrupt_stack);
+        PERCPU(carrier_stack_ready) = true;
+    }
+
+    if (ctx->regs[18] != 0)
         return;
 
     if (!PERCPU(carrier_x18_repair_logged)) {
@@ -407,29 +492,118 @@ static void hv_carrier_drain_pending(struct exc_info *ctx)
 {
 #if defined(ENABLE_VGIC_MODULE) && defined(ENABLE_NATIVE_AIC_PASSTHROUGH)
     hv_carrier_repair_x18(ctx);
-    if (!hv_native_aic_windows_active() || hv_native_aic_windows_ready() ||
-        ctx == NULL || ctx->regs[18] == 0)
-        return;
-
-    while (hv_vgic3_get_free_lr() != -1) {
-        virq_t pending;
-        if (!hv_sgi_queue_pop(&pending))
-            break;
-        hv_vgic3_inject_irq(pending.vintid, pending.priority, pending.active,
-                            pending.pending, pending.hw_status, pending.hw_irq);
-    }
-    while (hv_vgic3_get_free_lr() != -1) {
-        virq_t pending;
-        if (!virq_queue_pop(&PERCPU(irq_queue), &pending))
-            break;
-        printf("HV: windows-native-aic: carrier inject CPU %d IRQ %u with x18=0x%lx\n",
-               smp_id(), pending.vintid, ctx->regs[18]);
-        hv_vgic3_inject_irq(pending.vintid, pending.priority, pending.active,
-                            pending.pending, pending.hw_status, pending.hw_irq);
-    }
 #else
     (void)ctx;
 #endif
+}
+
+enum hv_carrier_queue {
+    HV_CARRIER_QUEUE_NONE,
+    HV_CARRIER_QUEUE_SGI,
+    HV_CARRIER_QUEUE_TIMER,
+    HV_CARRIER_QUEUE_IRQ,
+};
+
+static enum hv_carrier_queue hv_carrier_select_pending(virq_t *selected)
+{
+#if defined(ENABLE_VGIC_MODULE) && defined(ENABLE_NATIVE_AIC_PASSTHROUGH)
+    enum hv_carrier_queue best_queue = HV_CARRIER_QUEUE_NONE;
+    virq_t candidate;
+
+#define CONSIDER_CARRIER_QUEUE(queue, which)                                  \
+    do {                                                                      \
+        if (virq_queue_peek((queue), &candidate) &&                           \
+            (best_queue == HV_CARRIER_QUEUE_NONE ||                           \
+             candidate.priority < selected->priority)) {                      \
+            *selected = candidate;                                            \
+            best_queue = (which);                                             \
+        }                                                                     \
+    } while (0)
+
+    CONSIDER_CARRIER_QUEUE(&PERCPU(sgi_queue), HV_CARRIER_QUEUE_SGI);
+    CONSIDER_CARRIER_QUEUE(&PERCPU(timer_queue), HV_CARRIER_QUEUE_TIMER);
+    CONSIDER_CARRIER_QUEUE(&PERCPU(irq_queue), HV_CARRIER_QUEUE_IRQ);
+#undef CONSIDER_CARRIER_QUEUE
+    return best_queue;
+#else
+    (void)selected;
+    return HV_CARRIER_QUEUE_NONE;
+#endif
+}
+
+static u32 hv_carrier_do_iar1(void)
+{
+#if defined(ENABLE_VGIC_MODULE) && defined(ENABLE_NATIVE_AIC_PASSTHROUGH)
+    if (PERCPU(carrier_irq_active))
+        return 0x3ff;
+
+    virq_t selected = {.priority = 0xff};
+    enum hv_carrier_queue queue = hv_carrier_select_pending(&selected);
+    bool popped = false;
+    switch (queue) {
+        case HV_CARRIER_QUEUE_SGI:
+            popped = hv_sgi_queue_pop(&selected);
+            break;
+        case HV_CARRIER_QUEUE_TIMER:
+            popped = virq_queue_pop(&PERCPU(timer_queue), &selected);
+            break;
+        case HV_CARRIER_QUEUE_IRQ:
+            popped = virq_queue_pop(&PERCPU(irq_queue), &selected);
+            break;
+        default:
+            break;
+    }
+    if (!popped)
+        return 0x3ff;
+
+    PERCPU(carrier_irq_active) = true;
+    PERCPU(carrier_active_intid) = selected.vintid;
+    return selected.vintid;
+#else
+    return 0x3ff;
+#endif
+}
+
+static void hv_carrier_do_eoir1(u32 intid)
+{
+#if defined(ENABLE_VGIC_MODULE) && defined(ENABLE_NATIVE_AIC_PASSTHROUGH)
+    if (PERCPU(carrier_irq_active) &&
+        PERCPU(carrier_active_intid) == intid) {
+        PERCPU(carrier_irq_active) = false;
+        PERCPU(carrier_active_intid) = 0x3ff;
+    }
+#else
+    (void)intid;
+#endif
+}
+
+static bool hv_carrier_irq_pending(void)
+{
+#if defined(ENABLE_VGIC_MODULE) && defined(ENABLE_NATIVE_AIC_PASSTHROUGH)
+    if (!hv_native_aic_windows_active() || hv_native_aic_windows_ready() ||
+        !PERCPU(carrier_stack_ready) || !hv_vgic3_get_igrpen1())
+        return false;
+
+    /*
+     * J414s' Blizzard cores assert a virtual IRQ for a pending ICH LR, but the
+     * first Avalanche core can leave the same LR pending indefinitely. Keep
+     * the short-lived carrier's pending/active state in software and drive the
+     * IRQ line with HCR.VI while a deliverable Group-1 entry is queued.
+     *
+     * HCR.VI bypasses the virtual CPU interface's priority filter, so mirror
+     * the relevant VMCR checks here. A second interrupt is not deliverable
+     * until EOIR clears the software active state.
+     */
+    if (PERCPU(carrier_irq_active))
+        return false;
+
+    u8 pmr = (mrs(ICH_VMCR_EL2) >> 24) & 0xff;
+    virq_t selected = {.priority = 0xff};
+    if (hv_carrier_select_pending(&selected) != HV_CARRIER_QUEUE_NONE &&
+        selected.priority < pmr)
+        return true;
+#endif
+    return false;
 }
 
 static void hv_update_fiq(struct exc_info *ctx)
@@ -438,6 +612,7 @@ static void hv_update_fiq(struct exc_info *ctx)
     bool fiq_pending = false;
 
     hv_carrier_repair_x18(ctx);
+    hv_carrier_drain_pending(ctx);
 
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
     if (hv_native_aic_windows_active() && hv_native_aic_windows_ready()) {
@@ -496,12 +671,15 @@ static void hv_update_fiq(struct exc_info *ctx)
                 fiq_pending = true;
                 reg_clr(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_P);
                 if (!PERCPU(timer_p_reflection_pending) &&
-                    hv_vgic3_get_free_lr() != -1) {
+                    !PERCPU(carrier_irq_active)) {
                     PERCPU(timer_p_fiq_count)++;
                     PERCPU(timer_p_reflection_pending) = true;
-                    hv_vgic3_inject_irq(HV_GIC_TIMER_P_INTID,
-                                        hv_vgic3_get_priority(HV_GIC_TIMER_P_INTID),
-                                        false, true, false, 0);
+                    virq_t pending = {
+                        .vintid = HV_GIC_TIMER_P_INTID,
+                        .priority = hv_vgic3_get_priority(HV_GIC_TIMER_P_INTID),
+                        .pending = true,
+                    };
+                    virq_queue_push(&PERCPU(timer_queue), &pending);
                 }
             } else {
                 PERCPU(timer_p_reflection_pending) = false;
@@ -512,12 +690,15 @@ static void hv_update_fiq(struct exc_info *ctx)
                 fiq_pending = true;
                 reg_clr(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_V);
                 if (!PERCPU(timer_v_reflection_pending) &&
-                    hv_vgic3_get_free_lr() != -1) {
+                    !PERCPU(carrier_irq_active)) {
                     PERCPU(timer_v_fiq_count)++;
                     PERCPU(timer_v_reflection_pending) = true;
-                    hv_vgic3_inject_irq(HV_GIC_TIMER_V_INTID,
-                                        hv_vgic3_get_priority(HV_GIC_TIMER_V_INTID),
-                                        false, true, false, 0);
+                    virq_t pending = {
+                        .vintid = HV_GIC_TIMER_V_INTID,
+                        .priority = hv_vgic3_get_priority(HV_GIC_TIMER_V_INTID),
+                        .pending = true,
+                    };
+                    virq_queue_push(&PERCPU(timer_queue), &pending);
                 }
             } else {
                 PERCPU(timer_v_reflection_pending) = false;
@@ -628,7 +809,15 @@ static void hv_update_fiq(struct exc_info *ctx)
     bool event_unread = PERCPU(ipi_pending) ||
                         PERCPU(timer_p_event_unread) ||
                         PERCPU(timer_v_event_unread);
-    if (hv_native_aic_windows_ready() && event_unread) {
+    bool carrier_pending = hv_carrier_irq_pending();
+    if (carrier_pending && !PERCPU(carrier_vi_logged)) {
+        printf("HV: windows-native-aic: carrier VI armed CPU %d ELR=0x%lx "
+               "SPSR=0x%lx TPIDR=0x%lx\n",
+               smp_id(), ctx ? ctx->elr : 0, ctx ? ctx->spsr : 0,
+               mrs(TPIDR_EL1));
+        PERCPU(carrier_vi_logged) = true;
+    }
+    if ((hv_native_aic_windows_ready() && event_unread) || carrier_pending) {
         if (!(hcr & HCR_VI))
             hv_write_hcr(hcr | HCR_VI);
     } else if (hcr & HCR_VI) {
@@ -641,8 +830,6 @@ static void hv_update_fiq(struct exc_info *ctx)
         hv_write_hcr(hcr | HCR_VF);
     }
 #endif
-
-    hv_carrier_drain_pending(ctx);
 }
 
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
@@ -914,7 +1101,14 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                     !hv_native_aic_windows_ready() && regs[18] == 0) {
                     regs[rt] = 0x3ff;
                 } else {
-                    regs[rt] = hv_vgic3_do_iar1();
+                    regs[rt] = hv_carrier_do_iar1();
+                }
+                if (regs[rt] != 0x3ff) {
+                    u32 count = ++PERCPU(carrier_iar_count);
+                    if (count <= 8)
+                        printf("HV: carrier CPU %d IAR #%u INTID %lu x18=0x%lx "
+                               "ELR=0x%lx\n",
+                               smp_id(), count, regs[rt], regs[18], ctx->elr);
                 }
             }
             return true;
@@ -942,7 +1136,11 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                 regs[rt] = 0;
             }
             else{
-                hv_vgic3_do_eoir1(regs[rt]);
+                hv_carrier_do_eoir1(regs[rt] & ICH_LR_VIRTUAL_MASK);
+                u32 count = ++PERCPU(carrier_eoi_count);
+                if (count <= 8)
+                    printf("HV: carrier CPU %d EOI #%u INTID %lu\n",
+                           smp_id(), count, regs[rt] & ICH_LR_VIRTUAL_MASK);
             }
             return true;
 #endif
@@ -1149,7 +1347,7 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                     pmcr1_value |= BIT(8);
                 }
                 else {
-                    pmcr1_value &= ~(BIT(16));
+                    pmcr1_value &= ~(BIT(8));
                 }
                 sysop("isb");
                 msr(SYS_IMP_APL_PMCR1, pmcr1_value);
@@ -1434,11 +1632,13 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
         //SYSREG_MAP(SYS_PMSWINC_EL0, SYS_IMP_APL_PMC3)
         case SYSREG_ISS(SYS_PMUSERENR_EL0):
             if(is_read) {
-                regs[rt] = 0;
+                regs[rt] = PERCPU(guest_pmuserenr);
                 printf("HV PMUv3 Redirect: mrs x%ld, PMUSERENR_EL0 = 0x%lx\n", rt, regs[rt]);
             }
             else {
-                printf("HV PMUv3 Redirect (skipped write): msr PMUSERENR_EL0, x%ld = 0x%lx\n", rt, regs[rt]);
+                PERCPU(guest_pmuserenr) = regs[rt] & ~PMUSERENR_RESERVED;
+                printf("HV PMUv3 Redirect (OK): msr PMUSERENR_EL0, x%ld = 0x%lx\n",
+                       rt, PERCPU(guest_pmuserenr));
             }
            return true;
 #ifdef ENABLE_VGIC_MODULE
@@ -1921,8 +2121,7 @@ void hv_exc_irq(struct exc_info *ctx)
         return;
     }
 
-    if (hv_native_aic_windows_active() && !hv_native_aic_windows_ready() &&
-        ctx->regs[18] == 0) {
+    if (hv_native_aic_windows_active() && !hv_native_aic_windows_ready()) {
         virq_t pending = {
             .vintid = irq,
             .priority = hv_vgic3_get_priority(irq),
@@ -1932,8 +2131,9 @@ void hv_exc_irq(struct exc_info *ctx)
             .hw_irq = 0,
         };
         virq_queue_push(&PERCPU(irq_queue), &pending);
-        printf("HV: windows-native-aic: carrier deferred CPU %d IRQ %u with x18=0\n",
-               smp_id(), irq);
+        if (ctx->regs[18] == 0 || !PERCPU(carrier_stack_ready))
+            printf("HV: windows-native-aic: carrier deferred CPU %d IRQ %u "
+                   "until KPCR/panic-stack readiness\n", smp_id(), irq);
     }
     else if(hv_vgic3_get_free_lr() != -1){
         hv_vgic3_inject_irq(
@@ -2096,8 +2296,7 @@ void hv_exc_fiq(struct exc_info *ctx)
     //
     if (mrs(SYS_IMP_APL_IPI_SR_EL1) & IPI_SR_PENDING) {
 #ifdef ENABLE_VGIC_MODULE
-        if (!hv_native_aic_windows_active() || hv_native_aic_windows_ready() ||
-            ctx->regs[18] != 0) {
+        if (!hv_native_aic_windows_active() || hv_native_aic_windows_ready()) {
             while(hv_vgic3_get_free_lr() != -1){//another CPU sent an IPI, check the sgi_queue
                 virq_t pending;
                 if (!hv_sgi_queue_pop(&pending))
@@ -2111,9 +2310,6 @@ void hv_exc_fiq(struct exc_info *ctx)
                     pending.hw_irq
                 );
             }
-        } else {
-            printf("HV: windows-native-aic: carrier held CPU %d SGI with no KPCR\n",
-                   smp_id());
         }
 #endif
         if (PERCPU(ipi_queued)) {

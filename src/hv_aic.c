@@ -52,13 +52,14 @@ void hv_native_aic_enter_cpu(void)
 
     if (startup_carrier) {
         /*
-         * Apple implements the EL2 list registers, but a hardware-carrier test
-         * with TALL1 clear left the LRs pending and IAR unconsumed on J414s.
-         * Trap the short startup-carrier CPU-interface window and emulate its
-         * IAR/EOIR state transitions.  Target priorities come from the guest's
-         * GICR state, and hv_exc_exit repairs Windows' documented kernel x18
-         * alias from TPIDR_EL1 while APs are parked.  The first Windows AIC2
-         * CONFIG enable removes ICH, TALL1, and IMO permanently.
+         * Apple implements the EL2 list registers, but carrier LR behavior is
+         * not reliable across J414s' two core types. Trap the short startup
+         * CPU-interface window, keep IAR/EOIR state in software queues, and let
+         * hv_update_fiq drive HCR.VI for deliverable entries. Target priorities
+         * come from the guest's GICR state, and
+         * hv_exc_exit repairs Windows' kernel x18 alias from TPIDR_EL1 while
+         * APs are parked. The first Windows AIC2 CONFIG enable removes ICH,
+         * TALL1, IMO, and the carrier VI path permanently.
          */
         msr(ICH_VMCR_EL2, BIT(1));
         msr(ICH_HCR_EL2, BIT(0) | BIT(12));

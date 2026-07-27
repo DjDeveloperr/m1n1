@@ -683,5 +683,16 @@ static inline bool virq_queue_pop(virq_queue_t *q, virq_t *out)
     return true;
 }
 
+static inline bool virq_queue_peek(virq_queue_t *q, virq_t *out)
+{
+    u32 tail = __atomic_load_n(&q->tail, __ATOMIC_RELAXED);
+    u32 head = __atomic_load_n(&q->head, __ATOMIC_ACQUIRE);
+    if (tail == head)
+        return false;
+
+    *out = q->buf[tail & (VIRQ_QUEUE_SIZE - 1)];
+    return true;
+}
+
 #endif //ENABLE_VGIC_MODULE
 #endif //HV_VGIC_H

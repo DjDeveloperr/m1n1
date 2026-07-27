@@ -456,6 +456,40 @@ established from the remaining native-AIC correctness work.  Reaching the kernel
 not evidence that timer reflection, per-CPU affinity, IPIs, or peripheral interrupts
 are fully correct.
 
+### 2026-07-27 checkpoint
+
+Later J414s runs advanced substantially beyond the first recovery failure:
+
+- Keeping the x18/KPCR repair active after the AIC2 `CONFIG` handoff eliminated the
+  repeatable `IRQL_NOT_LESS_OR_EQUAL (0xA)` at `KfRaiseIrql+4`. A four-E-core control
+  configuration then ran for minutes with the Windows logo/spinner and no bugcheck.
+- Windows can populate `TPIDR_EL1` before both of its exception stacks are usable.
+  The carrier now requires writable `PanicStackBase` and `InterruptStackBase` ranges
+  before delivering an SGI. This allows the first Avalanche core (logical CPU 4) to
+  acknowledge and EOI its startup INTID 0; the earlier gate on only the panic stack
+  entered `KxSwitchStackAndPlayInterrupt` with an unsafe interrupt stack.
+- A software pending/active carrier is required for the short GIC compatibility
+  window. The hardware ICH LR path worked on Blizzard but left the same interrupt
+  pending indefinitely on Avalanche. HCR.VI now asserts only while a software queue
+  has a priority-eligible, non-active Group-1 entry. The first Windows AIC2 `CONFIG`
+  enable still removes this carrier permanently; normal operation remains native AIC.
+- CPU4 receives exactly one startup SGI from CPU0, returns INTID 0 from IAR, and EOIs
+  it. At EOI the SGI queue is empty and the coalesced count is zero. Windows sends no
+  second SGI to CPU4, so the remaining stall is not a lost carrier notification.
+- Normalizing `VPIDR_EL2` so Avalanche reports the Blizzard MIDR was tested and made
+  no behavioral difference. All other trapped architectural feature registers were
+  already identical across the two core types; that experiment was removed.
+- A 5 kHz EL2 sampler found CPU4 alive after EOI with stable x18/SP, looping at kernel
+  offsets `0x4fc4`, `0x13a88`, and `0x13a98` until the BSP times out and tears down the
+  temporary KPCR mapping. The next hardware step is to capture/disassemble this loop
+  and identify its waited-on value. The sampler itself was diagnostic-only and is not
+  retained in the checkpoint commit.
+
+The last session ended with stale USB CDC device nodes: neither proxy endpoint
+answered NOPs after a chainload re-enumeration race. A physical cable replug or proxy
+restart is required before that next capture; this is an external test-access blocker,
+not a new guest failure.
+
 ## 10. M1-VALIDATION CHECKLIST
 
 Most of the interrupt-correctness analysis above remains design reasoning from m1n1's
