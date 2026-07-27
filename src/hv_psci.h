@@ -221,6 +221,8 @@ typedef struct psci_per_cpu_data {
     // To know which CPU we are, according to how Apple hardware understands core position.
     //
     unsigned int cpu_index;
+    // Dense position in the PSCI topology (physical ADT cpu-id may be sparse).
+    unsigned int topology_index;
     unsigned int cluster_index;
     unsigned int die_index;
     //

@@ -2071,6 +2071,10 @@ class HV(Reloadable):
         guest_base += align(self.u.ba.devtree_size)
         tc_base = guest_base
         guest_base += align(tc_size)
+        # AArch64 UEFI runtime memory must be 64 KiB aligned.  Raw Mu images
+        # describe the loaded firmware region as EfiRuntimeServicesData, so a
+        # 16 KiB-aligned payload address makes DxeCore reject ExitBootServices.
+        guest_base = align_up(guest_base, 0x10000)
         self.guest_base = guest_base
         mem_top = self.u.ba.phys_base + self.u.ba.mem_size
         mem_size = mem_top - phys_base

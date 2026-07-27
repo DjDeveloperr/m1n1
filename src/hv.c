@@ -52,10 +52,15 @@ struct hv_secondary_info_t {
 };
 
 static struct hv_secondary_info_t hv_secondary_info;
+static u64 hv_secondary_regs[MAX_CPUS][4];
 
 void hv_init(void)
 {
     pcie_shutdown();
+    // Relinquish every USB controller except the one carrying this proxy.
+    // The guest can then reset those DWC3 blocks into host mode and own their
+    // DARTs without stale m1n1 device-mode endpoints or DMA mappings.
+    usb_iodev_shutdown_except(uartproxy_iodev);
     // Make sure we wake up DCP if we put it to sleep, just quiesce it to match ADT
     if (display_is_external && display_start_dcp() >= 0)
         display_shutdown(DCP_QUIESCED);
@@ -89,15 +94,11 @@ void hv_init(void)
     // this exact value verbatim, see hv_secondary_info.hcr below and
     // hv_init_secondary()). See docs/windows-native-aic.md for the full design.
     //
-    // HCR_EL2.IMO (arm_cpu_regs.h:177, BIT(4)) is intentionally *not* OR'd in here.
-    // IMO and FMO (arm_cpu_regs.h:178, BIT(3)) independently gate whether physical
-    // Group 1 IRQ and FIQ exceptions are routed to EL2 instead of the guest's own EL1
-    // (this is what previously made every AIC-routed peripheral interrupt trap to EL2
-    // for translation into a vGIC injection, see the old hv_exc_irq() AIC-ack path).
-    // Clearing IMO means those physical IRQs now go straight to the guest at EL1 with
-    // zero EL2 involvement: Windows' native AIC HAL extension drives the real Apple
-    // AIC (mask/unmask/ack/EOI via AIC's own MMIO, already unhooked/passed through --
-    // see hv_vgic.c's hv_vgicv3_init()) exactly like it would on bare metal.
+    // Mu and Windows both drive the physical AIC directly, so ordinary IRQs never
+    // route through EL2 and no virtual GIC is exposed.  FMO starts set while Mu's
+    // VBAR is still zero.  FMO remains set throughout: once TimerDxe is ready, Mu
+    // receives timer ticks as native-AIC software IRQs; after ExitBootServices,
+    // Windows receives HCR.VI plus AIC EVENT(2/3).  No vGIC state is exposed.
     //
     // HCR_EL2.FMO stays set: the Apple timer is FIQ-only (there is no IRQ-mode timer
     // delivery on this hardware) and physical FIQs must keep trapping to EL2, because
@@ -122,8 +123,7 @@ void hv_init(void)
                  HCR_TSC | // Trap SMC exceptions (only writable on Blizzard/Avalanche cores as the previous generations used a chicken bit for this.)
                  HCR_TID3 | // Trap ID group 3 registers (AA64 PFR, MMFR, ISAR, AFR ID registers) - required to support the vanilla ArmGicDxe UEFI driver.
                  HCR_AMO | // Trap SError exceptions
-                 // HCR_IMO intentionally omitted -- see comment above.
-                 HCR_FMO | // Trap FIQ exceptions -- timer-FIQ-only reflection, see above.
+                 HCR_FMO | // Hold timer FIQ until Mu's AIC and timer handlers are ready.
                  HCR_VM);  // Enable stage 2 translation
 #else
     hv_write_hcr(HCR_API | // Allow PAuth instructions
@@ -153,6 +153,7 @@ void hv_init(void)
     printf("DEBUG: setting up PSCI\n");
     hv_psci_init();
 #ifdef ENABLE_VGIC_MODULE
+#ifndef ENABLE_NATIVE_AIC_PASSTHROUGH
     //
     // m1n1_windows change: set up the vGIC
     //
@@ -160,16 +161,6 @@ void hv_init(void)
     //
     hv_vgicv3_init();
     init_vgic_irq_queues();
-    //
-#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
-    //
-    // windows-native-aic: reserve the per-CPU AIC software IRQs used to reflect the
-    // timer FIQ (see hv_exc.c). Must run after hv_vgicv3_init() (which discovers
-    // vgic_nr_lrs and used to be the timer path's dependency; kept as the natural
-    // "vGIC/IRQ setup is done" point) and after smp_start_secondaries() (hv_init(),
-    // top of this function) so smp_cpu_count() is valid.
-    //
-    hv_timer_reflect_init();
 #endif
 #endif
 
@@ -223,13 +214,26 @@ void hv_start(void *entry, u64 regs[4])
     if (gxf_enabled())
         gl2_call(hv_set_gxf_vbar, 0, 0, 0, 0);
 
+#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
+    /*
+     * Windows needs the GICD/GICR MMIO records advertised by Mu only while it
+     * classifies the startup controller.  Initialize those register hooks after
+     * the host's broad mappings are complete, but leave HCR.IMO clear and never
+     * enable ICH/LRs: this is a topology carrier, not an interrupt-delivery path.
+     */
+#ifdef ENABLE_VGIC_MODULE
+    hv_vgicv3_init();
+    init_vgic_irq_queues();
+#endif
+
+    /* Host MMIO mappings are complete before hv_start(), so these hooks persist. */
+    hv_native_aic_transition_init();
+#endif
+
     //
     // windows-native-aic: this is the "secondary CPU path" half of the HCR_EL2 update
-    // in hv_init() above -- it snapshots whatever hv_init() just wrote (IMO clear,
-    // FMO set, when ENABLE_NATIVE_AIC_PASSTHROUGH is on) and hv_init_secondary() below
-    // applies the identical value, verbatim, to every other core via a plain
-    // msr(HCR_EL2, info->hcr). All cores therefore present AIC/the timer reflector to
-    // the guest identically; there is no per-core divergence to introduce here.
+    // in hv_init() above.  APs started by Windows apply the current pure-AIC phase
+    // policy in hv_init_secondary() rather than inheriting a stale Mu-era FIQ state.
     //
     hv_secondary_info.hcr = mrs(HCR_EL2);
     hv_secondary_info.hacr = mrs(HACR_EL2);
@@ -250,7 +254,7 @@ void hv_start(void *entry, u64 regs[4])
     hv_secondary_info.sprr_config = mrs(SYS_IMP_APL_SPRR_CONFIG_EL1);
     hv_secondary_info.gxf_config = mrs(SYS_IMP_APL_GXF_CONFIG_EL1);
 
-#ifdef ENABLE_VGIC_MODULE
+#if defined(ENABLE_VGIC_MODULE) && !defined(ENABLE_NATIVE_AIC_PASSTHROUGH)
     hv_vgicv3_enable_virtual_interrupts();
     hv_vgicv3_init_list_registers();
 #endif
@@ -335,7 +339,10 @@ static void hv_init_secondary(struct hv_secondary_info_t *info)
     msr(SYS_IMP_APL_SPRR_CONFIG_EL1, info->sprr_config);
     msr(SYS_IMP_APL_GXF_CONFIG_EL1, info->gxf_config);
 
-#ifdef ENABLE_VGIC_MODULE
+#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
+    /* APs started by Windows inherit the post-EBS FIQ bridge policy. */
+    hv_native_aic_enter_cpu();
+#elif defined(ENABLE_VGIC_MODULE)
     hv_vgicv3_enable_virtual_interrupts();
     hv_vgicv3_init_list_registers();
 #endif
@@ -376,10 +383,22 @@ void hv_start_secondary(int cpu, void *entry, u64 regs[4])
 
     printf("HV: Entering guest secondary %d at %p\n", cpu, entry);
     hv_started_cpus[cpu] = true;
-    __atomic_or_fetch(&hv_cpus_in_guest, BIT(smp_id()), __ATOMIC_ACQUIRE);
+    __atomic_or_fetch(&hv_cpus_in_guest, BIT(cpu), __ATOMIC_ACQUIRE);
+
+    /*
+     * smp_call4() returns to the caller as soon as the target increments its
+     * acknowledgement flag, before the target necessarily dereferences the
+     * argument pointer.  PSCI's CPU_ON caller supplies a stack-local regs[];
+     * retaining that pointer races the next CPU_ON and can give an AP another
+     * processor's context ID.  Keep the guest entry registers in stable
+     * per-CPU storage for the lifetime of the asynchronous guest call.
+     */
+    memcpy(hv_secondary_regs[cpu], regs, sizeof(hv_secondary_regs[cpu]));
+    sysop("dmb sy");
 
     iodev_console_flush();
-    smp_call4(cpu, hv_enter_secondary, (u64)entry, (u64)regs, 0, 0);
+    smp_call4(cpu, hv_enter_secondary, (u64)entry,
+              (u64)hv_secondary_regs[cpu], 0, 0);
 }
 
 void hv_exit_cpu(int cpu)

@@ -70,15 +70,10 @@
  * we'll know which core needs to be signaled in those cases.)
  *
  * windows-native-aic (branch windows-native-aic, config.h: ENABLE_NATIVE_AIC_PASSTHROUGH):
- * when that flag is on, everything above still applies to the *machinery* in this file, but
- * hv_vgicv3_init() no longer installs the GICD/GICR/ITS hv_map_hook() MMIO traps described
- * below -- the guest is not shown a GIC distributor at all, and instead drives the real AIC
- * directly (its MMIO was never hooked in the first place; see docs/windows-native-aic.md). The
- * distributor/redistributor in-memory state (vgicv3_dist/vgicv3_vcpu_redist) and the
- * ICH_LR<n>_EL2 list-register helpers below are still allocated and initialized -- they're kept
- * for the vestigial ICC_SGI1R_EL1 SGI-emulation path in hv_exc.c, not for the timer, which this
- * design reflects via a per-CPU AIC software IRQ instead (hv_exc.c, hv_update_fiq() /
- * hv_timer_reflect_init()).
+ * when that flag is on, the GICD/GICR/ITS hooks remain the firmware and early-Windows
+ * startup carrier. hv_aic.c observes the real AIC2 CONFIG enable write after the HAL
+ * extension replaces the carrier callbacks; each CPU then disables its virtual CPU
+ * interface and clears HCR_EL2.IMO before native AIC delivery begins.
  *
  */
 #ifdef ENABLE_VGIC_MODULE
@@ -110,8 +105,11 @@ vgicv3_vcpu_redist *redistributors;
 vgicv3_its *interrupt_translation_service;
 static u64 dist_base, redist_base, its_base;
 static u16 num_cpus;
+/* Guest GICR frames are dense, but Apple ADT CPU IDs can be sparse. */
+static u8 redist_cpu_ids[MAX_CPUS];
 static bool vgic_inited;
-static u64 igrpen1;
+/* ICC_IGRPEN1_EL1 is banked per PE, not distributor-global state. */
+static u64 igrpen1[MAX_CPUS];
 /*
  * Number of implemented ICH_LR<n>_EL2 list registers. Derived at init from
  * ICH_VTR_EL2.ListRegs instead of assuming eight: touching an unimplemented LR
@@ -856,10 +854,15 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
 //
 static bool handle_vgic_redist_access(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
 {
+    u64 frame_offset;
     u64 relative_addr;
     bool register_handled;
     bool unimplemented_reg_accessed;
-    relative_addr = addr - redist_base;
+    frame_offset = addr - redist_base;
+    u16 frame = (u16)(frame_offset / 0x20000);
+    if (frame >= num_cpus)
+        return false;
+    relative_addr = frame_offset % 0x20000;
     register_handled = false;
     unimplemented_reg_accessed = false;
     u8 cpu_num;
@@ -867,6 +870,7 @@ static bool handle_vgic_redist_access(struct exc_info *ctx, u64 addr, u64 *val, 
     u32 irq_num;
     u32 reg_num;
     u32 reg_offset;
+    UNUSED(ctx);
     value_ic_enabler = 0;
     value_is_enabler = 0;
     current_val = 0;
@@ -874,7 +878,10 @@ static bool handle_vgic_redist_access(struct exc_info *ctx, u64 addr, u64 *val, 
     reg_num = 0;
     reg_offset = 0;
 
-    cpu_num = ctx->cpu_id;
+    /* The addressed redistributor frame selects the bank. */
+    cpu_num = redist_cpu_ids[frame];
+    if (cpu_num >= MAX_CPUS)
+        return false;
     if(write) {
         //
         // The guest attempted to write a register.
@@ -1565,24 +1572,34 @@ void hv_vgicv3_assign_redist_affinity_value(u16 cpu_num, bool last_cpu) {
 }
 
 void hv_vgicv3_init_redist_registers(void) {
-    memset(redistributors, 0, (sizeof(vgicv3_vcpu_redist) * num_cpus));
-    for(u16 i = 0; i < num_cpus; i++) {
-        bool last_cpu = (i + 1 == num_cpus) ? true : false;
-        redistributors[i].rd_region.gicr_ctl_reg = (BIT(2) | BIT(1));
-        redistributors[i].rd_region.gicr_iidr = (BIT(10) | BIT(5) | BIT(4) | BIT(3) | BIT(1) | BIT(0));
+    u16 frame = 0;
+
+    memset(redistributors, 0, sizeof(vgicv3_vcpu_redist) * MAX_CPUS);
+    memset(redist_cpu_ids, 0xff, sizeof(redist_cpu_ids));
+    for (u16 cpu = 0; cpu < MAX_CPUS; cpu++) {
+        /* The boot CPU never sets the secondary spin-table alive flag. */
+        if (cpu != (u16)boot_cpu_idx && !smp_is_alive(cpu))
+            continue;
+        if (frame >= num_cpus)
+            panic("HV vGIC: active CPU count exceeds ADT CPU count\n");
+
+        redist_cpu_ids[frame] = (u8)cpu;
+        redistributors[cpu].rd_region.gicr_ctl_reg = (BIT(2) | BIT(1));
+        redistributors[cpu].rd_region.gicr_iidr = (BIT(10) | BIT(5) | BIT(4) | BIT(3) | BIT(1) | BIT(0));
         //
         // assign affinity values to redistributors.
         //
-        hv_vgicv3_assign_redist_affinity_value(i, last_cpu);
-        redistributors[i].rd_region.gicr_status_reg = 0;
-        redistributors[i].rd_region.gicr_wake_reg = (BIT(2) | BIT(1)); //GICR_WAKER reset values, currently not using bits 31 or 0.
+        hv_vgicv3_assign_redist_affinity_value(cpu, frame + 1 == num_cpus);
+        redistributors[cpu].rd_region.gicr_status_reg = 0;
+        redistributors[cpu].rd_region.gicr_wake_reg = (BIT(2) | BIT(1)); //GICR_WAKER reset values, currently not using bits 31 or 0.
         //
         // Generate and set the LPI configuration table here.
         // (Right now this is ignored just to test if stuff is working since we have no MSIs and LPIs are disabled right now.)
         //
-        
-
+        frame++;
     }
+    if (frame != num_cpus)
+        panic("HV vGIC: initialized %u redistributors for %u ADT CPUs\n", frame, num_cpus);
 }
 
 
@@ -1630,7 +1647,7 @@ int hv_vgicv3_enable_virtual_interrupts(void)
     return 0;
 }
 
-u8 hv_vgic3_get_priority(u64 intd){
+u8 hv_vgic3_get_priority_cpu(int cpu, u64 intd){
     u64 reg_num = 0;
     u64 reg_offset = 0;
     u8 *reg_val = NULL;
@@ -1638,12 +1655,12 @@ u8 hv_vgic3_get_priority(u64 intd){
     if(intd <= 15){
         reg_num = intd / 4;
         reg_offset = intd % 4;
-        reg_val = (u8 *)&redistributors[smp_id()].sgi_region.gicr_sgi_ipriority_reg[reg_num];
+        reg_val = (u8 *)&redistributors[cpu].sgi_region.gicr_sgi_ipriority_reg[reg_num];
     }
     else if(intd >= 16 && intd <= 31){
         reg_num = (intd - 16) / 4;
         reg_offset = (intd - 16) % 4;
-        reg_val = (u8 *)&redistributors[smp_id()].sgi_region.gicr_ppi_ipriority_reg[reg_num];
+        reg_val = (u8 *)&redistributors[cpu].sgi_region.gicr_ppi_ipriority_reg[reg_num];
     }
     else{
         //
@@ -1665,6 +1682,23 @@ u8 hv_vgic3_get_priority(u64 intd){
     reg_val += reg_offset;
 
     return *reg_val;
+}
+
+u8 hv_vgic3_get_priority(u64 intd)
+{
+    return hv_vgic3_get_priority_cpu(smp_id(), intd);
+}
+
+u16 hv_vgic3_num_cpus(void)
+{
+    return num_cpus;
+}
+
+int hv_vgic3_cpu_for_frame(u16 frame)
+{
+    if (frame >= num_cpus || redist_cpu_ids[frame] >= MAX_CPUS)
+        return -1;
+    return redist_cpu_ids[frame];
 }
 
 u32 hv_vgic3_num_lrs(void)
@@ -1767,6 +1801,30 @@ void hv_vgic3_inject_irq(u32 vintid, u8 priority, bool active, bool pending, boo
     }
     
 
+    /*
+     * A GIC interrupt has one state machine per INTID.  Re-posting an INTID
+     * that is already pending or active must update that LR to
+     * active+pending, not allocate a second LR carrying the same INTID.  The
+     * latter lets Windows accept the same timer/SGI recursively before EOI,
+     * which corrupts its IRQL/context-switch state during AP startup.
+     */
+    for (u32 lr = 0; lr < vgic_nr_lrs; lr++) {
+        u64 lr_val = hv_vgic3_read_lr(lr);
+        if (!(lr_val & (ICH_LR_STATE_PENDING | ICH_LR_STATE_ACTIVE)))
+            continue;
+        if (((lr_val >> ICH_LR_VIRTUAL_SHIFT) & ICH_LR_VIRTUAL_MASK) !=
+            (vintid & ICH_LR_VIRTUAL_MASK))
+            continue;
+
+        if (pending)
+            lr_val |= ICH_LR_STATE_PENDING;
+        if (active)
+            lr_val |= ICH_LR_STATE_ACTIVE;
+        hv_vgic3_write_lr(lr, lr_val);
+        sysop("isb");
+        return;
+    }
+
     int free_lr = hv_vgic3_get_free_lr();
     if (free_lr < 0)
         return;
@@ -1779,7 +1837,8 @@ int hv_vgic3_do_iar1(void){
     int found_lr = -1;
     for(int lr = 0; lr < (int)vgic_nr_lrs; lr++){
         u64 lr_val = hv_vgic3_read_lr(lr);
-        if(lr_val & ICH_LR_STATE_PENDING){
+        if ((lr_val & ICH_LR_STATE_PENDING) &&
+            !(lr_val & ICH_LR_STATE_ACTIVE)) {
             u8 priority = (lr_val >> ICH_LR_PRIORITY_SHIFT) & ICH_LR_PRIORITY_MASK;
             if(priority < found_priority){
                 found_lr = lr;
@@ -1806,13 +1865,20 @@ void hv_vgic3_do_eoir1(u64 reg){
         //vgic_log("CHECKING LR: 0x%lx %d %d %d\n", lr_val, intd, (lr_val >> ICH_LR_VIRTUAL_SHIFT) & ICH_LR_VIRTUAL_MASK, lr_val & ICH_LR_STATE_ACTIVE);
         if( ((lr_val >> ICH_LR_VIRTUAL_SHIFT) & ICH_LR_VIRTUAL_MASK) == intd && (lr_val & ICH_LR_STATE_ACTIVE)){
             //vgic_log("DOING EOIR 0x%lx, found LR%d: 0x%lx, setting to 0\n", reg, lr, lr_val);
-            hv_vgic3_write_lr(lr, 0);
+            if (lr_val & ICH_LR_STATE_PENDING) {
+                lr_val &= ~ICH_LR_STATE_ACTIVE;
+                hv_vgic3_write_lr(lr, lr_val);
+            } else {
+                hv_vgic3_write_lr(lr, 0);
+            }
+            sysop("isb");
+            return;
         }
     }
 }
 
 void hv_vgic3_set_igrpen1(u64 reg){
-    igrpen1 = reg;
+    igrpen1[smp_id()] = reg;
     if(reg == 0){
         for(int lr = 0; lr < (int)vgic_nr_lrs; lr++)
             hv_vgic3_write_lr(lr, 0);
@@ -1820,7 +1886,7 @@ void hv_vgic3_set_igrpen1(u64 reg){
 }
 
 u64 hv_vgic3_get_igrpen1(void){
-    return igrpen1;
+    return igrpen1[smp_id()];
 }
 
 #endif
@@ -1960,17 +2026,14 @@ void hv_vgicv3_init(void)
     // allocated only to minimize the diff and avoid a second flag axis. See
     // docs/windows-native-aic.md.
     //
-#ifndef ENABLE_NATIVE_AIC_PASSTHROUGH
-    printf("HV vGIC DEBUG: mapping distributor into guest space\n");
+    printf("HV vGIC DEBUG: mapping startup-carrier distributor into guest space\n");
     hv_map_hook(dist_base, handle_vgic_dist_access, 0x10000);
-#else
-    printf("HV vGIC DEBUG: native-AIC passthrough active, NOT mapping distributor into guest space\n");
-#endif
 
 
     /* Redistributor setup */
     printf("HV vGIC DEBUG: setting up redistributors\n");
-    redistributors = heapblock_alloc(sizeof(vgicv3_vcpu_redist) * num_cpus);
+    /* State is indexed by sparse physical CPU ID; guest frames stay dense. */
+    redistributors = heapblock_alloc(sizeof(vgicv3_vcpu_redist) * MAX_CPUS);
     hv_vgicv3_init_redist_registers();
     //
     // windows-native-aic: same reasoning as the distributor above. The redistributor
@@ -1980,12 +2043,8 @@ void hv_vgicv3_init(void)
     // hv_vgic3_get_priority()/list-register injection at all (it's an AIC software IRQ,
     // see hv_exc.c). The guest never sees this MMIO region either way.
     //
-#ifndef ENABLE_NATIVE_AIC_PASSTHROUGH
-    printf("HV vGIC DEBUG: mapping redistributors into guest space\n");
+    printf("HV vGIC DEBUG: mapping startup-carrier redistributors into guest space\n");
     hv_map_hook(redist_base, handle_vgic_redist_access, ((0x20000) * num_cpus));
-#else
-    printf("HV vGIC DEBUG: native-AIC passthrough active, NOT mapping redistributors into guest space\n");
-#endif
 
     //
     // ITS setup (for MSIs - PCIe devices usually signal via these.)
@@ -2007,4 +2066,3 @@ void hv_vgicv3_init(void)
     return;
 #endif //ENABLE_VGIC_MODULE
 }
-

@@ -47,8 +47,8 @@ extern spinlock_t bhl;
 // real peripheral IRQ -- this is what makes it usable as a bugcheck-safe (IRQ, not
 // FIQ) timer-tick reflector.
 //
-// This reserves 2 * MAX_CPUS consecutive IRQ numbers at the TOP of AIC's HW IRQ space
-// (aic->max_irq, populated by aic_init() before the hypervisor starts) -- one CNTP
+// This reserves 2 * MAX_CPUS consecutive IRQ numbers at the TOP of AIC's implemented
+// HW IRQ space (aic->nr_irq, populated by aic_init() before the hypervisor starts) -- one CNTP
 // ("P") and one CNTV ("V") number per possible CPU, so a given core's timer FIQ always
 // reflects to that SAME core (via aic_set_affinity(), see hv_timer_reflect_init()
 // below) rather than an arbitrary one.
@@ -60,9 +60,15 @@ extern spinlock_t bhl;
 // this number, or use hv_trace_irq()/the proxy IRQ tracer) that nothing else claims
 // these numbers before trusting this.
 //
-#define HV_TIMER_SWIRQ_BASE      (aic->max_irq - (2 * MAX_CPUS))
+#define HV_TIMER_SWIRQ_BASE      (aic->nr_irq - (2 * MAX_CPUS))
 #define HV_TIMER_P_SWIRQ(cpu)    (HV_TIMER_SWIRQ_BASE + (cpu))
 #define HV_TIMER_V_SWIRQ(cpu)    (HV_TIMER_SWIRQ_BASE + MAX_CPUS + (cpu))
+#define HV_TIMER_REFLECT_CALL_MAGIC 0x4e54414943ULL /* "NTAIC" */
+#define HV_TIMER_CTL_ENABLE      BIT(0)
+#define HV_TIMER_CTL_IMASK       BIT(1)
+/* Standard GIC PPIs published by the Windows startup-carrier GTDT. */
+#define HV_GIC_TIMER_P_INTID     30
+#define HV_GIC_TIMER_V_INTID     27
 #endif
 
 struct hv_pcpu_data {
@@ -106,6 +112,10 @@ struct hv_pcpu_data {
     u64  timer_v_fiq_count;
     bool timer_p_reflection_pending;
     bool timer_v_reflection_pending;
+    bool timer_p_event_unread;
+    bool timer_v_event_unread;
+    bool carrier_timer_ready;
+    bool carrier_x18_repair_logged;
 #endif
 } ALIGNED(64);
 
@@ -115,8 +125,6 @@ void hv_exit_guest(void) __attribute__((noreturn));
 
 static u64 stolen_time = 0;
 static u64 exc_entry_time;
-static int num_cpus;
-
 extern u64 hv_cpus_in_guest;
 extern int hv_pinned_cpu;
 extern int hv_want_cpu;
@@ -125,8 +133,6 @@ static bool time_stealing = true;
 
 void init_vgic_irq_queues(void) {
 #ifdef ENABLE_VGIC_MODULE
-    int node = adt_path_offset(adt, "/cpus");
-    num_cpus = adt_get_child_count(adt, node);
     for (int i = 0; i < MAX_CPUS; i++) {
         virq_queue_init(&PERCPU_N(i, irq_queue));
         virq_queue_init(&PERCPU_N(i, sgi_queue));
@@ -139,10 +145,9 @@ void init_vgic_irq_queues(void) {
 //
 // windows-native-aic: reserve and unmask the per-CPU AIC software IRQs used by the
 // timer-FIQ reflector (see the HV_TIMER_P_SWIRQ()/HV_TIMER_V_SWIRQ() comment above and
-// docs/windows-native-aic.md). Must run after init_vgic_irq_queues() (so `num_cpus` is
-// populated from the ADT, matching the same core-count source the vGIC code already
-// uses) and after aic_init() has run (so `aic->max_irq` is valid) -- both are already
-// true at this function's one call site in hv_init() (hv.c).
+// docs/windows-native-aic.md). Must run after init_vgic_irq_queues() and after
+// aic_init() has run (so `aic->nr_irq` is valid) -- both are already true at
+// this function's one call site in hv_init() (hv.c).
 //
 // aic_set_affinity()/aic_set_mask() write global (not per-calling-core) AIC MMIO state
 // (aic.c:216-219, aic.c:204-215 -- the same registers hv_vgic.c's guest-facing GICD
@@ -151,50 +156,63 @@ void init_vgic_irq_queues(void) {
 //
 void hv_timer_reflect_init(void)
 {
-    int cpus = num_cpus;
-    if (cpus <= 0) {
-        printf("HV: windows-native-aic: num_cpus not initialized, skipping timer reflector setup\n");
-        return;
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+        PERCPU_N(cpu, timer_p_reflection_pending) = false;
+        PERCPU_N(cpu, timer_v_reflection_pending) = false;
+        PERCPU_N(cpu, timer_p_event_unread) = false;
+        PERCPU_N(cpu, timer_v_event_unread) = false;
+        PERCPU_N(cpu, carrier_timer_ready) = false;
+        PERCPU_N(cpu, carrier_x18_repair_logged) = false;
+        aic_set_sw(HV_TIMER_P_SWIRQ(cpu), false);
+        aic_set_sw(HV_TIMER_V_SWIRQ(cpu), false);
     }
-    if (cpus > MAX_CPUS)
-        cpus = MAX_CPUS;
+    reg_clr(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2,
+            VM_TMR_FIQ_ENA_ENA_P | VM_TMR_FIQ_ENA_ENA_V);
+    printf("HV: windows-native-aic: holding timer FIQ until Mu AIC is ready\n");
+}
 
-    printf("HV: windows-native-aic: reserving AIC SW IRQs %d..%d (CNTP) and %d..%d "
-           "(CNTV) for the per-CPU timer-FIQ reflector -- UNVERIFIED placement, see "
-           "docs/windows-native-aic.md OQ-1\n",
-           HV_TIMER_P_SWIRQ(0), HV_TIMER_P_SWIRQ(cpus - 1),
-           HV_TIMER_V_SWIRQ(0), HV_TIMER_V_SWIRQ(cpus - 1));
+void hv_timer_native_enable(void)
+{
+    PERCPU(timer_p_reflection_pending) = false;
+    PERCPU(timer_v_reflection_pending) = false;
+    PERCPU(timer_p_event_unread) = false;
+    PERCPU(timer_v_event_unread) = false;
+    hv_write_hcr(mrs(HCR_EL2) & ~HCR_VI);
+    reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2,
+            VM_TMR_FIQ_ENA_ENA_P | VM_TMR_FIQ_ENA_ENA_V);
+}
 
-    //
-    // KNOWN GAP (docs/windows-native-aic.md OQ-1b), found by reading m1n1's own
-    // aic_set_affinity() (aic.c:216-219): it is a NO-OP unless aic->version == 1.
-    // aic->version comes from the ADT "aic,N" compatible string (aic.c:159-168) and is
-    // chip-dependent; every chip this project actually cares about beyond the M1 base
-    // (T8103/T8112, which use AIC1) -- M1 Pro/Max/Ultra, M2 Pro/Max/Ultra, M5 Pro, etc.
-    // -- uses AIC2 or AIC3 (aic.c:28-43), where per-IRQ target routing instead lives in
-    // the aic->regs.config region as an AIC23_IRQ_CFG_TARGET field (aic_regs.h:28,
-    // GENMASK(3,0), populated per external-interrupt entry in aic23_init(),
-    // aic.c:130-144) whose value ENCODING (raw CPU index? cluster+core packed value?
-    // bitmask?) is not documented anywhere in this tree and has NOT been reverse
-    // engineered here -- guessing it would violate this task's "never guess a
-    // register/bit" rule.
-    //
-    // We still call aic_set_affinity() below: it is correct on AIC1 and a harmless
-    // no-op on AIC2/AIC3 (it will not misroute anything, it just won't set anything).
-    // On AIC2/AIC3 hardware the reserved timer SW IRQs are therefore left at
-    // whatever AIC's own default/reset routing is for a freshly-claimed IRQ number --
-    // UNKNOWN, and NOT validated to land on the expected core. This is a real,
-    // concrete correctness gap for this design on any Pro/Max/Ultra-class or newer
-    // chip and is called out as a blocking M1-validation item, not a cosmetic one: if
-    // the reflected tick lands on the wrong core, that core's clock silently stops
-    // while another core's clock double-fires.
-    //
-    for (int cpu = 0; cpu < cpus; cpu++) {
-        aic_set_affinity(HV_TIMER_P_SWIRQ(cpu), cpu);
-        aic_set_mask(HV_TIMER_P_SWIRQ(cpu), false); // false = unmask, see aic.c:204-215
-        aic_set_affinity(HV_TIMER_V_SWIRQ(cpu), cpu);
-        aic_set_mask(HV_TIMER_V_SWIRQ(cpu), false);
+void hv_timer_reflect_enable(void)
+{
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+        aic_set_sw(HV_TIMER_P_SWIRQ(cpu), false);
+        aic_set_sw(HV_TIMER_V_SWIRQ(cpu), false);
+        PERCPU_N(cpu, carrier_timer_ready) = false;
     }
+    PERCPU(timer_p_reflection_pending) = false;
+    PERCPU(timer_v_reflection_pending) = false;
+    PERCPU(timer_p_event_unread) = false;
+    PERCPU(timer_v_event_unread) = false;
+    reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2,
+            VM_TMR_FIQ_ENA_ENA_P | VM_TMR_FIQ_ENA_ENA_V);
+    printf("HV: windows-native-aic: enabled FIQ-to-AIC-EVENT timer bridge\n");
+}
+
+void hv_timer_reflect_hold(void)
+{
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+        aic_set_sw(HV_TIMER_P_SWIRQ(cpu), false);
+        aic_set_sw(HV_TIMER_V_SWIRQ(cpu), false);
+        PERCPU_N(cpu, timer_p_reflection_pending) = false;
+        PERCPU_N(cpu, timer_v_reflection_pending) = false;
+        PERCPU_N(cpu, timer_p_event_unread) = false;
+        PERCPU_N(cpu, timer_v_event_unread) = false;
+        PERCPU_N(cpu, carrier_timer_ready) = false;
+    }
+    hv_write_hcr(mrs(HCR_EL2) & ~HCR_VI);
+    reg_clr(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2,
+            VM_TMR_FIQ_ENA_ENA_P | VM_TMR_FIQ_ENA_ENA_V);
+    printf("HV: windows-native-aic: holding timer bridge until Windows enables AIC2\n");
 }
 #endif
 
@@ -307,94 +325,189 @@ void hv_add_time(s64 time)
     stolen_time -= (u64)time;
 }
 
-static void hv_update_fiq(void)
+static void hv_carrier_repair_x18(struct exc_info *ctx)
+{
+#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
+    if (ctx == NULL || !hv_native_aic_windows_active() ||
+        hv_native_aic_windows_ready() ||
+        (FIELD_GET(SPSR_M, ctx->spsr) >> 2) != 1 || ctx->regs[18] != 0)
+        return;
+
+    /*
+     * TPIDR_EL1 may carry Windows-private low-bit tags while x18 is the
+     * page-aligned KPCR.  Live J414s captures show, for example,
+     * TPIDR_EL1=...1002 paired with x18=...1000.  Never copy those tags into
+     * the architectural x18 alias.
+     */
+    u64 guest_pcr = mrs(TPIDR_EL1) & ~0xfffULL;
+    if (guest_pcr == 0)
+        return;
+
+    if (!PERCPU(carrier_x18_repair_logged)) {
+        printf("HV: windows-native-aic: repaired carrier CPU %d x18 from "
+               "tag-stripped TPIDR_EL1=0x%lx at ELR=0x%lx\n",
+               smp_id(), guest_pcr, ctx->elr);
+        PERCPU(carrier_x18_repair_logged) = true;
+    }
+    ctx->regs[18] = guest_pcr;
+#else
+    (void)ctx;
+#endif
+}
+
+static void hv_carrier_drain_pending(struct exc_info *ctx)
+{
+#if defined(ENABLE_VGIC_MODULE) && defined(ENABLE_NATIVE_AIC_PASSTHROUGH)
+    hv_carrier_repair_x18(ctx);
+    if (!hv_native_aic_windows_active() || hv_native_aic_windows_ready() ||
+        ctx == NULL || ctx->regs[18] == 0)
+        return;
+
+    while (hv_vgic3_get_free_lr() != -1) {
+        virq_t pending;
+        if (!virq_queue_pop(&PERCPU(sgi_queue), &pending))
+            break;
+        printf("HV: windows-native-aic: carrier inject CPU %d SGI %u with x18=0x%lx\n",
+               smp_id(), pending.vintid, ctx->regs[18]);
+        hv_vgic3_inject_irq(pending.vintid, pending.priority, pending.active,
+                            pending.pending, pending.hw_status, pending.hw_irq);
+    }
+    while (hv_vgic3_get_free_lr() != -1) {
+        virq_t pending;
+        if (!virq_queue_pop(&PERCPU(irq_queue), &pending))
+            break;
+        printf("HV: windows-native-aic: carrier inject CPU %d IRQ %u with x18=0x%lx\n",
+               smp_id(), pending.vintid, ctx->regs[18]);
+        hv_vgic3_inject_irq(pending.vintid, pending.priority, pending.active,
+                            pending.pending, pending.hw_status, pending.hw_irq);
+    }
+#else
+    (void)ctx;
+#endif
+}
+
+static void hv_update_fiq(struct exc_info *ctx)
 { 
     u64 hcr = mrs(HCR_EL2);
     bool fiq_pending = false;
 
-#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
-    //
-    // windows-native-aic timer-FIQ reflector. See docs/windows-native-aic.md "Timer
-    // re-arm handshake" for the full design; summary of the per-source flow:
-    //
-    //   physical timer expires -> FIQ to EL2 (already happened, we're in that handler)
-    //   -> EL2 masks/suppresses that timer source (reg_clr VM_TMR_FIQ_ENA_ENA_{P,V})
-    //   -> EL2 atomically marks *_reflection_pending (per-CPU, this core only)
-    //   -> EL2 triggers a RESERVED per-CPU AIC software IRQ (aic_set_sw())
-    //   -> EL1 (guest) handles the ordinary Windows clock vector on that AIC IRQ number
-    //   -> Windows programs the next deadline (writes CNTx_CVAL/TVAL/CTL_EL0)
-    //   -> EL2 observes (next call to this function) that CNTx_CTL_EL02 no longer
-    //      reads ISTATUS-asserted, and re-enables the physical FIQ source (the `else`
-    //      branch below) -- this is the PASS-THROUGH re-arm design, chosen over
-    //      TRAPPED/COOPERATIVE for the reasons in the design doc.
-    //
-    if (mrs(CNTP_CTL_EL02) == (CNTx_CTL_ISTATUS | CNTx_CTL_ENABLE)) {
-        fiq_pending = true;
-        //
-        // Mask first, before anything else: if we don't, and EL1 hasn't yet serviced
-        // the reflected IRQ, ISTATUS stays asserted and the very next FIQ-eligible
-        // instant re-traps EL2 -- the exact failure mode this design must avoid. Bit
-        // cited at cpu_regs.h:736-738 (SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2 =
-        // sys_reg(3,5,15,1,3), VM_TMR_FIQ_ENA_ENA_P = BIT(1)). This reg_clr() is the
-        // same primitive the pre-windows-native-aic code already used here (previously
-        // a stopgap ahead of a "TODO: proper injection"); it is now load-bearing.
-        //
-        reg_clr(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_P);
-        //
-        // Monotonic expiration counter (coalescing, required -- NOT a boolean). Always
-        // advances, even if a reflection is already outstanding: see the struct
-        // comment above and the "Coalescing" section of docs/windows-native-aic.md for
-        // why we don't need the guest to be told the exact count, and why that's an
-        // explicitly UNVERIFIED assumption about how Windows' clock ISR recomputes
-        // elapsed time, not a fact this patch can establish without an M1 trace.
-        //
-        PERCPU(timer_p_fiq_count)++;
-        if (!PERCPU(timer_p_reflection_pending)) {
-            PERCPU(timer_p_reflection_pending) = true;
-            //
-            // AIC's SW-pending bit is a level (aic_set_sw()/AIC_SW_SET, aic_regs.h:12),
-            // not a FIFO slot, so we deliberately do NOT re-post here if a reflection
-            // is already pending -- doing so would be a harmless no-op AIC-side, but
-            // gating it lets *_reflection_pending double as "have we already told the
-            // guest" for M1-trace diagnostics.
-            //
-            aic_set_sw(HV_TIMER_P_SWIRQ(smp_id()), true);
-        }
-    } else {
-        //
-        // Re-arm: CNTP is not currently expired (guest reprogrammed a future deadline,
-        // the expected case, or disabled/masked it itself). Un-suppress the physical
-        // FIQ source so the next real expiration traps EL2 again.
-        //
-        // This re-check runs on every EL2 exit (hv_update_fiq() is called from
-        // hv_exc_exit(), invoked at the end of hv_exc_sync's fast AND slow paths, and
-        // of hv_exc_fiq()/hv_exc_serr() -- i.e. every sync trap, FIQ, and SError, not
-        // just timer FIQs), which is what makes this PASS-THROUGH design viable
-        // without an explicit trap on the guest's reprogramming write: mrs(CNTP_CTL_EL02)
-        // is read live here regardless of whether that guest write itself trapped
-        // (ECV mode, hv_has_ecv true, hv.c) or went straight to hardware
-        // (CNTHCTL_EL1PTEN passthrough, hv_has_ecv false, hv.c) -- the pre-existing,
-        // unconditional use of this same read at this same call site is why that
-        // holds. See docs/windows-native-aic.md for the TRAPPED/COOPERATIVE
-        // alternative, the decision point, and why the non-ECV case is the one that
-        // still needs an M1 trace to be sure re-arm happens promptly enough.
-        //
-        reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_P);
-        PERCPU(timer_p_reflection_pending) = false;
-    }
+    hv_carrier_repair_x18(ctx);
 
-    if (mrs(CNTV_CTL_EL02) == (CNTx_CTL_ISTATUS | CNTx_CTL_ENABLE)) {
-        fiq_pending = true;
-        // See the CNTP case above -- identical handshake, CNTV (virtual timer) source.
-        reg_clr(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_V);
-        PERCPU(timer_v_fiq_count)++;
-        if (!PERCPU(timer_v_reflection_pending)) {
-            PERCPU(timer_v_reflection_pending) = true;
-            aic_set_sw(HV_TIMER_V_SWIRQ(smp_id()), true);
+#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
+    if (hv_native_aic_windows_active() && hv_native_aic_windows_ready()) {
+        /*
+         * Windows owns AIC directly, but Apple wires the architectural timers
+         * to FIQ.  Coalesce an asserted timer, suppress its physical FIQ, and
+         * assert HCR.VI.  The HAL then takes an ordinary IRQ and reads the AIC
+         * EVENT hook, which returns the native Apple source value 2 or 3.
+         */
+        if (mrs(CNTP_CTL_EL02) == (CNTx_CTL_ISTATUS | CNTx_CTL_ENABLE)) {
+            fiq_pending = true;
+            reg_clr(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_P);
+            if (!PERCPU(timer_p_reflection_pending)) {
+                PERCPU(timer_p_fiq_count)++;
+                PERCPU(timer_p_reflection_pending) = true;
+                PERCPU(timer_p_event_unread) = true;
+            }
+        } else {
+            reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_P);
+            PERCPU(timer_p_reflection_pending) = false;
+            PERCPU(timer_p_event_unread) = false;
         }
-    } else {
-        reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_V);
-        PERCPU(timer_v_reflection_pending) = false;
+
+        if (mrs(CNTV_CTL_EL02) == (CNTx_CTL_ISTATUS | CNTx_CTL_ENABLE)) {
+            fiq_pending = true;
+            reg_clr(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_V);
+            if (!PERCPU(timer_v_reflection_pending)) {
+                PERCPU(timer_v_fiq_count)++;
+                PERCPU(timer_v_reflection_pending) = true;
+                PERCPU(timer_v_event_unread) = true;
+            }
+        } else {
+            reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_V);
+            PERCPU(timer_v_reflection_pending) = false;
+            PERCPU(timer_v_event_unread) = false;
+        }
+    } else if (hv_native_aic_windows_active()) {
+        /*
+         * Windows calibrates its architectural clock before the AIC HAL
+         * extension enables CONFIG.  During that narrow window, reflect the
+         * architected GTDT timer PPIs 30/27 through empty startup-carrier LRs. A timer write
+         * and ICC_IGRPEN1=1 are both required, so stale Mu state cannot create
+         * an IRQ storm.  This path disappears when CONFIG switches to AIC2.
+         */
+        PERCPU(timer_p_event_unread) = false;
+        PERCPU(timer_v_event_unread) = false;
+
+        if (!PERCPU(carrier_timer_ready) || !hv_vgic3_get_igrpen1() ||
+            ctx == NULL || ctx->regs[18] == 0) {
+            reg_clr(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2,
+                    VM_TMR_FIQ_ENA_ENA_P | VM_TMR_FIQ_ENA_ENA_V);
+            PERCPU(timer_p_reflection_pending) = false;
+            PERCPU(timer_v_reflection_pending) = false;
+        } else {
+            if (mrs(CNTP_CTL_EL02) == (CNTx_CTL_ISTATUS | CNTx_CTL_ENABLE)) {
+                fiq_pending = true;
+                reg_clr(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_P);
+                if (!PERCPU(timer_p_reflection_pending) &&
+                    hv_vgic3_get_free_lr() != -1) {
+                    PERCPU(timer_p_fiq_count)++;
+                    PERCPU(timer_p_reflection_pending) = true;
+                    hv_vgic3_inject_irq(HV_GIC_TIMER_P_INTID,
+                                        hv_vgic3_get_priority(HV_GIC_TIMER_P_INTID),
+                                        false, true, false, 0);
+                }
+            } else {
+                PERCPU(timer_p_reflection_pending) = false;
+                reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_P);
+            }
+
+            if (mrs(CNTV_CTL_EL02) == (CNTx_CTL_ISTATUS | CNTx_CTL_ENABLE)) {
+                fiq_pending = true;
+                reg_clr(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_V);
+                if (!PERCPU(timer_v_reflection_pending) &&
+                    hv_vgic3_get_free_lr() != -1) {
+                    PERCPU(timer_v_fiq_count)++;
+                    PERCPU(timer_v_reflection_pending) = true;
+                    hv_vgic3_inject_irq(HV_GIC_TIMER_V_INTID,
+                                        hv_vgic3_get_priority(HV_GIC_TIMER_V_INTID),
+                                        false, true, false, 0);
+                }
+            } else {
+                PERCPU(timer_v_reflection_pending) = false;
+                reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_V);
+            }
+        }
+    } else if (hv_native_aic_mu_timer_active()) {
+        /*
+         * Mu's native FIQ exception return corrupts its exception frame on
+         * J414s.  Keep FIQ at EL2 and post the timer through Mu's reserved
+         * real-AIC software IRQ ABI instead.  Ordinary device IRQs remain
+         * physical AIC pass-through and no GIC state is exposed.
+         */
+        if (mrs(CNTP_CTL_EL02) == (CNTx_CTL_ISTATUS | CNTx_CTL_ENABLE)) {
+            fiq_pending = true;
+            reg_clr(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_P);
+            if (!PERCPU(timer_p_reflection_pending)) {
+                PERCPU(timer_p_fiq_count)++;
+                PERCPU(timer_p_reflection_pending) = true;
+                aic_set_sw(HV_TIMER_P_SWIRQ(smp_id()), true);
+            }
+        } else if (!PERCPU(timer_p_reflection_pending)) {
+            reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_P);
+        }
+
+        if (mrs(CNTV_CTL_EL02) == (CNTx_CTL_ISTATUS | CNTx_CTL_ENABLE)) {
+            fiq_pending = true;
+            reg_clr(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_V);
+            if (!PERCPU(timer_v_reflection_pending)) {
+                PERCPU(timer_v_fiq_count)++;
+                PERCPU(timer_v_reflection_pending) = true;
+                aic_set_sw(HV_TIMER_V_SWIRQ(smp_id()), true);
+            }
+        } else if (!PERCPU(timer_v_reflection_pending)) {
+            reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_V);
+        }
     }
 #else
     if (mrs(CNTP_CTL_EL02) == (CNTx_CTL_ISTATUS | CNTx_CTL_ENABLE)) {
@@ -465,14 +578,145 @@ static void hv_update_fiq(void)
     fiq_pending |= PERCPU(ipi_pending) || PERCPU(pmc_pending);
 
     sysop("isb");
-#ifndef ENABLE_VGIC_MODULE
+#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
+    bool event_unread = PERCPU(ipi_pending) ||
+                        PERCPU(timer_p_event_unread) ||
+                        PERCPU(timer_v_event_unread);
+    if (hv_native_aic_windows_ready() && event_unread) {
+        if (!(hcr & HCR_VI))
+            hv_write_hcr(hcr | HCR_VI);
+    } else if (hcr & HCR_VI) {
+        hv_write_hcr(hcr & ~HCR_VI);
+    }
+#elif !defined(ENABLE_VGIC_MODULE)
     if ((hcr & HCR_VF) && !fiq_pending) {
         hv_write_hcr(hcr & ~HCR_VF);
     } else if (!(hcr & HCR_VF) && fiq_pending) {
         hv_write_hcr(hcr | HCR_VF);
     }
 #endif
+
+    hv_carrier_drain_pending(ctx);
 }
+
+#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
+bool hv_native_aic_event_read(u64 *event)
+{
+    if (!hv_native_aic_windows_ready() || event == NULL)
+        return false;
+
+    /*
+     * Fast IPIs are FIQ-class and are consumed by m1n1 for its own EL2
+     * coordination.  Guest-originated sends are tagged by ipi_queued; reflect
+     * only those arrivals as the architectural AIC IPI EVENT expected by the
+     * native Windows controller callback.  This is an AIC EVENT/IRQ delivery,
+     * not a vGIC list-register injection.
+     */
+    if (PERCPU(ipi_pending)) {
+        *event = FIELD_PREP(AIC_EVENT_TYPE, AIC_EVENT_TYPE_IPI) |
+                 AIC_EVENT_IPI_OTHER;
+        PERCPU(ipi_pending) = false;
+    /* Windows uses the virtual timer in the proven QEMU AIC path. */
+    } else if (PERCPU(timer_v_event_unread)) {
+        *event = 3;
+        PERCPU(timer_v_event_unread) = false;
+    } else if (PERCPU(timer_p_event_unread)) {
+        *event = 2;
+        PERCPU(timer_p_event_unread) = false;
+    } else {
+        return false;
+    }
+
+    if (!PERCPU(ipi_pending) && !PERCPU(timer_p_event_unread) &&
+        !PERCPU(timer_v_event_unread))
+        hv_write_hcr(mrs(HCR_EL2) & ~HCR_VI);
+    return true;
+}
+
+/*
+ * A guest timer write is the reliable completion signal for a reflected tick.
+ * Merely polling ISTATUS in hv_update_fiq() is racy: immediately after an MSR
+ * write the old asserted status can still be observed, and if EL1 then returns
+ * without another trap the reflector remains suppressed forever.  Rearm the
+ * physical source at the trapped write itself.  hv_update_fiq() runs on the
+ * same exception exit and will suppress/post it again if the new deadline is
+ * already expired.
+ */
+static void hv_timer_reflect_guest_rearm(bool physical, bool control_write, u64 value,
+                                         bool guest_cpu_ready)
+{
+    sysop("isb");
+
+    if (!hv_native_aic_windows_active()) {
+        /*
+         * TimerDxe first writes CTL to disable/mask the timer, then registers
+         * all callbacks, and only at the end writes ENABLE=1 with IMASK clear.
+         * That final control write is the proof that native FIQ can be released.
+         */
+        if (control_write && (value & HV_TIMER_CTL_ENABLE) &&
+            !(value & HV_TIMER_CTL_IMASK)) {
+            hv_native_aic_timer_ready();
+        } else if (hv_native_aic_mu_timer_active()) {
+            if (physical) {
+                PERCPU(timer_p_reflection_pending) = false;
+                aic_set_sw(HV_TIMER_P_SWIRQ(smp_id()), false);
+                reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_P);
+            } else {
+                PERCPU(timer_v_reflection_pending) = false;
+                aic_set_sw(HV_TIMER_V_SWIRQ(smp_id()), false);
+                reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_V);
+            }
+        }
+        return;
+    }
+
+    if (!hv_native_aic_windows_ready()) {
+        /*
+         * Readiness is CPU-local.  A BSP timer write must never arm a newly
+         * entered AP: Windows has not installed that AP's KPCR/x18 yet, and an
+         * early carrier tick would crash in KfRaiseIrql at x18 + 0x38.
+         */
+        /*
+         * A timer write alone is too early on a Windows AP.  The AP bootstrap
+         * programs its timer before installing the KPCR in x18; delivering an
+         * LR in that interval enters KfRaiseIrql with x18 == 0 and bugchecks at
+         * [x18 + 0x38].  Only arm this CPU's carrier after a trapped write also
+         * proves that Windows has established its per-CPU kernel context.
+         */
+        /*
+         * Keep the compatibility clock on the BSP.  Windows AP startup can
+         * transiently populate x18 while programming its timer and then clear
+         * it again before the first local tick.  SGIs still bring every AP
+         * online through the carrier; local timer delivery begins only after
+         * the native AIC handoff.
+         */
+        PERCPU(carrier_timer_ready) = guest_cpu_ready && smp_id() == boot_cpu_idx;
+        PERCPU(timer_p_event_unread) = false;
+        PERCPU(timer_v_event_unread) = false;
+        hv_write_hcr(mrs(HCR_EL2) & ~HCR_VI);
+        if (physical) {
+            PERCPU(timer_p_reflection_pending) = false;
+            reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_P);
+        } else {
+            PERCPU(timer_v_reflection_pending) = false;
+            reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_V);
+        }
+        return;
+    }
+
+    if (physical) {
+        PERCPU(timer_p_reflection_pending) = false;
+        PERCPU(timer_p_event_unread) = false;
+        reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_P);
+    } else {
+        PERCPU(timer_v_reflection_pending) = false;
+        PERCPU(timer_v_event_unread) = false;
+        reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_V);
+    }
+    if (!PERCPU(timer_p_event_unread) && !PERCPU(timer_v_event_unread))
+        hv_write_hcr(mrs(HCR_EL2) & ~HCR_VI);
+}
+#endif
 
 #define SYSREG_MAP(sr, to)                                                                         \
     case SYSREG_ISS(sr):                                                                           \
@@ -505,12 +749,32 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
         SYSREG_PASS(SYS_IMP_APL_CORE_NRG_ACC_DAT);
         SYSREG_PASS(SYS_IMP_APL_CORE_SRM_NRG_ACC_DAT);
         /* Architectural timer, for ECV */
+#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
+#define SYSREG_MAP_REFLECT(sr, to, physical, control)                                               \
+    case SYSREG_ISS(sr):                                                                           \
+        if (is_read) {                                                                             \
+            regs[rt] = _mrs(sr_tkn(to));                                                           \
+        } else {                                                                                   \
+            _msr(sr_tkn(to), regs[rt]);                                                            \
+            hv_timer_reflect_guest_rearm(physical, control, regs[rt], regs[18] != 0);              \
+        }                                                                                          \
+        return true;
+
+        SYSREG_MAP_REFLECT(SYS_CNTV_CTL_EL0, SYS_CNTV_CTL_EL02, false, true)
+        SYSREG_MAP_REFLECT(SYS_CNTV_CVAL_EL0, SYS_CNTV_CVAL_EL02, false, false)
+        SYSREG_MAP_REFLECT(SYS_CNTV_TVAL_EL0, SYS_CNTV_TVAL_EL02, false, false)
+        SYSREG_MAP_REFLECT(SYS_CNTP_CTL_EL0, SYS_CNTP_CTL_EL02, true, true)
+        SYSREG_MAP_REFLECT(SYS_CNTP_CVAL_EL0, SYS_CNTP_CVAL_EL02, true, false)
+        SYSREG_MAP_REFLECT(SYS_CNTP_TVAL_EL0, SYS_CNTP_TVAL_EL02, true, false)
+#undef SYSREG_MAP_REFLECT
+#else
         SYSREG_MAP(SYS_CNTV_CTL_EL0, SYS_CNTV_CTL_EL02)
         SYSREG_MAP(SYS_CNTV_CVAL_EL0, SYS_CNTV_CVAL_EL02)
         SYSREG_MAP(SYS_CNTV_TVAL_EL0, SYS_CNTV_TVAL_EL02)
         SYSREG_MAP(SYS_CNTP_CTL_EL0, SYS_CNTP_CTL_EL02)
         SYSREG_MAP(SYS_CNTP_CVAL_EL0, SYS_CNTP_CVAL_EL02)
         SYSREG_MAP(SYS_CNTP_TVAL_EL0, SYS_CNTP_TVAL_EL02)
+#endif
         /* Spammy stuff seen on t600x p-cores */
         /* These are PMU/PMC registers */
         SYSREG_PASS(sys_reg(3, 2, 15, 12, 0));
@@ -590,11 +854,31 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
         SYSREG_PASS(sys_reg(2, 0, 0, 0, 7))
         SYSREG_PASS(sys_reg(2, 0, 1, 1, 4))
 
-        /* These only need to be trapped if ICH_HCR_EL2.TALL1 is set, currently not in use
+#if defined(ENABLE_VGIC_MODULE) && defined(ENABLE_NATIVE_AIC_PASSTHROUGH)
+        /*
+         * The Apple cores implement the GIC virtualization registers at EL2 but
+         * not a directly usable ICC_* interface at EL1.  During Windows' short
+         * startup-carrier phase, ICH_HCR_EL2.TALL1 routes these accesses here so
+         * they do not become illegal instructions.  No LR receives an interrupt;
+         * this is register compatibility only, until Windows enables AIC2.
+         */
         case SYSREG_ISS(ICC_IAR1_EL1):
             if(is_read) {
-                regs[rt] = hv_vgic3_do_iar1();
-                printf("R: ICC_IAR1_EL1: 0x%lx\n", regs[rt]);
+                if (hv_native_aic_windows_active() &&
+                    !hv_native_aic_windows_ready() && regs[18] == 0) {
+                    regs[rt] = 0x3ff;
+                    printf("HV: windows-native-aic: carrier IAR deferred on CPU %d with x18=0\n",
+                           smp_id());
+                } else {
+                    regs[rt] = hv_vgic3_do_iar1();
+                }
+                if (regs[rt] != 0x3ff &&
+                    regs[rt] != HV_GIC_TIMER_P_INTID &&
+                    regs[rt] != HV_GIC_TIMER_V_INTID)
+                    printf("R: ICC_IAR1_EL1: CPU %d 0x%lx x18=0x%lx x19=0x%lx "
+                           "ELR=0x%lx SPSR=0x%lx\n",
+                           smp_id(), regs[rt], regs[18], regs[19], ctx->elr,
+                           ctx->spsr);
             }
             else{
                 printf("W: ICC_IAR1_EL1: 0x%lx\n", regs[rt]);
@@ -626,11 +910,12 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
             }
             else{
                 hv_vgic3_do_eoir1(regs[rt]);
-                aic_set_mask(regs[rt], false);
-                printf("W: ICC_EOIR1_EL1: 0x%lx\n", regs[rt]);
+                if (regs[rt] != HV_GIC_TIMER_P_INTID &&
+                    regs[rt] != HV_GIC_TIMER_V_INTID)
+                    printf("W: ICC_EOIR1_EL1: 0x%lx\n", regs[rt]);
             }
             return true;
-        */
+#endif
 
 #ifdef ENABLE_VGIC_MODULE
         //
@@ -663,7 +948,16 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                 aff3 = ICH_SGI_AFF3(sgir_value);
                 aff0_targets = sgir_value & ICH_SGI_TARGETLIST_MASK;
 
-                for(int cpu = 0; cpu < num_cpus; cpu++){
+                /*
+                 * GICR frames are dense but Apple's physical CPU IDs are not:
+                 * J414s exposes frames 0..9 for CPU IDs 0..6,8,9,10.  Iterate
+                 * the exact frame map so SGIs never target absent CPU7 or omit
+                 * physical CPU10.
+                 */
+                for (u16 frame = 0; frame < hv_vgic3_num_cpus(); frame++) {
+                    int cpu = hv_vgic3_cpu_for_frame(frame);
+                    if (cpu < 0)
+                        continue;
                     if(irm == ICH_SGI_TARGET_OTHERS){
                         if(smp_id() == cpu)
                             continue;
@@ -693,7 +987,7 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                     }
                     virq_t pending = { 
                         .vintid = virq, 
-                        .priority = 0x20, 
+                        .priority = hv_vgic3_get_priority_cpu(cpu, virq),
                         .active = false, 
                         .pending = true,
                         .hw_status = false,
@@ -1189,11 +1483,23 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
         //     }
         //     return true;
 
-        /* Outer Sharable TLB maintenance instructions */
-        SYSREG_PASS(sys_reg(1, 0, 8, 1, 0)) // TLBI VMALLE1OS
-        SYSREG_PASS(sys_reg(1, 0, 8, 1, 1)) // TLBI VAE1OS
-        SYSREG_PASS(sys_reg(1, 0, 8, 1, 2)) // TLBI ASIDE1OS
-        SYSREG_PASS(sys_reg(1, 0, 8, 5, 1)) // TLBI RVAE1OS
+        /*
+         * Outer-shareable TLBI operations trap on Apple M2 even though the
+         * guest legitimately selects them from its architectural feature
+         * view.  Re-executing the trapped OS encoding at EL2 takes a nested
+         * undefined exception.  Inner-shareable maintenance has the required
+         * scope for this single-socket system and is implemented by the CPU,
+         * so translate each OS operation to its IS counterpart.
+         */
+        case SYSREG_ISS(sys_reg(1, 0, 8, 1, 0)): // VMALLE1OS -> VMALLE1IS
+            /* VMALLE1* is operandless and must encode Xt as XZR. */
+            if (is_read)
+                return false;
+            sysop("tlbi vmalle1is");
+            return true;
+        SYSREG_MAP(sys_reg(1, 0, 8, 1, 1), sys_reg(1, 0, 8, 3, 1)) // VAE1OS -> VAE1IS
+        SYSREG_MAP(sys_reg(1, 0, 8, 1, 2), sys_reg(1, 0, 8, 3, 2)) // ASIDE1OS -> ASIDE1IS
+        SYSREG_MAP(sys_reg(1, 0, 8, 5, 1), sys_reg(1, 0, 8, 2, 1)) // RVAE1OS -> RVAE1IS
 
         case SYSREG_ISS(SYS_ACTLR_EL1):
             if (is_read) {
@@ -1256,6 +1562,13 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
 }
 
 static bool hv_handle_smc(struct exc_info *ctx) {
+#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
+    if (ctx->regs[0] == HV_TIMER_REFLECT_CALL_MAGIC &&
+        (ctx->regs[1] == 17 || ctx->regs[1] == 18)) {
+        hv_timer_reflect_guest_rearm(ctx->regs[1] == 17, false, 0, true);
+        return true;
+    }
+#endif
     printf("PSCI SMC DEBUG: handling PSCI request 0x%lx\n", ctx->regs[0]);
     bool handled_smc = hv_handle_psci_smc(ctx);
     return handled_smc;
@@ -1347,7 +1660,8 @@ static void hv_exc_entry(void)
 static void hv_exc_exit(struct exc_info *ctx)
 {
     hv_wdt_breadcrumb('x');
-    hv_update_fiq();
+    hv_carrier_repair_x18(ctx);
+    hv_update_fiq(ctx);
     /* reenable PMU counters */
     reg_set(SYS_IMP_APL_PMCR0, PERCPU(exc_entry_pmcr0_cnt));
     msr(CNTVOFF_EL2, stolen_time);
@@ -1404,7 +1718,7 @@ void hv_exc_sync(struct exc_info *ctx)
         hv_wdt_breadcrumb('#');
         ctx->elr += 4;
         hv_set_elr(ctx->elr);
-        hv_update_fiq();
+        hv_update_fiq(ctx);
         hv_wdt_breadcrumb('s');
         return;
     }
@@ -1448,7 +1762,20 @@ void hv_exc_sync(struct exc_info *ctx)
 
 void hv_exc_irq(struct exc_info *ctx)
 {
+    hv_carrier_repair_x18(ctx);
 #ifdef ENABLE_VGIC_MODULE
+#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
+    /*
+     * AIC2 CONFIG is enabled on the last processor to finish the deferred HAL
+     * handoff.  Other processors may still have their per-CPU HCR.IMO set.
+     * Do not acknowledge their pending AIC EVENT at EL2: clear IMO and return,
+     * allowing the still-pending physical IRQ to be taken again by Windows EL1.
+     */
+    if (hv_native_aic_active()) {
+        hv_native_aic_enter_cpu();
+        return;
+    }
+#endif
     //
     // windows-native-aic: under ENABLE_NATIVE_AIC_PASSTHROUGH, hv.c clears
     // HCR_EL2.IMO specifically so ordinary AIC-routed physical IRQs go straight to the
@@ -1467,8 +1794,26 @@ void hv_exc_irq(struct exc_info *ctx)
     //      fallback replacing the old AIC-IRQ-to-vGIC-injection tail, below.
     //
     u32 reason = aic_ack();
-    int irq = FIELD_GET(AIC_EVENT_NUM, reason);
+    u32 irq = FIELD_GET(AIC_EVENT_NUM, reason);
     int type = FIELD_GET(AIC_EVENT_TYPE, reason);
+
+#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
+    /*
+     * AIC EVENT state can outlive a RAM chainload.  A timer-reflector SW IRQ
+     * that was posted by the previous guest may therefore already be latched
+     * when the new startup carrier begins.  It must not be translated into a
+     * vGIC LR: unlike a real level interrupt, the startup guest has no native
+     * AIC EOI path that can clear the SW-pending bit, so the same event would
+     * be acknowledged and injected forever.
+     */
+    if (!hv_native_aic_active() && irq >= HV_TIMER_SWIRQ_BASE &&
+        irq < HV_TIMER_SWIRQ_BASE + (2 * MAX_CPUS)) {
+        aic_set_mask(irq, true);
+        aic_set_sw(irq, false);
+        printf("HV: windows-native-aic: discarded stale startup reflector IRQ %u\n", irq);
+        return;
+    }
+#endif
 
     u64 misr = mrs(ICH_MISR_EL2);
     u64 eisr = mrs(ICH_EISR_EL2);
@@ -1546,25 +1891,21 @@ void hv_exc_irq(struct exc_info *ctx)
         return;
     }
 
-#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
-    //
-    // windows-native-aic fail-closed fallback (docs/windows-native-aic.md OQ-3).
-    // Reaching here means aic_ack() returned a real HW/IPI event via an actual
-    // physical-IRQ trap, i.e. this vector fired at all -- which hv.c's HCR_EL2.IMO=0
-    // is specifically meant to prevent for ordinary AIC IRQs. Do NOT translate it into
-    // a vGIC injection: the guest is not listening on the (unhooked, no longer
-    // installed) vGIC distributor for peripherals in this design, it reads AIC
-    // directly. Ack/mask the source so it does not storm EL2, log loudly so this is
-    // visible during M1 bring-up (this must show up in the M1-VALIDATION CHECKLIST as
-    // a hard failure, not be silently swallowed), and drop it.
-    //
-    printf("HV: windows-native-aic: UNEXPECTED physical IRQ trapped at EL2 despite "
-           "HCR_EL2.IMO=0 (reason=0x%x type=%d irq=%d) -- native-AIC passthrough "
-           "assumption violated, masking and dropping\n", reason, type, irq);
-    if (type == AIC_EVENT_TYPE_HW)
-        aic_set_mask(irq, true);
-#else
-    if(hv_vgic3_get_free_lr() != -1){
+    if (hv_native_aic_windows_active() && !hv_native_aic_windows_ready() &&
+        ctx->regs[18] == 0) {
+        virq_t pending = {
+            .vintid = irq,
+            .priority = hv_vgic3_get_priority(irq),
+            .active = false,
+            .pending = true,
+            .hw_status = false,
+            .hw_irq = 0,
+        };
+        virq_queue_push(&PERCPU(irq_queue), &pending);
+        printf("HV: windows-native-aic: carrier deferred CPU %d IRQ %u with x18=0\n",
+               smp_id(), irq);
+    }
+    else if(hv_vgic3_get_free_lr() != -1){
         hv_vgic3_inject_irq(
             irq,                         //vintid
             hv_vgic3_get_priority(irq),  //priority
@@ -1585,7 +1926,6 @@ void hv_exc_irq(struct exc_info *ctx)
         };
         virq_queue_push(&PERCPU(irq_queue), &pending);
     }
-#endif
 #else
     hv_wdt_breadcrumb('I');
     hv_get_context(ctx);
@@ -1625,7 +1965,8 @@ void hv_exc_fiq(struct exc_info *ctx)
 
     if (smp_id() != interruptible_cpu && !(mrs(ISR_EL1) & 0x40) && hv_want_cpu == -1) {
         // Non-interruptible CPU and it was just a timer tick (or spurious), so just update FIQs
-        hv_update_fiq();
+        hv_get_context(ctx);
+        hv_update_fiq(ctx);
         hv_arm_tick(true);
         return;
     }
@@ -1633,6 +1974,7 @@ void hv_exc_fiq(struct exc_info *ctx)
     // Slow (single threaded) path
     hv_wdt_breadcrumb('F');
     hv_get_context(ctx);
+    hv_carrier_repair_x18(ctx);
     hv_exc_entry();
 
     // Only poll for HV events in the interruptible CPU
@@ -1724,18 +2066,26 @@ void hv_exc_fiq(struct exc_info *ctx)
     //
     if (mrs(SYS_IMP_APL_IPI_SR_EL1) & IPI_SR_PENDING) {
 #ifdef ENABLE_VGIC_MODULE
-        while(hv_vgic3_get_free_lr() != -1){//another CPU sent an IPI, check the sgi_queue
-            virq_t pending;
-            if (!virq_queue_pop(&PERCPU(sgi_queue), &pending))
-                break;
-            hv_vgic3_inject_irq(
-                pending.vintid,
-                pending.priority,
-                pending.active,
-                pending.pending,
-                pending.hw_status,
-                pending.hw_irq
-            );
+        if (!hv_native_aic_windows_active() || hv_native_aic_windows_ready() ||
+            ctx->regs[18] != 0) {
+            while(hv_vgic3_get_free_lr() != -1){//another CPU sent an IPI, check the sgi_queue
+                virq_t pending;
+                if (!virq_queue_pop(&PERCPU(sgi_queue), &pending))
+                    break;
+                printf("HV: windows-native-aic: FIQ inject CPU %d SGI %u x18=0x%lx\n",
+                       smp_id(), pending.vintid, ctx->regs[18]);
+                hv_vgic3_inject_irq(
+                    pending.vintid,
+                    pending.priority,
+                    pending.active,
+                    pending.pending,
+                    pending.hw_status,
+                    pending.hw_irq
+                );
+            }
+        } else {
+            printf("HV: windows-native-aic: carrier held CPU %d SGI with no KPCR\n",
+                   smp_id());
         }
 #endif
         if (PERCPU(ipi_queued)) {

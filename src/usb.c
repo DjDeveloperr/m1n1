@@ -56,6 +56,24 @@ static bool usb_is_initialized = false;
 #define PIPEHANDLER_DUMMY_PHY_EN         BIT(15)
 #define PIPEHANDLER_NATIVE_POWER_DOWN    GENMASK(3, 0)
 
+#define USB2PHY_USBCTL           0x00
+#define USB2PHY_USBCTL_RUN       2
+#define USB2PHY_USBCTL_ISOLATION 4
+
+#define USB2PHY_CTL             0x04
+#define USB2PHY_CTL_RESET       BIT(0)
+#define USB2PHY_CTL_PORT_RESET  BIT(1)
+#define USB2PHY_CTL_APB_RESET_N BIT(2)
+#define USB2PHY_CTL_SIDDQ       BIT(3)
+
+#define USB2PHY_SIG      0x08
+#define USB2PHY_SIG_VBUS (BIT(0) | BIT(1) | BIT(2) | BIT(3))
+#define USB2PHY_SIG_HOST (7 << 12)
+
+#define USB2PHY_MISCTUNE              0x1c
+#define USB2PHY_MISCTUNE_APB_GATE_OFF BIT(29)
+#define USB2PHY_MISCTUNE_REF_GATE_OFF BIT(30)
+
 static dart_dev_t *usb_dart_init(u32 idx)
 {
     int mapper_offset;
@@ -150,6 +168,68 @@ int usb_phy_bringup(u32 idx)
     write32(usb_regs.drd_regs_unk3 + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_RESET_N);
     write32(usb_regs.drd_regs_unk3 + PIPEHANDLER_NONSELECTED_OVERRIDE, 0x9332);
 
+    return 0;
+}
+
+/*
+ * m1n1 initially brings every available controller up in device mode so any
+ * one of them can carry the proxy.  Before handing an unused port to a host
+ * guest, select the USB2 host role while both the PHY and DWC3 are held in
+ * reset.  T6020 can otherwise latch the old device role until a later reset,
+ * leaving a healthy xHCI root hub that never reports a connected device.
+ */
+static int usb_phy_handoff_host(u32 idx)
+{
+    struct usb_drd_regs regs;
+    if (usb_drd_get_regs(idx, &regs) < 0)
+        return -1;
+
+    /* Assert DWC3 reset and clamp its PIPE interface. */
+    clear32(regs.drd_regs_unk3 + PIPEHANDLER_AON_GEN,
+            PIPEHANDLER_AON_GEN_DWC3_RESET_N);
+    set32(regs.drd_regs_unk3 + PIPEHANDLER_AON_GEN,
+          PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
+
+    /* Power the USB2 PHY off before changing its latched role. */
+    write32(regs.atc + USB2PHY_USBCTL, USB2PHY_USBCTL_ISOLATION);
+    udelay(10);
+    set32(regs.atc + USB2PHY_CTL, USB2PHY_CTL_SIDDQ);
+    udelay(10);
+    set32(regs.atc + USB2PHY_CTL, USB2PHY_CTL_PORT_RESET);
+    udelay(10);
+    set32(regs.atc + USB2PHY_CTL, USB2PHY_CTL_RESET);
+    udelay(10);
+    clear32(regs.atc + USB2PHY_CTL, USB2PHY_CTL_APB_RESET_N);
+    udelay(10);
+    set32(regs.atc + USB2PHY_MISCTUNE,
+          USB2PHY_MISCTUNE_APB_GATE_OFF | USB2PHY_MISCTUNE_REF_GATE_OFF);
+
+    set32(regs.atc + USB2PHY_SIG, USB2PHY_SIG_HOST);
+
+    /* Power the PHY back up in host mode while DWC3 remains reset. */
+    set32(regs.atc + USB2PHY_SIG, USB2PHY_SIG_VBUS);
+    udelay(10);
+    clear32(regs.atc + USB2PHY_CTL, USB2PHY_CTL_SIDDQ);
+    udelay(10);
+    clear32(regs.atc + USB2PHY_CTL, USB2PHY_CTL_RESET);
+    udelay(10);
+    clear32(regs.atc + USB2PHY_CTL, USB2PHY_CTL_PORT_RESET);
+    udelay(10);
+    set32(regs.atc + USB2PHY_CTL, USB2PHY_CTL_APB_RESET_N);
+    udelay(10);
+    clear32(regs.atc + USB2PHY_MISCTUNE,
+            USB2PHY_MISCTUNE_APB_GATE_OFF | USB2PHY_MISCTUNE_REF_GATE_OFF);
+    write32(regs.atc + USB2PHY_USBCTL, USB2PHY_USBCTL_RUN);
+
+    /* Leave SuperSpeed on the safe dummy backend; USB2 remains available. */
+    write32(regs.drd_regs_unk3 + PIPEHANDLER_MUX_CTRL, PIPEHANDLER_MUX_CTRL_DUMMY);
+    clear32(regs.drd_regs_unk3 + PIPEHANDLER_AON_GEN,
+            PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
+    set32(regs.drd_regs_unk3 + PIPEHANDLER_AON_GEN,
+          PIPEHANDLER_AON_GEN_DWC3_RESET_N);
+
+    printf("USB%d: PHY handed to guest in host mode (SIG=%#x CTL=%#x)\n", idx,
+           read32(regs.atc + USB2PHY_SIG), read32(regs.atc + USB2PHY_CTL));
     return 0;
 }
 
@@ -275,7 +355,7 @@ static int usb_init_i2c(const char *i2c_path)
     if (!hpm_mngr_name || strnlen(hpm_mngr_name, 16) >= 16)
         return 0;
 
-    i2c_dev_t *i2c = i2c_init(i2c_path);
+    i2c_dev_t *i2c = i2c_init_allow_powered(i2c_path);
     if (!i2c) {
         printf("usb: i2c init failed for %s\n", i2c_path);
         return -1;
@@ -286,7 +366,7 @@ static int usb_init_i2c(const char *i2c_path)
         const char *name = adt_get_name(adt, node);
         if (!name || memcmp(name, "hpm", 3) || name[4] != '\0')
             continue; // unexpected hpm node name
-        u32 idx = name[3] - 30;
+        u32 idx = name[3] - '0';
         if (idx >= USB_IODEV_COUNT)
             continue; // unexpected hpm index
 
@@ -363,7 +443,7 @@ void usb_i2c_restore_irqs(const char *i2c_path, bool force)
     if (!hpm_mngr_name || strnlen(hpm_mngr_name, 16) >= 16)
         return;
 
-    i2c_dev_t *i2c = i2c_init(i2c_path);
+    i2c_dev_t *i2c = i2c_init_allow_powered(i2c_path);
     if (!i2c) {
         printf("usb: i2c init failed.\n");
         return;
@@ -374,7 +454,7 @@ void usb_i2c_restore_irqs(const char *i2c_path, bool force)
         const char *name = adt_get_name(adt, node);
         if (!name || memcmp(name, "hpm", 3) || name[4] != '\0')
             continue; // unexpected hpm node name
-        u32 idx = name[3] - 30;
+        u32 idx = name[3] - '0';
         if (idx >= USB_IODEV_COUNT)
             continue; // unexpected hpm index
 
@@ -438,6 +518,25 @@ void usb_iodev_shutdown(void)
         printf("USB%d: shutdown\n", i);
         usb_dwc3_shutdown(usb_iodev->opaque);
         free(usb_iodev);
+    }
+}
+
+void usb_iodev_shutdown_except(iodev_id_t keep)
+{
+    for (int i = 0; i < USB_IODEV_COUNT; i++) {
+        iodev_id_t id = IODEV_USB0 + i;
+        if (id == keep)
+            continue;
+
+        struct iodev *usb_iodev = iodev_unregister_device(id);
+        if (!usb_iodev)
+            continue;
+
+        printf("USB%d: releasing controller for guest\n", i);
+        usb_dwc3_shutdown(usb_iodev->opaque);
+        free(usb_iodev);
+        if (usb_phy_handoff_host(i) < 0)
+            printf("USB%d: failed to configure guest host mode\n", i);
     }
 }
 

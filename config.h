@@ -40,24 +40,18 @@
 // called out explicitly rather than guessed.
 //
 // When this is defined (it requires ENABLE_VGIC_MODULE, enforced below), a guest
-// booted under the hypervisor drives the real Apple AIC directly instead of the
-// emulated GICv3 distributor/redistributor:
+// booted under the hypervisor starts on the emulated GICv3 carrier, then drives
+// the real Apple AIC after the Windows HAL extension enables AIC2 CONFIG:
 //
-//  - hv.c no longer sets HCR_EL2.IMO, so physical (AIC-routed) IRQs are delivered
-//    straight to the guest at EL1 with zero EL2 involvement. HCR_EL2.FMO stays set
-//    unconditionally, because the Apple timer is FIQ-only and Windows bugchecks
-//    (0x2B/0x3D) if a raw FIQ ever reaches EL1.
-//  - hv_vgic.c's hv_vgicv3_init() skips installing the GICD/GICR/ITS MMIO hv_map_hook
-//    traps -- the guest gets the real AIC MMIO straight through (it already did; no
-//    hook ever targeted it) and drives it itself.
-//  - hv_exc.c's hv_exc_irq() no longer translates real AIC IRQ events into injected
-//    vGIC interrupts; physical IRQ is not expected to trap to EL2 at all anymore
-//    (a defensive fail-closed fallback remains in case that assumption is wrong).
+//  - HCR_EL2.IMO and the GICD/GICR hooks remain active during firmware and early
+//    Windows startup. This is required by the inbox GIC callbacks that execute
+//    before the Apple HAL's deferred carrier replacement.
+//  - hv_aic.c forwards the real AIC register page and watches AIC2 CONFIG. On its
+//    enable write, each CPU clears its virtual-interface state and HCR_EL2.IMO;
+//    physical AIC IRQs then reach the guest at EL1 with zero EL2 involvement.
 //  - The physical timer FIQ is reflected to the guest as an ordinary per-CPU AIC
-//    software-generated IRQ (aic_set_sw(), NOT a GICv3 list-register injection --
-//    that was the original plan for this file but was superseded by a per-CPU
-//    mask/pending/re-arm handshake; see hv_exc.c's hv_update_fiq() and
-//    hv_timer_reflect_init(), and docs/windows-native-aic.md "Timer re-arm handshake").
+//    software-generated IRQ after handoff; before handoff it uses the original
+//    GIC list-register carrier path. HCR_EL2.FMO remains set throughout.
 //
 #define ENABLE_NATIVE_AIC_PASSTHROUGH
 

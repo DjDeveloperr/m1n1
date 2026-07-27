@@ -11,8 +11,6 @@
 #include "utils.h"
 #include "xnuboot.h"
 
-#define FB_DEPTH_MASK 0xff
-
 fb_t fb;
 
 struct image {

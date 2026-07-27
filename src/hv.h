@@ -140,6 +140,23 @@ int hv_vgicv3_enable_virtual_interrupts(void);
 // take its first timer FIQ. See docs/windows-native-aic.md.
 //
 void hv_timer_reflect_init(void);
+void hv_timer_native_enable(void);
+void hv_timer_reflect_hold(void);
+void hv_timer_reflect_enable(void);
+bool hv_native_aic_event_read(u64 *event);
+/*
+ * Mu and Windows both own the real AIC.  Mu receives native IRQ and FIQ
+ * exceptions; when Mu disables AIC2 CONFIG at ExitBootServices, the hook
+ * changes only timer delivery: FIQ remains trapped at EL2 and is presented to
+ * Windows as a synthetic IRQ whose AIC EVENT value is the Apple timer source.
+ */
+void hv_native_aic_transition_init(void);
+bool hv_native_aic_active(void);
+bool hv_native_aic_windows_active(void);
+bool hv_native_aic_windows_ready(void);
+bool hv_native_aic_mu_timer_active(void);
+void hv_native_aic_timer_ready(void);
+void hv_native_aic_enter_cpu(void);
 #endif
 bool hv_handle_psci_smc(struct exc_info *ctx);
 int hv_handle_psci_smc_python_entry(uint64_t regs[4]);

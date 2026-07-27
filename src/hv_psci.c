@@ -51,184 +51,22 @@ unsigned int psci_num_cores, psci_num_clusters;
 // Yes I realize that this is probably pretty dumb, but this is just a temporary thing for now.
 //
 cpu_power_domain_node_t psci_cpu_nodes[MAX_CPUS];
-non_cpu_power_domain_node_t psci_non_cpu_nodes[(T6021_NUM_CLUSTERS * 2) + 1];
-static platform_local_state_t psci_requested_local_power_states[PSCI_MAX_POWER_LEVEL][24];
+non_cpu_power_domain_node_t psci_non_cpu_nodes[MAX_CPUS + NUM_SYSTEMS_ACTIVE];
+static platform_local_state_t psci_requested_local_power_states[PSCI_MAX_POWER_LEVEL][MAX_CPUS];
 spinlock_t *psci_locks;
 psci_per_cpu_data_t psci_cpu_data_array[MAX_CPUS];
 static int adt_cpu_nodes[MAX_CPUS];
+/*
+ * Apple physical CPU IDs are not necessarily dense (J414s omits 7 and 11).
+ * PSCI's topology walk is dense, while all hardware-facing arrays remain
+ * indexed by the physical ADT cpu-id.  These maps keep the two namespaces
+ * explicit instead of assuming that cpu-id == topology index.
+ */
+static uint8_t psci_active_cpu_ids[MAX_CPUS];
+static bool psci_cpu_present[MAX_CPUS];
+static unsigned char psci_power_domain_tree[MAX_CPUS + 2];
 static u64 adt_pmgr_reg;
 static u64 cpu_start_off;
-
-//
-// Apple SoC Power Domain tree descriptors, note these are per SoC so as new SoCs release, this needs to be updated.
-// Macs only for now.
-//
-
-static const unsigned char apple_t8103_power_domain_tree_descriptor[] = {
-   //
-   // Root node. There is only one.
-   //
-   NUM_SYSTEMS_ACTIVE,
-   //
-   // Number of clusters active on the system.
-   //
-   T8103_NUM_CLUSTERS,
-   //
-   // Number of cores in the E-core cluster (E core clusters are first)
-   //
-   T8103_CORES_PER_CLUSTER,
-   //
-   // Number of cores in the P-core cluster.
-   //
-   T8103_CORES_PER_CLUSTER
-};
-
-
-static const unsigned char apple_t8112_power_domain_tree_descriptor[] = {
-   //
-   // Root node. There is only one.
-   //
-   NUM_SYSTEMS_ACTIVE,
-   //
-   // Number of clusters active on the system.
-   //
-   T8112_NUM_CLUSTERS,
-   //
-   // Number of cores in the E-core cluster (E core clusters are first)
-   //
-   T8112_CORES_PER_CLUSTER,
-   //
-   // Number of cores in the P-core cluster.
-   //
-   T8112_CORES_PER_CLUSTER
-};
-
-static const unsigned char apple_t6000_power_domain_tree_descriptor[] = {
-   //
-   // Root node. There is only one.
-   //
-   NUM_SYSTEMS_ACTIVE,
-   //
-   // Number of clusters active on the system.
-   //
-   T6000_NUM_CLUSTERS,
-   //
-   // Number of cores in the E-core cluster (E core clusters are first)
-   //
-   T600X_E_CLUSTER_CORE_COUNT,
-   //
-   // Number of cores in the first P-core cluster.
-   //
-   T600X_P_CLUSTER_CORE_COUNT,
-   //
-   // Number of cores in the second P-core cluster.
-   //
-   T600X_P_CLUSTER_CORE_COUNT
-};
-
-static const unsigned char apple_t6001_power_domain_tree_descriptor[] = {
-   //
-   // Root node. There is only one.
-   //
-   NUM_SYSTEMS_ACTIVE,
-   //
-   // Number of clusters active on the system.
-   //
-   T6001_NUM_CLUSTERS,
-   //
-   // Number of cores in the E-core cluster (E core clusters are first)
-   //
-   T600X_E_CLUSTER_CORE_COUNT,
-   //
-   // Number of cores in the first P-core cluster.
-   //
-   T600X_P_CLUSTER_CORE_COUNT,
-   //
-   // Number of cores in the second P-core cluster.
-   //
-   T600X_P_CLUSTER_CORE_COUNT
-};
-
-static const unsigned char apple_t6002_power_domain_tree_descriptor[] = {
-   //
-   // Root node. There is only one.
-   //
-   NUM_SYSTEMS_ACTIVE,
-   //
-   // Number of clusters active on the system.
-   //
-   T6002_NUM_CLUSTERS,
-   //
-   // Number of cores in the E-core cluster (E core clusters are first)
-   //
-   T600X_E_CLUSTER_CORE_COUNT,
-   //
-   // Number of cores in the first P-core cluster.
-   //
-   T600X_P_CLUSTER_CORE_COUNT,
-   //
-   // Number of cores in the second P-core cluster.
-   //
-   T600X_P_CLUSTER_CORE_COUNT,
-   //
-   // Number of cores in the E-core cluster on the second die.
-   //
-   T600X_E_CLUSTER_CORE_COUNT,
-   //
-   // Number of cores in the first P-core cluster on the second die.
-   //
-   T600X_P_CLUSTER_CORE_COUNT,
-   //
-   // Number of cores in the second P-core cluster on the second die.
-   //
-   T600X_P_CLUSTER_CORE_COUNT
-};
-
-static const unsigned char apple_t6020_power_domain_tree_descriptor[] = {
-   //
-   // Root node. There is only one.
-   //
-   NUM_SYSTEMS_ACTIVE,
-   //
-   // Number of clusters active on the system.
-   //
-   T6020_NUM_CLUSTERS,
-   //
-   // Number of cores in the E-core cluster (E core clusters are first)
-   //
-   T602X_E_CLUSTER_CORE_COUNT,
-   //
-   // Number of cores in the first P-core cluster.
-   //
-   T602X_P_CLUSTER_CORE_COUNT,
-   //
-   // Number of cores in the second P-core cluster.
-   //
-   T602X_P_CLUSTER_CORE_COUNT
-};
-
-static const unsigned char apple_t6021_power_domain_tree_descriptor[] = {
-   //
-   // Root node. There is only one.
-   //
-   NUM_SYSTEMS_ACTIVE,
-   //
-   // Number of clusters active on the system.
-   //
-   T6021_NUM_CLUSTERS,
-   //
-   // Number of cores in the E-core cluster (E core clusters are first)
-   //
-   T602X_E_CLUSTER_CORE_COUNT,
-   //
-   // Number of cores in the first P-core cluster.
-   //
-   T602X_P_CLUSTER_CORE_COUNT,
-   //
-   // Number of cores in the second P-core cluster.
-   //
-   T602X_P_CLUSTER_CORE_COUNT
-};
 
 //
 // A table of valid idle states. Anything else is considered invalid.
@@ -307,61 +145,146 @@ const unsigned int valid_idle_states[] = {
 // None.
 //
 
-void hv_psci_init(void) {
-    //
-    // Save number of cores/clusters for PSCI
-    // code to keep track of.
-    //
-    // We're using the Trusted Firmware-A implementation of PSCI code,
-    // and that implementation has number of cores and clusters per platform hardcoded.
-    // (as it's expected to be ported individually to each platform and all
-    // reference platforms typically have unchanging amounts of cores.)
-    // 
-    // Due to Apple SoCs having variable amounts of cores, and a different number of clusters
-    // depending on whether it's a "Pro" chip or not, we need to instead use variables and calculate this number
-    // of cores manually.
-    //
-    // For the cluster number, there are only three possiblities, so we can hardcode this per SoC "family"
-    // (standard M-series chips have two, "Pro"/"Max" chips have three and "Ultra" chips have 6, since they are two "Max" dies interconnected together.)
-    //
-    // If hardcoding number of clusters dependent on Chip ID becomes infeasible, change the code below to dynamically determine
-    // from ADT/board id.
-    //
+typedef struct psci_adt_cpu {
+    uint8_t cpu_id;
+    uint32_t cluster_key;
+    uint32_t local_core_id;
+} psci_adt_cpu_t;
 
-    const unsigned char *topology_tree;
+static bool hv_psci_cpu_precedes(const psci_adt_cpu_t *left, const psci_adt_cpu_t *right)
+{
+    if (left->cluster_key != right->cluster_key)
+        return left->cluster_key < right->cluster_key;
+    if (left->local_core_id != right->local_core_id)
+        return left->local_core_id < right->local_core_id;
+    return left->cpu_id < right->cpu_id;
+}
 
-    //
-    // Get the platform's PSCI topology map.
-    //
-    switch(chip_id) {
-      case T8103:
-         topology_tree = apple_t8103_power_domain_tree_descriptor;
-         break;
-      case T8112:
-         topology_tree = apple_t8112_power_domain_tree_descriptor;
-         break;
-      case T6000:
-         topology_tree = apple_t6000_power_domain_tree_descriptor;
-         break;
-      case T6001:
-         topology_tree = apple_t6001_power_domain_tree_descriptor;
-         break;
-      case T6002:
-         topology_tree = apple_t6002_power_domain_tree_descriptor;
-         break;
-      case T6020:
-         topology_tree = apple_t6020_power_domain_tree_descriptor;
-         break;
-      case T6021:
-         topology_tree = apple_t6021_power_domain_tree_descriptor;
-         break;
+/*
+ * Build the PSCI hierarchy from Apple's live device tree.  Family-wide core
+ * maxima are not topology: binned parts such as J414s legitimately have
+ * sparse cpu-id values and fewer active cores in a cluster.  Linux makes the
+ * same decision from the enabled CPU nodes rather than a SoC maximum.
+ */
+static const unsigned char *hv_psci_build_adt_topology(void)
+{
+    psci_adt_cpu_t cpus[MAX_CPUS];
+    unsigned int cpu_count = 0;
+    int cpus_node = adt_path_offset(adt, "/cpus");
+    int node = cpus_node;
+
+    if (cpus_node < 0)
+        panic("PSCI setup fatal error: /cpus is missing from ADT\n");
+
+    memset(adt_cpu_nodes, 0, sizeof(adt_cpu_nodes));
+    memset(psci_active_cpu_ids, 0xff, sizeof(psci_active_cpu_ids));
+    memset(psci_cpu_present, 0, sizeof(psci_cpu_present));
+    memset(psci_cpu_nodes, 0, sizeof(psci_cpu_nodes));
+    memset(psci_cpu_data_array, 0, sizeof(psci_cpu_data_array));
+    memset(psci_power_domain_tree, 0, sizeof(psci_power_domain_tree));
+
+    ADT_FOREACH_CHILD(adt, node) {
+        unsigned int cpu_id;
+        unsigned int reg;
+        unsigned int cluster_id;
+        unsigned int local_core_id;
+        unsigned int die_id = 0;
+        unsigned short cluster_type;
+        uint64_t mpidr = BIT(31);
+
+        if (ADT_GETPROP(adt, node, "cpu-id", &cpu_id) < 0)
+            continue;
+        if (cpu_id >= MAX_CPUS)
+            panic("PSCI setup fatal error: ADT cpu-id %u exceeds MAX_CPUS\n", cpu_id);
+        if (psci_cpu_present[cpu_id])
+            panic("PSCI setup fatal error: duplicate ADT cpu-id %u\n", cpu_id);
+        if (cpu_count >= MAX_CPUS)
+            panic("PSCI setup fatal error: too many ADT CPUs\n");
+        if (ADT_GETPROP(adt, node, "reg", &reg) < 0)
+            panic("PSCI setup fatal error: CPU%u has no reg property\n", cpu_id);
+        if (ADT_GETPROP(adt, node, "die-cluster-id", &cluster_id) < 0)
+            cluster_id = (reg >> 8) & 0xff;
+        if (ADT_GETPROP(adt, node, "die-id", &die_id) < 0)
+            die_id = 0;
+        if (ADT_GETPROP(adt, node, "cluster-core-id", &local_core_id) < 0)
+            local_core_id = reg & 0xff;
+        if (ADT_GETPROP(adt, node, "cluster-type", &cluster_type) < 0)
+            panic("PSCI setup fatal error: CPU%u has no cluster-type property\n", cpu_id);
+
+        /* Apple ADT reg omits Aff2=1 on P cores; MPIDR_EL1 and Linux include it. */
+        mpidr |= reg;
+        if (cluster_type == 'P')
+            mpidr |= BIT(16);
+        else if (cluster_type != 'E')
+            panic("PSCI setup fatal error: CPU%u has unknown cluster type 0x%x\n",
+                  cpu_id, cluster_type);
+
+        adt_cpu_nodes[cpu_id] = node;
+        psci_cpu_present[cpu_id] = true;
+        psci_cpu_nodes[cpu_id].mpidr = mpidr;
+        psci_cpu_data_array[cpu_id].cpu_index = cpu_id;
+        psci_cpu_data_array[cpu_id].reg_value = reg;
+        psci_cpu_data_array[cpu_id].cluster_index = cluster_id;
+        psci_cpu_data_array[cpu_id].die_index = die_id;
+        psci_cpu_data_array[cpu_id].local_core_number = local_core_id;
+        cpus[cpu_count++] = (psci_adt_cpu_t) {
+            .cpu_id = (uint8_t)cpu_id,
+            .cluster_key = (die_id << 16) | (cluster_id & 0xffff),
+            .local_core_id = local_core_id,
+        };
     }
-    printf("PSCI DEBUG: topology tree selected\n");
-    psci_num_clusters = topology_tree[1];
+
+    if (!cpu_count)
+        panic("PSCI setup fatal error: ADT contains no usable CPU nodes\n");
+
+    for (unsigned int i = 1; i < cpu_count; i++) {
+        psci_adt_cpu_t current = cpus[i];
+        unsigned int j = i;
+        while (j && hv_psci_cpu_precedes(&current, &cpus[j - 1])) {
+            cpus[j] = cpus[j - 1];
+            j--;
+        }
+        cpus[j] = current;
+    }
+
+    psci_power_domain_tree[0] = NUM_SYSTEMS_ACTIVE;
+    uint32_t previous_cluster = ~0u;
+    unsigned int cluster_count = 0;
+    for (unsigned int dense = 0; dense < cpu_count; dense++) {
+        unsigned int cpu_id = cpus[dense].cpu_id;
+        if (cpus[dense].cluster_key != previous_cluster) {
+            previous_cluster = cpus[dense].cluster_key;
+            if (++cluster_count >= MAX_CPUS)
+                panic("PSCI setup fatal error: too many ADT clusters\n");
+        }
+        psci_power_domain_tree[cluster_count + 1]++;
+        psci_active_cpu_ids[dense] = (uint8_t)cpu_id;
+        psci_cpu_data_array[cpu_id].topology_index = dense;
+    }
+    psci_power_domain_tree[1] = cluster_count;
+    psci_num_cores = cpu_count;
+    psci_num_clusters = cluster_count;
+
+    printf("PSCI: ADT topology has %u active CPUs in %u clusters:",
+           psci_num_cores, psci_num_clusters);
+    for (unsigned int dense = 0; dense < psci_num_cores; dense++)
+        printf(" %u", psci_active_cpu_ids[dense]);
+    printf("\n");
+
+    return psci_power_domain_tree;
+}
+
+void hv_psci_init(void) {
+    const unsigned char *topology_tree = hv_psci_build_adt_topology();
+
+    printf("PSCI DEBUG: ADT topology tree built\n");
     printf("PSCI DEBUG: allocating RAM for locks\n");
     psci_locks = malloc(((psci_num_clusters + NUM_SYSTEMS_ACTIVE) * sizeof(spinlock_t)));
     printf("PSCI DEBUG: populating power domain tree\n");
-    psci_num_cores = hv_psci_populate_power_domain_tree(topology_tree);
+    unsigned int populated_cores = hv_psci_populate_power_domain_tree(topology_tree);
+    if (populated_cores != psci_num_cores)
+        panic("PSCI setup fatal error: topology populated %u of %u ADT CPUs\n",
+              populated_cores, psci_num_cores);
     printf("PSCI DEBUG: updating power level limits\n");
     hv_psci_update_power_level_limits();
 
@@ -374,20 +297,6 @@ void hv_psci_init(void) {
     }
     if (adt_get_reg(adt, adt_pmgr_path, "reg", 0, &adt_pmgr_reg, NULL) < 0) {
         printf("PSCI setup fatal error: Error getting /arm-io/pmgr regs\n");
-    }
-    int node = adt_path_offset(adt, "/cpus");
-   //  psci_num_cores = 1;
-    //
-    // Set up the ADT cpu nodes, to use in cpu on and off code.
-    //
-    memset(adt_cpu_nodes, 0, sizeof(adt_cpu_nodes));
-    ADT_FOREACH_CHILD(adt, node) {
-        unsigned int cpu_identifier;
-        if(ADT_GETPROP(adt, node, "cpu-id", &cpu_identifier) < 0) {
-            continue;
-        }
-      //   psci_num_cores++;
-        adt_cpu_nodes[cpu_identifier] = node;
     }
     switch (chip_id) {
         case T8103:
@@ -408,67 +317,7 @@ void hv_psci_init(void) {
     }
     printf("PSCI DEBUG: Number of cores for PSCI nodes is %d\n", psci_num_cores);
 
-    //
-    // Allocate memory for PSCI power domain tree based on previously obtained core/cluster count values.
-    //
     printf("PSCI DEBUG: Number of clusters for PSCI nodes is %d\n", psci_num_clusters);
-   //  psci_cpu_nodes = malloc((psci_num_cores * sizeof(cpu_power_domain_node_t)));
-   //  psci_non_cpu_nodes = malloc((psci_num_clusters + NUM_SYSTEMS_ACTIVE) * sizeof(non_cpu_power_domain_node_t));
-   //  for(int i = 0; i < PSCI_MAX_POWER_LEVEL; i++) {
-   //    psci_requested_local_power_states[i] = malloc((psci_num_cores * sizeof(platform_local_state_t)));
-   //  }
-
-   //  psci_cpu_data_array = malloc(((psci_num_cores) * sizeof(psci_per_cpu_data_t)));
-
-    //
-    // Save the global CPU number, local cluster core number, lower two bytes of MPIDR for each core, (the ADT "reg" value in the CPU nodes.)
-    // and the die number for each of the cores here.
-    //
-    for(int i = 0; i < MAX_CPUS; i++) {
-        int current_node = adt_cpu_nodes[i];
-
-        if(!current_node) {
-         continue;
-        }
-        unsigned int cpu_identifier;
-        unsigned int reg_identifier;
-        unsigned int cluster_num;
-        unsigned int local_cluster_core_num;
-        unsigned int die_id;
-        unsigned short cluster_type;
-        unsigned int mpidr_data = (1 << 31);
-        if(ADT_GETPROP(adt, current_node, "cpu-id", &cpu_identifier) < 0) {
-            continue;
-        }
-        if(ADT_GETPROP(adt, current_node, "reg", &reg_identifier) < 0) {
-            continue;
-        }
-        if(ADT_GETPROP(adt, current_node, "die-cluster-id", &cluster_num) < 0) {
-            //TODO: this does not exist on T810X
-            //continue;
-        }
-        if(ADT_GETPROP(adt, current_node, "die-id", &die_id) < 0) {
-            //TODO: this does not exist on T810X
-            //continue;
-        }
-        if(ADT_GETPROP(adt, current_node, "cluster-core-id", &local_cluster_core_num) < 0) {
-            //TODO: this does not exist on T810X
-            //continue;
-        }
-        if(ADT_GETPROP(adt, current_node, "cluster-type", &cluster_type) < 0) {
-            continue;
-        }
-        psci_cpu_data_array[cpu_identifier].cpu_index = cpu_identifier;
-        psci_cpu_data_array[cpu_identifier].reg_value = reg_identifier;
-        psci_cpu_data_array[cpu_identifier].cluster_index = cluster_num;
-        psci_cpu_data_array[cpu_identifier].die_index = die_id;
-        psci_cpu_data_array[cpu_identifier].local_core_number = local_cluster_core_num;
-        if(cluster_type == 'P') {
-         mpidr_data |= (1 << 16);
-        }
-        psci_cpu_nodes[cpu_identifier].mpidr = ((mpidr_data) | (reg_identifier));
-    }
-
     printf("PSCI DEBUG: Total number of nodes in power domain tree is %d (%d cores, %d clusters, %d system)\n", 
     (psci_num_clusters + psci_num_cores + NUM_SYSTEMS_ACTIVE), 
     psci_num_cores, 
@@ -511,17 +360,21 @@ void hv_psci_init_requested_local_power_states(void) {
 }
 
 void hv_psci_update_power_level_limits(void) {
-   unsigned int cpu_index;
+   unsigned int dense_index;
    int j;
    unsigned int nodes_index[PSCI_MAX_POWER_LEVEL];
    unsigned int temp_index[PSCI_MAX_POWER_LEVEL];
 
-   for(cpu_index = 0; cpu_index < psci_num_cores; cpu_index++) {
+   for (unsigned int index = 0; index < PSCI_MAX_POWER_LEVEL; index++)
+      nodes_index[index] = ~0u;
+
+   for(dense_index = 0; dense_index < psci_num_cores; dense_index++) {
+      unsigned int cpu_index = psci_active_cpu_ids[dense_index];
       hv_psci_get_parent_nodes(cpu_index, PSCI_MAX_POWER_LEVEL, temp_index);
       for(j = PSCI_MAX_POWER_LEVEL - 1; j >= 0; j--) {
          if(temp_index[j] != nodes_index[j]) {
             nodes_index[j] = temp_index[j];
-            psci_non_cpu_nodes[nodes_index[j]].first_cpu_idx = cpu_index;
+            psci_non_cpu_nodes[nodes_index[j]].first_cpu_idx = dense_index;
          }
          psci_non_cpu_nodes[nodes_index[j]].num_cpu_siblings++;
       }
@@ -543,9 +396,7 @@ void hv_psci_initialize_power_domain_node(uint16_t node_index, unsigned int pare
       psci_per_cpu_data_t *cpu_data;
       //printf("PSCI DEBUG: setting CPU parent node to %d\n", parent_index);
       psci_cpu_nodes[node_index].parent_node = parent_index;
-      //printf("PSCI DEBUG: setting CPU node MPIDR to 0\n");
-      psci_cpu_nodes[node_index].mpidr = 0;
-      cpu_data = psci_cpu_data_array;
+      cpu_data = &psci_cpu_data_array[node_index];
       //printf("PSCI DEBUG: setting CPU node affinity state to OFF\n");
       cpu_data->affinity_state = AFFINITY_STATE_OFF;
       //printf("PSCI DEBUG: setting CPU node targeted suspend level to default level\n");
@@ -575,8 +426,17 @@ unsigned int hv_psci_populate_power_domain_tree(const unsigned char *power_domai
          num_children = power_domain_tree_map[parent_node_index];
          printf("PSCI DEBUG: number of children in level %d is %d\n", level, num_children);
          for(j = node_index; j < (node_index + num_children); j++) {
-            printf("PSCI DEBUG: initializing power domain node %d with parent %d, at level %d\n", j, (parent_node_index - 1), level);
-            hv_psci_initialize_power_domain_node((uint16_t)j, parent_node_index - 1U, (unsigned char)level);
+            unsigned int storage_index = j;
+            if (level == (int)PSCI_CPU_POWER_LEVEL) {
+               if (j >= psci_num_cores)
+                  panic("PSCI setup fatal error: topology CPU index %u is out of range\n", j);
+               storage_index = psci_active_cpu_ids[j];
+            }
+            printf("PSCI DEBUG: initializing power domain node %d (storage %d) with parent %d, at level %d\n",
+                   j, storage_index, (parent_node_index - 1), level);
+            hv_psci_initialize_power_domain_node((uint16_t)storage_index,
+                                                 parent_node_index - 1U,
+                                                 (unsigned char)level);
          }
          node_index = j;
          number_of_nodes_at_next_level += num_children;
@@ -736,8 +596,10 @@ void hv_psci_set_requested_local_power_state(unsigned int power_level, unsigned 
    // Do not allow access to CPU power level (as this array does not store the requested state for that.)
    //
    assert(power_level > 0);
-   if((power_level > 0) && (power_level <= PSCI_MAX_POWER_LEVEL) && (cpu_index < psci_num_cores)) {
-      psci_requested_local_power_states[power_level - 1][cpu_index] = requested_power_state;
+   if((power_level > 0) && (power_level <= PSCI_MAX_POWER_LEVEL) &&
+      (cpu_index < MAX_CPUS) && psci_cpu_present[cpu_index]) {
+      unsigned int dense_index = psci_cpu_data_array[cpu_index].topology_index;
+      psci_requested_local_power_states[power_level - 1][dense_index] = requested_power_state;
    }
 }
 
@@ -1228,12 +1090,13 @@ int hv_psci_validate_entry_point(entry_point_info_t *entry_point, unsigned long 
 }
 
 int hv_psci_validate_mpidr_exists(uint64_t mpidr) {
-   for(int i = 0; i < MAX_CPUS; i++) {
+   for(unsigned int dense = 0; dense < psci_num_cores; dense++) {
       //
       // Iterate through the cpu power domain nodes, if we find the MPIDR in here, return success.
       //
-      unsigned long mpidr_to_test = psci_cpu_nodes[i].mpidr;
-      if(mpidr == mpidr_to_test) {
+      unsigned int cpu_id = psci_active_cpu_ids[dense];
+      unsigned long mpidr_to_test = psci_cpu_nodes[cpu_id].mpidr;
+      if((mpidr & 0x00ffffffUL) == (mpidr_to_test & 0x00ffffffUL)) {
          return PSCI_STATUS_SUCCESS;
       }
    }
@@ -1246,10 +1109,12 @@ unsigned int hv_psci_translate_mpidr_to_cpu(unsigned int target_cpu) {
    //
    unsigned int mpidr_reg_to_check = target_cpu & 0x0000ffff;
    unsigned int result = 0xff;
-   for(int i = 0; i < MAX_CPUS; i++) {
-      unsigned int saved_reg_value = psci_cpu_data_array[i].reg_value;
+   for(unsigned int dense = 0; dense < psci_num_cores; dense++) {
+      unsigned int cpu_id = psci_active_cpu_ids[dense];
+      unsigned int saved_reg_value = psci_cpu_data_array[cpu_id].reg_value;
       if(mpidr_reg_to_check == saved_reg_value) {
-         result = i;
+         result = cpu_id;
+         break;
       }
    }
    if(result == 0xff) {
@@ -1274,7 +1139,8 @@ int hv_psci_turn_on_cpu(uint64_t target_cpu, uint64_t entry_point, uint64_t cont
    //
    unsigned int cpu_identifier = hv_psci_translate_mpidr_to_cpu(target_cpu);
    int retval = PSCI_STATUS_SUCCESS; //assume success
-   printf("PSCI DEBUG: turning on CPU%d MPIDR: 0x%lx\n", cpu_identifier, target_cpu);
+   printf("PSCI DEBUG: turning on CPU%d MPIDR: 0x%lx entry=0x%lx context=0x%lx\n",
+          cpu_identifier, target_cpu, entry_point, context_id);
 #ifdef PSCI_POWER_ON_CPUS_ENABLE
    entry_point_info_t entry_point_info;
    //
@@ -1287,19 +1153,16 @@ int hv_psci_turn_on_cpu(uint64_t target_cpu, uint64_t entry_point, uint64_t cont
    //
    retval = hv_psci_validate_entry_point(&entry_point_info, entry_point, context_id);
 #else
-   //
-   // Get the cpu-release-addr value, this is where the spinning CPU is looking for the entry point;
-   //
-
-   //We need to get the EL1 release address. It was patched into EL2 ADT (this) in reg-private prop of the cpu node
-   uint64_t release_addr = smp_get_release_addr(cpu_identifier, true);
-   //
-   // Write the entry point over and then wake the CPU.
-   //
-   write64(release_addr, entry_point);
-   write64(release_addr + sizeof(uint64_t), context_id);//also write context_id to args[0] as ntoskrnl expects
-   dc_civac_range((void *)release_addr, sizeof(uint64_t) * 2);
-   sysop("sev");
+   /*
+    * m1n1 owns the physical secondary and keeps it in its EL2 spin loop.  The
+    * old implementation wrote the guest entry point into that loop's C call
+    * target, which executed the Windows AP bootstrap directly at EL2.  Enter
+    * it through the normal hypervisor secondary path so HCR/stage-2/AIC state
+    * is installed and the entry runs at guest EL1.  PSCI passes context_id in
+    * X0 on the target CPU.
+    */
+   uint64_t regs[4] = {context_id, 0, 0, 0};
+   hv_start_secondary(cpu_identifier, (void *)entry_point, regs);
    return retval;
 
 #endif
@@ -1689,15 +1552,27 @@ bool hv_handle_psci_smc(struct exc_info *ctx) {
             ctx->regs[0] = retval;
             break;
          case PSCI_SYSTEM_POWEROFF_FUNCTION_ID:
-            hv_psci_turn_off_system();
-            //
-            // We don't return from this.
-            //
          case PSCI_SYSTEM_RESET_FUNCTION_ID:
-            hv_psci_reset_system();
-            //
-            // We don't return from this.
-            //
+            /*
+             * Native-AIC bring-up diagnostic: preserve the failing guest instead
+             * of immediately powering off or rebooting back into the resident
+             * stage-1 proxy.
+             * ELR points at the SMC instruction and X30 identifies its caller.
+             */
+            printf("PSCI SYSTEM HOLD: guest requested %s at ELR=0x%llx "
+                   "X30=0x%llx SP_EL0=0x%llx SP_EL1=0x%llx SPSR=0x%llx "
+                   "X1=0x%llx X2=0x%llx X3=0x%llx\n",
+                   psci_func_id == PSCI_SYSTEM_POWEROFF_FUNCTION_ID ?
+                       "SYSTEM_OFF" : "SYSTEM_RESET",
+                   (unsigned long long)ctx->elr,
+                   (unsigned long long)ctx->regs[30],
+                   (unsigned long long)ctx->sp[0],
+                   (unsigned long long)ctx->sp[1],
+                   (unsigned long long)ctx->spsr,
+                   (unsigned long long)ctx->regs[1],
+                   (unsigned long long)ctx->regs[2],
+                   (unsigned long long)ctx->regs[3]);
+            return false;
          case PSCI_FEATURES_FUNCTION_ID:
             retval = hv_psci_features(w1);
             ctx->regs[0] = retval;

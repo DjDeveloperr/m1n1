@@ -391,8 +391,8 @@ deleted):
 
 ## 8. Open questions
 
-- **OQ-1 (placement):** `HV_TIMER_SWIRQ_BASE = aic->max_irq - (2 * MAX_CPUS)` reserves
-  the topmost `2 * MAX_CPUS` (48) AIC HW IRQ numbers for the timer reflector. This is a
+- **OQ-1 (placement):** `HV_TIMER_SWIRQ_BASE = aic->nr_irq - (2 * MAX_CPUS)` reserves
+  the topmost `2 * MAX_CPUS` (48) implemented AIC HW IRQ numbers for the timer reflector. This is a
   common convention (real peripherals are enumerated from the ADT starting near the
   bottom) but has **not** been cross-checked against any specific chip's actual
   interrupt map. Confirm nothing else claims these numbers before trusting this on real
@@ -432,12 +432,35 @@ deleted):
   that the timer is no longer GIC-PPI-delivered? Left unchanged rather than guessed at
   either way (see `src/hv_exc.c`, `case SYSREG_ISS(ID_AA64PFR0_EL1)`).
 
-## 9. M1-VALIDATION CHECKLIST
+## 9. J414S HARDWARE BRING-UP STATUS (2026-07-26)
 
-Everything above is design reasoning from reading m1n1's own source plus the RE docs in
-`apple_silicon_nt_drivers/docs/`. None of it has run on real hardware. This checklist is
-the concrete "what to boot/measure" companion; nothing in this patch should be trusted
-without it.
+The path has now run on an M2 Pro Mac14,9 (`apple,j414s`) with the current m1n1
+RAM-chainloaded over the older resident proxy.  Observed hardware evidence:
+
+- Mu starts with native-AIC passthrough active and reaches Windows Boot Manager.
+- After waking the correct HPM and handing USB1's PHY/controller to the guest in
+  host mode, Mu enumerates a Satechi NVMe enclosure as high-speed USB mass storage,
+  validates its GPT/FAT ESP, and loads `EFI/BOOT/BOOTAA64.EFI` and `bootmgfw.efi`.
+  SuperSpeed operation is not yet proven; the successful enumeration is USB2.
+- Windows reaches its kernel transition and executes PMUv3/PSCI and feature-register
+  probes.  An EL2 undefined exception caused by operandless `TLBI VMALLE1OS` was
+  fixed by explicitly issuing `TLBI VMALLE1IS` with the reserved `XZR` operand.
+- The next captured failure was Windows recovery status `0xc000000d`, "Fatal error
+  transitioning to the operating system."  Mu simultaneously rejected
+  `ExitBootServices()` because runtime descriptors were not 64 KiB aligned.  The raw
+  guest load address and T602x runtime code/data bins have been corrected; live
+  verification of that correction is pending the next powered target run.
+
+The checklist below therefore distinguishes what the hardware run has already
+established from the remaining native-AIC correctness work.  Reaching the kernel is
+not evidence that timer reflection, per-CPU affinity, IPIs, or peripheral interrupts
+are fully correct.
+
+## 10. M1-VALIDATION CHECKLIST
+
+Most of the interrupt-correctness analysis above remains design reasoning from m1n1's
+source plus the RE docs in `apple_silicon_nt_drivers/docs/`.  The limited J414s evidence
+in section 9 does not satisfy the timer/IPI/peripheral acceptance tests below.
 
 **T0 -- sanity / does it boot at all**
 - [ ] Boots a Windows guest (or, as a cheaper first step, m1n1's own test harness /a

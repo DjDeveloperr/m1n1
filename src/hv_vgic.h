@@ -595,6 +595,9 @@ void hv_vgicv3_init_list_registers(void);
 int hv_vgicv3_enable_virtual_interrupts(void);
 
 u8 hv_vgic3_get_priority(u64 intd);
+u8 hv_vgic3_get_priority_cpu(int cpu, u64 intd);
+u16 hv_vgic3_num_cpus(void);
+int hv_vgic3_cpu_for_frame(u16 frame);
 
 int hv_vgic3_get_free_lr(void);
 

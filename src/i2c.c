@@ -27,7 +27,7 @@ struct i2c_dev {
     uintptr_t base;
 };
 
-i2c_dev_t *i2c_init(const char *adt_node)
+static i2c_dev_t *i2c_init_internal(const char *adt_node, bool allow_powered)
 {
     int adt_path[8];
     int adt_offset;
@@ -44,8 +44,18 @@ i2c_dev_t *i2c_init(const char *adt_node)
     }
 
     if (pmgr_adt_power_enable(adt_node)) {
-        printf("i2c: Error enabling power for %s\n", adt_node);
-        return NULL;
+        if (!allow_powered) {
+            printf("i2c: Error enabling power for %s\n", adt_node);
+            return NULL;
+        }
+
+        /*
+         * A RAM-chainloaded m1n1 can inherit an already-live I2C block from
+         * the resident stub even when its reconstructed PMGR dependency state
+         * cannot be enabled recursively.  USB HPM access is still valid in
+         * that state, so permit the caller to use the mapped controller.
+         */
+        printf("i2c: power enable failed for %s; trying inherited controller\n", adt_node);
     }
 
     i2c_dev_t *dev = calloc(1, sizeof(*dev));
@@ -54,6 +64,16 @@ i2c_dev_t *i2c_init(const char *adt_node)
 
     dev->base = base;
     return dev;
+}
+
+i2c_dev_t *i2c_init(const char *adt_node)
+{
+    return i2c_init_internal(adt_node, false);
+}
+
+i2c_dev_t *i2c_init_allow_powered(const char *adt_node)
+{
+    return i2c_init_internal(adt_node, true);
 }
 
 void i2c_shutdown(i2c_dev_t *dev)
