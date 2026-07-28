@@ -13,6 +13,8 @@ parser = argparse.ArgumentParser(description='Run a Mach-O payload under the hyp
 parser.add_argument('-s', '--symbols', type=pathlib.Path)
 parser.add_argument('-m', '--script', type=pathlib.Path, action='append', default=[])
 parser.add_argument('-c', '--command', action="append", default=[])
+parser.add_argument('--abort-on-script-error', action="store_true",
+                    help="exit instead of entering the guest shell when a preload script/command fails")
 parser.add_argument('-S', '--shell', action="store_true")
 parser.add_argument('-e', '--hook-exceptions', action="store_true")
 parser.add_argument('-d', '--debug-xnu', action="store_true")
@@ -100,6 +102,8 @@ for i in args.script:
         hv.run_script(i)
     except:
         traceback.print_exc()
+        if args.abort_on_script_error:
+            raise
         args.shell = True
 
 for i in args.command:
@@ -107,6 +111,8 @@ for i in args.command:
         hv.run_code(i)
     except:
         traceback.print_exc()
+        if args.abort_on_script_error:
+            raise
         args.shell = True
 
 if args.shell:
