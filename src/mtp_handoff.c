@@ -97,6 +97,21 @@
 #define MTP_IOVA_WINDOW_SIZE 0x10000000ULL
 #define MTP_READY_TIMEOUT    (3 * USEC_PER_SEC)
 
+/*
+ * Multitouch firmware staging window, in lockstep with the fourth _CRS
+ * memory resource in the Windows MTP SSDT (integration/hardware/m2-pro/
+ * project-mu/MTP.asl) and with the Mu MemoryInitPeiLib reservation overlay.
+ * AppleMtpHid writes the firmware payload at the CPU physical address and
+ * sends the bus address in command 0x95, so the mapping must be established
+ * here and must survive into Windows.  The bus address sits above the IOP
+ * firmware segment VAs (~0x10c1000) and below the RTKit IOVA window at
+ * 0x2000000; the physical carveout is DRAM base + 512 MiB, which Mu removes
+ * from the UEFI memory map so Windows never allocates it.
+ */
+#define MTP_FW_STAGING_DVA  0x1800000ULL
+#define MTP_FW_STAGING_PHYS 0x10020000000ULL
+#define MTP_FW_STAGING_SIZE 0x100000ULL
+
 struct mtp_handoff_state {
     asc_dev_t *asc;
     dart_dev_t *dart;
@@ -338,6 +353,21 @@ void mtp_handoff_init(void)
         printf("mtp-handoff: IOVA allocator setup failed\n");
         goto fail;
     }
+
+    /*
+     * Pre-map the firmware staging window before the IOP boots.  Wiping it
+     * first means the IOP can never observe stale DRAM contents through the
+     * mapping, and Windows only ever sends command 0x95 after writing a
+     * validated payload here.
+     */
+    memset((void *)MTP_FW_STAGING_PHYS, 0, MTP_FW_STAGING_SIZE);
+    if (dart_map(mtp_handoff.dart, MTP_FW_STAGING_DVA, (void *)MTP_FW_STAGING_PHYS,
+                 MTP_FW_STAGING_SIZE) < 0) {
+        printf("mtp-handoff: could not map firmware staging window\n");
+        goto fail;
+    }
+    printf("mtp-handoff: firmware staging DVA %#llx -> %#llx/+%#llx\n", MTP_FW_STAGING_DVA,
+           MTP_FW_STAGING_PHYS, MTP_FW_STAGING_SIZE);
 
     mtp_handoff.asc = asc_init(MTP_PATH);
     if (!mtp_handoff.asc) {
