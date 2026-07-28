@@ -1923,9 +1923,24 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
             if (is_read) {
                 regs[rt] = mrs(SYS_IMP_APL_CYC_OVRD);
             } else {
-                if (regs[rt] & (CYC_OVRD_DISABLE_WFI_RET | CYC_OVRD_FIQ_MODE_MASK))
+                u64 value = regs[rt];
+
+                if (value & (CYC_OVRD_DISABLE_WFI_RET | CYC_OVRD_FIQ_MODE_MASK))
                     return false;
-                msr(SYS_IMP_APL_CYC_OVRD, regs[rt]);
+#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
+                /*
+                 * Windows may program the remaining CYC_OVRD policy after
+                 * secondary startup. Keep the native-AIC invariant installed
+                 * by hv_configure_guest_wfi_mode(): mode 2 is the Apple
+                 * clock-gate-only mode that preserves architectural registers
+                 * across WFI. A trapped guest write must not silently restore
+                 * mode 0 and reintroduce the x18/KPCR loss.
+                 */
+                value &= ~CYC_OVRD_WFI_MODE_MASK;
+                value |= CYC_OVRD_WFI_MODE(2);
+#endif
+                msr(SYS_IMP_APL_CYC_OVRD, value);
+                sysop("isb");
             }
             return true;
             /* clang-format off */
