@@ -2,11 +2,11 @@
 
 Branch: `windows-native-aic`. Base: `windows` (vGIC-emulation design, `ENABLE_VGIC_MODULE`).
 
-**Status: UNTESTED.** This is a first, careful implementation, not a claim that it
-works. There is no M1 available to this author; correctness of every
-register/timing/routing claim below is gated on real hardware. Every place a fact
-could not be cited from m1n1's own headers/source is marked explicitly as an
-assumption, an open question, or a fail-closed fallback -- never guessed.
+**Status: ACTIVE HARDWARE BRING-UP.** Native AIC2 CONFIG handoff, four-core
+startup, timer reflection, and real Fast-IPI sends have all executed on a J414s
+M2 Pro. Windows has progressed into storage bring-up, but a successful boot is
+not yet claimed. Sections that still describe an unvalidated mechanism are
+retained as explicit open questions rather than historical assumptions.
 
 **Toolchain note (this DOES change the starting premise for future work on this
 patch):** the task that produced this patch was framed as "cannot be built on this
@@ -314,9 +314,8 @@ IRQ:
 
 Both are FIQ-class physical interrupt sources that keep trapping to EL2 because
 `HCR_EL2.FMO` stays set (they are not fixed by clearing `IMO`, unlike ordinary AIC
-IRQs). Per the originating task's explicit instruction, this patch does **not** invent
-new virtual-interrupt reflection machinery for either -- it documents the decision and
-leaves the pre-existing fail-closed behavior in place.
+IRQs). PMU remains fail-closed. Fast IPI now has a hardware-tested native-AIC
+transport described below.
 
 **PMU** (`src/hv_exc.c`, `hv_exc_fiq()`, the `SYS_IMP_APL_PMCR0` handling): unchanged.
 The physical source is masked (IACT + IMODE cleared) on FIQ, and
@@ -330,25 +329,28 @@ interrupts bypass EL2 the same way ordinary peripherals do -- unvalidated, out o
 for this pass.
 
 **Fast-IPI** (`SYS_IMP_APL_IPI_RR_LOCAL_EL1`/`IPI_RR_GLOBAL_EL1`/`IPI_SR_EL1`):
-CPU-local, bypasses AIC entirely, so clearing `HCR_EL2.IMO` does not help it. m1n1 also
-uses this exact mechanism for its **own** EL2-internal cross-core coordination
-(`smp_send_ipi()`, `src/smp.c:417-424`, used by `hv_rendezvous()`), so it cannot simply
-be permanently masked. A guest write to the RR registers is already trapped and relayed
-to a real IPI unconditionally (`hv_handle_msr()`, unrelated to this flag); what stays
-fail-closed, unchanged, is the *arrival* side: `PERCPU(ipi_pending)` is set but nothing
-reflects it to the guest as an interrupt (same as the pre-existing vGIC-mode behavior).
+CPU-local, bypasses AIC entirely, and is also used by m1n1's own EL2 rendezvous.
+Guest RR writes are trapped, tagged before the physical send, and relayed as real
+Fast IPIs. On the target, EL2 acknowledges the physical edge and turns only a
+guest-tagged arrival into a synthetic AIC `EVENT_TYPE_IPI` wake driven by
+`HCR.IMO|HCR.VI`.
 
-**Design decision:** cross-core IPI generation should use AIC's own
-software-triggered-interrupt mechanism (`AIC_IPI_SEND`/`AIC_IPI_ACK`, `aic_regs.h:7-10`,
-delivered via the same `AIC_EVENT` ack path as ordinary HW interrupts,
-`AIC_EVENT_TYPE_IPI = 4`, `aic_regs.h:51`) instead of Apple's CPU Fast-IPI registers.
-An AIC-mediated IPI is IRQ-class through the normal ack/arbitration path, so with
-`HCR_EL2.IMO` clear it reaches the guest directly -- structurally identical to how the
-timer reflector uses `aic_set_sw()`, just for a real cross-core doorbell instead of a
-software-synthesized one. Windows' AppleAic-equivalent HAL extension is expected to use
-this path for `HalRequestIpi`. **This is a documented decision, not implemented code**
-(nothing in this patch calls `AIC_IPI_SEND`) -- confirming it is actually delivered as
-IRQ rather than FIQ on real hardware is OQ-2.
+The synthetic wake is transactional. `PERCPU(ipi_pending)` contains distinct
+`DELIVERABLE` and `INFLIGHT` generations. Reading EVENT moves one generation to
+`INFLIGHT`; it does not retire it. The Windows AIC HAL keeps the corresponding
+IPI class active until its controller EOI and writes trapped `IPI_SR_EL1` there.
+That write commits only `INFLIGHT`, preserving a newer `DELIVERABLE` send. Each
+new transaction places a seven-bit generation in EVENT bits 30:24. EVENT bit 31
+marks real NT IPI work migrated from the GIC startup carrier; the HAL dispatches
+that classless origin as class 0, while explicitly retiring an ordinary
+classless redundant Fast-IPI edge as spurious. Retries reuse the exact raw
+token, so the HAL's comparison rejects an EOI delayed from an older Active
+lifetime. If no EOI arrives, the local architectural-counter clock
+rate-limits retries to at least 250 ms apart and continues until completion;
+the diagnostic retry count saturates instead of abandoning the transaction.
+This closes the observed failure in which NT retained its KPCR pending-vector
+bit and KPRCB request node after HAL and m1n1 had both destructively cleared
+their wake state.
 
 ## 7. What was disabled vs. kept
 
@@ -412,9 +414,10 @@ deleted):
   land on the expected core.** This is the single most likely "the timer reflector
   doesn't actually work correctly" failure mode on real target hardware and should be
   the first thing an M1 trace checks (checklist item T4).
-- **OQ-2 (AIC-mediated IPI, &sect;6):** confirm `AIC_IPI_SEND`/`AIC_IPI_ACK` are really
-  delivered as ordinary IRQ-class AIC events (not FIQ) on real hardware, the way their
-  shared `AIC_EVENT` ack path with `AIC_EVENT_TYPE_HW` structurally implies.
+- **OQ-2 (transactional Fast IPI, &sect;6):** confirm on hardware that every emitted
+  synthetic EVENT is followed by a HAL EOI commit during clean SMP startup and
+  that the bounded retry counter remains zero. A nonzero retry is recovery
+  evidence and must be correlated with NT's KPCR+0xCC and KPRCB request queue.
 - **OQ-3 (maintenance interrupt routing, &sect;4.5 point 1):** does the GICv3
   virtual-CPU-interface maintenance interrupt trap to EL2 independent of
   `HCR_EL2.IMO`, or does it share the same physical-IRQ routing gate as ordinary AIC
@@ -549,14 +552,12 @@ in section 9 does not satisfy the timer/IPI/peripheral acceptance tests below.
       not done in this patch) before this design is correct on that hardware.
 
 **T5 -- IPI path**
-- [ ] Confirm `AIC_IPI_SEND`/`AIC_IPI_ACK` (OQ-2) are delivered as ordinary IRQ-class
-      AIC events on real hardware (i.e. do NOT require `HCR_EL2.FMO` trapping), before
-      relying on the &sect;6 IPI design decision for a multi-core Windows guest's
-      cross-core signaling (DPC/TLB-shootdown/scheduler IPIs). If a native-AIC Windows
-      AppleAic-equivalent HAL instead uses Apple's Fast-IPI registers for `HalRequestIpi`
-      (contrary to the &sect;6 decision), IPI delivery to the guest is currently
-      undelivered (fail-closed, &sect;6) and multi-core Windows will likely stall/hang
-      waiting on IPIs -- this is a real, known, documented gap, not a hidden one.
+- [x] Confirm the hardware HAL executes Apple Fast-IPI RR instructions and that
+      tagged arrivals become native-AIC synthetic EVENTs on all four E cores.
+- [ ] Validate the transactional EOI build with no debugger mutation. Capture
+      per-CPU send/tag/EVENT/commit counters plus `DELIVERABLE`, `INFLIGHT`, and
+      retry count. Clean startup requires NT's vector-pending bit and request
+      queue to drain without a manual `pcpu[].ipi_pending` write.
 
 **T6 -- maintenance-interrupt routing (OQ-3)**
 - [ ] Confirm whether `hv_exc_irq()` (the physical-IRQ vector, `src/hv_exc.c`) is ever

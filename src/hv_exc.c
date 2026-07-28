@@ -32,6 +32,30 @@ extern spinlock_t bhl;
 #define PERCPU(x) pcpu[mrs(TPIDR_EL2)].x
 #define PERCPU_N(x, y) pcpu[x].y
 
+/*
+ * Guest Fast-IPI transport state.  DELIVERABLE is also used by the legacy
+ * vGIC path, so these common state bits must remain available when native AIC
+ * passthrough is compiled out.
+ *
+ * Under native AIC, the physical Fast-IPI latch is only a wake edge; it is
+ * not proof that Windows reached KiIpiServiceRoutine. EVENT accept moves a
+ * generation to INFLIGHT, and the HAL's controller EOI writes IPI_SR_EL1 to
+ * commit it. DELIVERABLE may coexist with INFLIGHT when a newer send arrives.
+ */
+#define HV_GUEST_IPI_DELIVERABLE      BIT(0)
+#define HV_GUEST_IPI_INFLIGHT         BIT(1)
+#define HV_GUEST_IPI_RETRY_ARMED      BIT(2)
+#define HV_GUEST_IPI_GENERATION       GENMASK(9, 3)
+#define HV_GUEST_IPI_INFLIGHT_CARRIER BIT(10)
+#define HV_GUEST_IPI_EVENT_TOKEN      GENMASK(10, 3)
+#define HV_GUEST_IPI_RETRY_COUNT      GENMASK(14, 11)
+#define HV_GUEST_IPI_START_TIME       GENMASK(30, 15)
+#define HV_GUEST_IPI_QUEUED_CARRIER   BIT(31)
+#define HV_GUEST_IPI_OUTSTANDING      (HV_GUEST_IPI_DELIVERABLE | HV_GUEST_IPI_INFLIGHT)
+#define HV_GUEST_IPI_RETRY_COUNT_MAX  MASK(4)
+#define HV_GUEST_IPI_CLOCK_SHIFT      18
+#define HV_GUEST_IPI_CLOCK_MASK       MASK(16)
+
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
 //
 // windows-native-aic timer-FIQ reflector: reserved per-CPU AIC software IRQ numbers.
@@ -160,8 +184,23 @@ struct hv_pcpu_data {
     u32 carrier_active_intid;
     u32 carrier_iar_count;
     u32 carrier_eoi_count;
+    /*
+     * Monotonic, read-only diagnostic counters for the guest Fast-IPI path.
+     * Keep these at the tail so the established offsets of ipi_queued,
+     * ipi_pending, native_doorbell_posted and the carrier counters do not
+     * change. The 0x800-byte aligned structure has exactly 16 tail bytes.
+     */
+    u32 guest_ipi_send_count;
+    u32 guest_ipi_tag_take_count;
+    u32 guest_ipi_event_emit_count;
+    u32 guest_ipi_commit_count;
 #endif
 } ALIGNED(64);
+
+#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
+static_assert(sizeof(struct hv_pcpu_data) == 0x800,
+              "native-AIC pcpu debug ABI changed");
+#endif
 
 struct hv_pcpu_data pcpu[MAX_CPUS];
 
@@ -247,6 +286,8 @@ static bool hv_sgi_queue_pop(virq_t *pending)
 void hv_timer_reflect_init(void)
 {
     for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+        PERCPU_N(cpu, ipi_queued) = 0;
+        PERCPU_N(cpu, ipi_pending) = 0;
         PERCPU_N(cpu, timer_p_reflection_pending) = false;
         PERCPU_N(cpu, timer_v_reflection_pending) = false;
         PERCPU_N(cpu, timer_p_event_unread) = false;
@@ -262,6 +303,10 @@ void hv_timer_reflect_init(void)
         PERCPU_N(cpu, carrier_active_intid) = 0x3ff;
         PERCPU_N(cpu, carrier_iar_count) = 0;
         PERCPU_N(cpu, carrier_eoi_count) = 0;
+        PERCPU_N(cpu, guest_ipi_send_count) = 0;
+        PERCPU_N(cpu, guest_ipi_tag_take_count) = 0;
+        PERCPU_N(cpu, guest_ipi_event_emit_count) = 0;
+        PERCPU_N(cpu, guest_ipi_commit_count) = 0;
         aic_set_sw(HV_TIMER_P_SWIRQ(cpu), false);
         aic_set_sw(HV_TIMER_V_SWIRQ(cpu), false);
     }
@@ -318,9 +363,141 @@ void hv_timer_reflect_hold(void)
     printf("HV: windows-native-aic: holding timer bridge until Windows enables AIC2\n");
 }
 
+static bool hv_guest_ipi_doorbell_pending(void)
+{
+    u32 state = PERCPU(ipi_pending);
+
+    return ((state & HV_GUEST_IPI_DELIVERABLE) &&
+            !(state & HV_GUEST_IPI_INFLIGHT)) ||
+           (state & HV_GUEST_IPI_RETRY_ARMED);
+}
+
+static u32 hv_guest_ipi_clock_now(void)
+{
+    return (u32)(mrs(CNTPCT_EL0) >> HV_GUEST_IPI_CLOCK_SHIFT) &
+           HV_GUEST_IPI_CLOCK_MASK;
+}
+
+static u32 hv_guest_ipi_stamp(u32 state)
+{
+    state &= ~HV_GUEST_IPI_START_TIME;
+    state |= FIELD_PREP(HV_GUEST_IPI_START_TIME,
+                        hv_guest_ipi_clock_now());
+    return state;
+}
+
+static bool hv_guest_ipi_begin_delivery(u32 *event_token)
+{
+    u32 state = PERCPU(ipi_pending);
+    u32 next_generation;
+    bool carrier;
+
+    if (event_token == NULL)
+        return false;
+
+    if ((state & HV_GUEST_IPI_INFLIGHT) &&
+        (state & HV_GUEST_IPI_RETRY_ARMED)) {
+        /* Re-emit the same uncommitted generation. */
+        state &= ~HV_GUEST_IPI_RETRY_ARMED;
+    } else if ((state & HV_GUEST_IPI_DELIVERABLE) &&
+               !(state & HV_GUEST_IPI_INFLIGHT)) {
+        /*
+         * Begin a new transaction. Bits 30:24 of the synthetic EVENT carry a
+         * seven-bit generation, while bit 31 records that this wake came from
+         * a GIC-carrier SGI migrated across CONFIG. The origin bit lets the
+         * HAL distinguish real class-0 carrier work from an ordinary
+         * redundant Fast-IPI edge whose class bitmap is already empty.
+         */
+        carrier = (state & HV_GUEST_IPI_QUEUED_CARRIER) != 0;
+        next_generation =
+            (FIELD_GET(HV_GUEST_IPI_GENERATION, state) + 1) & MASK(7);
+        state &= ~(HV_GUEST_IPI_DELIVERABLE |
+                   HV_GUEST_IPI_QUEUED_CARRIER |
+                   HV_GUEST_IPI_RETRY_ARMED |
+                   HV_GUEST_IPI_RETRY_COUNT |
+                   HV_GUEST_IPI_START_TIME |
+                   HV_GUEST_IPI_EVENT_TOKEN);
+        state |= HV_GUEST_IPI_INFLIGHT |
+                 FIELD_PREP(HV_GUEST_IPI_GENERATION, next_generation);
+        if (carrier)
+            state |= HV_GUEST_IPI_INFLIGHT_CARRIER;
+    } else {
+        return false;
+    }
+
+    PERCPU(ipi_pending) = hv_guest_ipi_stamp(state);
+    PERCPU(guest_ipi_event_emit_count)++;
+    *event_token = FIELD_GET(HV_GUEST_IPI_EVENT_TOKEN, state);
+    return true;
+}
+
+static bool hv_guest_ipi_commit_delivery(void)
+{
+    u32 state = PERCPU(ipi_pending);
+
+    if (!(state & HV_GUEST_IPI_INFLIGHT))
+        return false;
+
+    /* Preserve a newer DELIVERABLE generation across this EOI commit. */
+    state &= ~(HV_GUEST_IPI_INFLIGHT |
+               HV_GUEST_IPI_INFLIGHT_CARRIER |
+               HV_GUEST_IPI_RETRY_ARMED |
+               HV_GUEST_IPI_RETRY_COUNT |
+               HV_GUEST_IPI_START_TIME);
+    PERCPU(ipi_pending) = state;
+    PERCPU(guest_ipi_commit_count)++;
+    return true;
+}
+
+static void hv_guest_ipi_retry_tick(void)
+{
+    u32 state;
+    u32 retries;
+    u32 now;
+    u32 started;
+    u32 elapsed;
+    u32 delay;
+
+    if (!hv_native_aic_windows_ready())
+        return;
+
+    state = PERCPU(ipi_pending);
+    if (!(state & HV_GUEST_IPI_INFLIGHT) ||
+        (state & HV_GUEST_IPI_RETRY_ARMED))
+        return;
+
+    now = hv_guest_ipi_clock_now();
+    started = FIELD_GET(HV_GUEST_IPI_START_TIME, state);
+    elapsed = (now - started) & HV_GUEST_IPI_CLOCK_MASK;
+    delay = (u32)((mrs(CNTFRQ_EL0) / 4) >> HV_GUEST_IPI_CLOCK_SHIFT);
+    if (delay == 0)
+        delay = 1;
+    if (elapsed < delay)
+        return;
+
+    /*
+     * A non-interruptible AP receives m1n1's one-Hz slow tick even while EL1
+     * is parked in WFI.  The boot CPU ticks at 5 kHz, so use the architectural
+     * counter rather than tick count and wait at least 250 ms between attempts.
+     * The stored 17-bit coarse timestamp wraps after tens of minutes on J414s;
+     * unsigned modular subtraction is unambiguous for this sub-second delay.
+     * Retry frequency is bounded, but the transport is never abandoned while
+     * NT still owes an EOI. Saturate the diagnostic count rather than recreating
+     * the original permanent INFLIGHT-with-no-doorbell hang after a fixed cap.
+     */
+    retries = FIELD_GET(HV_GUEST_IPI_RETRY_COUNT, state);
+    if (retries < HV_GUEST_IPI_RETRY_COUNT_MAX)
+        retries++;
+    state &= ~HV_GUEST_IPI_RETRY_COUNT;
+    state |= FIELD_PREP(HV_GUEST_IPI_RETRY_COUNT, retries) |
+             HV_GUEST_IPI_RETRY_ARMED;
+    PERCPU(ipi_pending) = hv_guest_ipi_stamp(state);
+}
+
 static void hv_native_aic_doorbell_sync(void)
 {
-    bool pending = PERCPU(ipi_pending) || PERCPU(timer_p_event_unread) ||
+    bool pending = hv_guest_ipi_doorbell_pending() ||
+                   PERCPU(timer_p_event_unread) ||
                    PERCPU(timer_v_event_unread);
     bool carrier_active = hv_native_aic_windows_ready() &&
                           PERCPU(carrier_irq_active);
@@ -642,6 +819,19 @@ static void hv_carrier_do_eoir1(u32 intid)
 #endif
 }
 
+static bool hv_guest_ipi_take_tag(void)
+{
+    if (!__atomic_exchange_n(&PERCPU(ipi_queued), false, __ATOMIC_ACQUIRE))
+        return false;
+
+    /* Do not overwrite an older INFLIGHT transaction. */
+    PERCPU(ipi_pending) |= HV_GUEST_IPI_DELIVERABLE;
+#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
+    PERCPU(guest_ipi_tag_take_count)++;
+#endif
+    return true;
+}
+
 /*
  * A Windows GIC-carrier SGI can race the global AIC2 CONFIG write.  The old
  * post-CONFIG FIQ path popped such an SGI into an ICH LR after the local CPU
@@ -666,7 +856,8 @@ static void hv_carrier_migrate_sgis_to_native(void)
         migrated++;
 
     if (migrated != 0) {
-        PERCPU(ipi_pending) = true;
+        PERCPU(ipi_pending) |= HV_GUEST_IPI_DELIVERABLE |
+                               HV_GUEST_IPI_QUEUED_CARRIER;
         printf("HV: windows-native-aic: migrated %u carrier SGI(s) "
                "to native wake on CPU %d\n", migrated, smp_id());
     }
@@ -910,13 +1101,14 @@ static void hv_update_fiq(struct exc_info *ctx)
     }
 #endif
 
-    fiq_pending |= PERCPU(ipi_pending) || PERCPU(pmc_pending);
+    fiq_pending |= (PERCPU(ipi_pending) & HV_GUEST_IPI_OUTSTANDING) ||
+                   PERCPU(pmc_pending);
 
     sysop("isb");
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
     bool carrier_pending = hv_carrier_irq_pending();
     bool native_pending = hv_native_aic_windows_ready() &&
-                          (PERCPU(ipi_pending) ||
+                          (hv_guest_ipi_doorbell_pending() ||
                            PERCPU(timer_p_event_unread) ||
                            PERCPU(timer_v_event_unread));
     hcr = mrs(HCR_EL2);
@@ -958,6 +1150,7 @@ bool hv_native_aic_event_read(u64 raw_event, u64 *event)
     u32 die = FIELD_GET(AIC_EVENT_DIE, raw_event);
     u32 irq = FIELD_GET(AIC_EVENT_NUM, raw_event);
     u32 flat_irq = die * aic->max_irq + irq;
+    u32 ipi_event_token;
     bool reserved = type == AIC_EVENT_TYPE_HW &&
                     flat_irq >= HV_TIMER_SWIRQ_BASE &&
                     flat_irq < HV_TIMER_SWIRQ_BASE + (2 * MAX_CPUS);
@@ -996,10 +1189,10 @@ bool hv_native_aic_event_read(u64 raw_event, u64 *event)
      * native Windows controller callback.  This is an AIC EVENT/IRQ delivery,
      * not a vGIC list-register injection.
      */
-    if (PERCPU(ipi_pending)) {
-        *event = FIELD_PREP(AIC_EVENT_TYPE, AIC_EVENT_TYPE_IPI) |
+    if (hv_guest_ipi_begin_delivery(&ipi_event_token)) {
+        *event = FIELD_PREP(AIC_EVENT_DIE, ipi_event_token) |
+                 FIELD_PREP(AIC_EVENT_TYPE, AIC_EVENT_TYPE_IPI) |
                  AIC_EVENT_IPI_OTHER;
-        PERCPU(ipi_pending) = false;
     /* Windows uses the virtual timer in the proven QEMU AIC path. */
     } else if (PERCPU(timer_v_event_unread)) {
         *event = 3;
@@ -1895,10 +2088,30 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
             return true;
 
         case SYSREG_ISS(SYS_IMP_APL_IPI_SR_EL1):
-            if (is_read)
-                regs[rt] = PERCPU(ipi_pending) ? IPI_SR_PENDING : 0;
-            else if (regs[rt] & IPI_SR_PENDING)
-                PERCPU(ipi_pending) = false;
+            if (is_read) {
+                regs[rt] = (PERCPU(ipi_pending) & HV_GUEST_IPI_OUTSTANDING) ?
+                               IPI_SR_PENDING : 0;
+            } else if (regs[rt] & IPI_SR_PENDING) {
+#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
+                if (hv_native_aic_windows_active()) {
+                    /*
+                     * The native HAL writes IPI_SR from its controller EOI.
+                     * That is the first point at which NT has resolved vector
+                     * E01 and run the IPI service path, so it is the commit
+                     * boundary for exactly one INFLIGHT generation.  An init
+                     * or deinit write with no INFLIGHT transaction is benign
+                     * and must not discard a queued DELIVERABLE generation --
+                     * including during the pre-CONFIG Windows carrier phase.
+                     */
+                    hv_guest_ipi_commit_delivery();
+                    hv_native_aic_doorbell_sync();
+                } else
+#endif
+                {
+                    /* Preserve the original physical-register semantics. */
+                    PERCPU(ipi_pending) = 0;
+                }
+            }
             return true;
 
         /* shadow the interrupt mode and state flag */
@@ -1986,6 +2199,10 @@ static bool hv_handle_msr(struct exc_info *ctx, u64 iss)
             u64 mpidr = (regs[rt] & 0xff) | (mrs(MPIDR_EL1) & 0xffff00);
             for (int i = 0; i < MAX_CPUS; i++)
                 if (mpidr == smp_get_mpidr(i)) {
+#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
+                    __atomic_fetch_add(&pcpu[i].guest_ipi_send_count, 1,
+                                       __ATOMIC_RELAXED);
+#endif
                     __atomic_store_n(&pcpu[i].ipi_queued, true,
                                      __ATOMIC_RELEASE);
                     /*
@@ -2006,6 +2223,10 @@ static bool hv_handle_msr(struct exc_info *ctx, u64 iss)
             u64 mpidr = (regs[rt] & 0xff) | ((regs[rt] & 0xff0000) >> 8);
             for (int i = 0; i < MAX_CPUS; i++) {
                 if (mpidr == (smp_get_mpidr(i) & 0xffff)) {
+#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
+                    __atomic_fetch_add(&pcpu[i].guest_ipi_send_count, 1,
+                                       __ATOMIC_RELAXED);
+#endif
                     __atomic_store_n(&pcpu[i].ipi_queued, true,
                                      __ATOMIC_RELEASE);
                     sysop("dsb sy");
@@ -2316,6 +2537,7 @@ void hv_exc_irq(struct exc_info *ctx)
         return;
     }
 
+#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
     if (hv_native_aic_windows_active() && !hv_native_aic_windows_ready()) {
         virq_t pending = {
             .vintid = irq,
@@ -2330,7 +2552,9 @@ void hv_exc_irq(struct exc_info *ctx)
             printf("HV: windows-native-aic: carrier deferred CPU %d IRQ %u "
                    "until KPCR/panic-stack readiness\n", smp_id(), irq);
     }
-    else if(hv_vgic3_get_free_lr() != -1){
+    else
+#endif
+    if(hv_vgic3_get_free_lr() != -1){
         hv_vgic3_inject_irq(
             irq,                         //vintid
             hv_vgic3_get_priority(irq),  //priority
@@ -2394,8 +2618,11 @@ void hv_exc_fiq(struct exc_info *ctx)
      * recovery point; the second exchange below closes the arrival window
      * around the physical acknowledge.
      */
-    if (__atomic_exchange_n(&PERCPU(ipi_queued), false, __ATOMIC_ACQUIRE))
-        PERCPU(ipi_pending) = true;
+    hv_guest_ipi_take_tag();
+#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
+    if (tick)
+        hv_guest_ipi_retry_tick();
+#endif
 
     if (smp_id() != interruptible_cpu && !(mrs(ISR_EL1) & 0x40) && hv_want_cpu == -1) {
         // Non-interruptible CPU and it was just a timer tick (or spurious), so just update FIQs
@@ -2462,42 +2689,16 @@ void hv_exc_fiq(struct exc_info *ctx)
         hv_exc_proxy(ctx, START_EXCEPTION_LOWER, EXC_FIQ, NULL);
     }
 
-    //
-    // windows-native-aic Fast-IPI design decision (item 4, docs/windows-native-aic.md
-    // "PMU / Fast-IPI FIQ handling"). Apple's "Fast IPI" (SYS_IMP_APL_IPI_RR_LOCAL_EL1
-    // / IPI_RR_GLOBAL_EL1 / IPI_SR_EL1) is FIQ-class and CPU-local -- it bypasses AIC
-    // entirely, so unlike ordinary peripheral interrupts it is NOT fixed by clearing
-    // HCR_EL2.IMO; it stays trapped here because HCR_EL2.FMO stays set (hv.c). m1n1
-    // ALSO uses this exact mechanism for its own EL2-internal cross-core coordination
-    // (smp_send_ipi(), smp.c:417-424, used by hv_rendezvous() and by the
-    // ICC_SGI1R_EL1-relay below), so this FIQ source cannot simply be masked off
-    // permanently -- m1n1 needs to keep consuming it regardless of what the guest does.
-    //
-    // A guest write to IPI_RR_LOCAL_EL1/IPI_RR_GLOBAL_EL1 is already trapped and
-    // relayed to a real cross-core Fast-IPI unconditionally (hv_handle_msr(), case
-    // SYSREG_ISS(SYS_IMP_APL_IPI_RR_LOCAL_EL1)/(..._GLOBAL_EL1)), independent of vGIC
-    // or native-AIC-passthrough. What this patch does NOT add is a new *arrival-side*
-    // reflection for that path to the guest (i.e. no vGIC injection, no AIC software
-    // IRQ, for PERCPU(ipi_pending) specifically) -- per this task's explicit
-    // instruction not to invent an untested Fast-IPI reflection. This mirrors the
-    // pre-existing behavior: even under the old vGIC-distributor design,
-    // PERCPU(ipi_pending) (set below) was only ever exposed via the trapped read of
-    // SYS_IMP_APL_IPI_SR_EL1, never injected as a virtual interrupt.
-    //
-    // DESIGN DECISION: cross-core IPI generation should instead use AIC's OWN
-    // software-triggered-interrupt mechanism (AIC_IPI_SEND/AIC_IPI_ACK,
-    // aic_regs.h:7-10, delivered via the same AIC_EVENT ack path as ordinary HW
-    // interrupts per AIC_EVENT_TYPE_IPI=4, aic_regs.h:51) rather than Apple's CPU Fast
-    // IPI registers. An AIC-mediated IPI is IRQ-class through the normal AIC
-    // ack/arbitration path, so with HCR_EL2.IMO clear it reaches the guest directly,
-    // zero EL2 involvement -- structurally identical to the timer-reflector's use of
-    // aic_set_sw() above, just for a real cross-core doorbell instead of a
-    // software-synthesized one. Windows' AppleAic-equivalent HAL extension is expected
-    // to use this path for HalRequestIpi, not Apple's Fast-IPI system registers. This
-    // is a documented design decision, not implemented code (nothing in this patch
-    // calls AIC_IPI_SEND) -- confirming AIC_IPI_SEND really is delivered as IRQ, not
-    // FIQ, on real hardware is an M1-validation item (docs/windows-native-aic.md OQ-2).
-    //
+    /*
+     * Apple's Fast IPI is FIQ-class and shared with m1n1's own rendezvous
+     * mechanism. Guest IPI_RR writes are therefore trapped, tagged, and
+     * relayed as physical Fast IPIs. The target acknowledges the physical
+     * edge here, but that edge is only transport: after CONFIG handoff the
+     * guest tag becomes a transactional synthetic AIC IPI EVENT driven by
+     * HCR.VI. EVENT accept marks it INFLIGHT; the HAL's later IPI_SR write at
+     * controller EOI commits it. A local-tick retry can re-emit an uncommitted
+     * EVENT without consuming a newer DELIVERABLE generation.
+     */
     if (mrs(SYS_IMP_APL_IPI_SR_EL1) & IPI_SR_PENDING) {
         /*
          * Acknowledge the physical edge before consuming the guest tag.  If a
@@ -2509,7 +2710,9 @@ void hv_exc_fiq(struct exc_info *ctx)
         msr(SYS_IMP_APL_IPI_SR_EL1, IPI_SR_PENDING);
         sysop("isb");
 #ifdef ENABLE_VGIC_MODULE
+#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
         if (!hv_native_aic_windows_active()) {
+#endif
             while(hv_vgic3_get_free_lr() != -1){//another CPU sent an IPI, check the sgi_queue
                 virq_t pending;
                 if (!hv_sgi_queue_pop(&pending))
@@ -2523,12 +2726,11 @@ void hv_exc_fiq(struct exc_info *ctx)
                     pending.hw_irq
                 );
             }
+#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
         }
 #endif
-        if (__atomic_exchange_n(&PERCPU(ipi_queued), false,
-                                __ATOMIC_ACQUIRE)) {
-            PERCPU(ipi_pending) = true;
-        }
+#endif
+        hv_guest_ipi_take_tag();
     }
 
     hv_maybe_switch_cpu(ctx, START_HV, HV_CPU_SWITCH, NULL);
