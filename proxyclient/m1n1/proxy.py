@@ -1151,7 +1151,7 @@ class M1N1Proxy(Reloadable):
         return self.request(self.P_FB_IMPROVE_LOGO)
 
     def pcie_init(self):
-        return self.request(self.P_PCIE_INIT)
+        return self.request(self.P_PCIE_INIT, signed=True)
     def pcie_shutdown(self):
         return self.request(self.P_PCIE_SHUTDOWN)
 

@@ -589,7 +589,9 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             break;
 
         case P_PCIE_INIT:
-            pcie_init();
+            /* Surface link-training failure to the host instead of silently
+             * launching a guest with an empty/dead PCI hierarchy. */
+            reply->retval = pcie_init();
             break;
         case P_PCIE_SHUTDOWN:
             pcie_shutdown();
