@@ -105,6 +105,7 @@ OBJECTS := \
 	afk.o \
 	aic.o \
 	asc.o \
+	bcm4388_handoff.o \
 	bootlogo_48.o bootlogo_128.o bootlogo_256.o \
 	chainload.o \
 	chainload_asm.o \

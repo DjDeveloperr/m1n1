@@ -329,6 +329,42 @@ static void test_invalid_ops(void)
     CHECK(mock.write_count == 0);
 }
 
+static void test_split_rid_route_never_touches_msi(void)
+{
+    struct mock_mmio mock = {0};
+    struct pcie_t602x_bcm4388_rid_transaction transaction;
+    const u64 rid_base = PCIE_T602X_BCM4388_PORT0_BASE + PCIE_T602X_PORT_RID2SID_OFFSET;
+
+    CHECK(pcie_t602x_bcm4388_route_port0_rids(&mock_ops, &mock, &transaction) ==
+          PCIE_T602X_BCM4388_OK);
+    CHECK(mock.write_count == 2);
+    check_write(&mock, 0, rid_base, PCIE_T602X_BCM4388_WIFI_RID2SID, true);
+    check_write(&mock, 1, rid_base + 4, PCIE_T602X_BCM4388_BLUETOOTH_RID2SID, true);
+    CHECK(mock.msi_config == 0);
+
+    CHECK(pcie_t602x_bcm4388_rollback_port0_rids(&mock_ops, &mock, &transaction) ==
+          PCIE_T602X_BCM4388_OK);
+    CHECK(mock.rid2sid[0] == 0);
+    CHECK(mock.rid2sid[1] == 0);
+    CHECK(mock.msi_config == 0);
+}
+
+static void test_split_msi_enable_never_touches_rids(void)
+{
+    struct mock_mmio mock = {0};
+
+    CHECK(pcie_t602x_bcm4388_enable_port0_msi(&mock_ops, &mock) == PCIE_T602X_BCM4388_OK);
+    CHECK(mock.rid2sid[0] == 0);
+    CHECK(mock.rid2sid[1] == 0);
+    CHECK(mock.msi_config == 1);
+    for (size_t index = 0; index < mock.write_count; index++) {
+        CHECK(mock.writes[index].address !=
+              PCIE_T602X_BCM4388_PORT0_BASE + PCIE_T602X_PORT_RID2SID_OFFSET);
+        CHECK(mock.writes[index].address !=
+              PCIE_T602X_BCM4388_PORT0_BASE + PCIE_T602X_PORT_RID2SID_OFFSET + 4);
+    }
+}
+
 int main(void)
 {
     test_success_write_order();
@@ -340,6 +376,8 @@ int main(void)
     test_msi_read_failure_leaves_decoder_disabled();
     test_msi_failure_rolls_back_new_rids();
     test_invalid_ops();
+    test_split_rid_route_never_touches_msi();
+    test_split_msi_enable_never_touches_rids();
 
     puts("T602X BCM4388 PCIe host tests: PASS");
     return 0;

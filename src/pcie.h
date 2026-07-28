@@ -6,6 +6,8 @@
 #ifdef PCIE_T602X_WIRELESS_HOST_TEST
 #include <stdbool.h>
 #include <stdint.h>
+typedef uint8_t u8;
+typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64;
 #else
@@ -29,10 +31,24 @@ typedef uint64_t u64;
 #define PCIE_T602X_BCM4388_WIFI_RID2SID      UINT32_C(0x80010100)
 #define PCIE_T602X_BCM4388_BLUETOOTH_RID2SID UINT32_C(0x80010101)
 #define PCIE_T602X_MSIMAP_VALID              UINT32_C(0x80000000)
+#define PCIE_T602X_PORT_RID2SID_ENTRY_COUNT  32
 
 struct pcie_t602x_mmio_ops {
     int (*read32)(void *context, u64 address, u32 *value);
     int (*write32)(void *context, u64 address, u32 value);
+};
+
+/*
+ * Rollback token for the two fixed BCM4388 RID2SID slots.  The fields are
+ * public so a dormant pre-Mu handoff transaction can retain ownership across
+ * its DART programming and descriptor-publication phases.  Callers must treat
+ * the contents as opaque.
+ */
+struct pcie_t602x_bcm4388_rid_transaction {
+    u32 prior_rid0;
+    u32 prior_rid1;
+    u32 changed_mask;
+    bool active;
 };
 
 /*
@@ -88,6 +104,25 @@ enum pcie_t602x_bcm4388_error {
     (PCIE_T602X_BCM4388_ERR_MSI_MAP_READ_BASE - (int)(vector))
 #define PCIE_T602X_BCM4388_ERR_MSI_MAP_MISMATCH(vector)                                            \
     (PCIE_T602X_BCM4388_ERR_MSI_MAP_MISMATCH_BASE - (int)(vector))
+
+/*
+ * Independently callable ownership operations.  None train the link, touch
+ * endpoint config space, or enable bus mastering.
+ *
+ * route_port0_rids() only installs the two fixed RID -> SID1 entries and
+ * returns a token that can unwind exactly the slots it acquired.
+ * enable_port0_msi() only programs/enables the port decoder and requires it to
+ * be disabled on entry.  The dormant default-deny handoff intentionally never
+ * calls this function.
+ */
+int pcie_t602x_bcm4388_require_port0_msi_disabled(const struct pcie_t602x_mmio_ops *ops,
+                                                  void *context);
+int pcie_t602x_bcm4388_disable_port0_msi(const struct pcie_t602x_mmio_ops *ops, void *context);
+int pcie_t602x_bcm4388_route_port0_rids(const struct pcie_t602x_mmio_ops *ops, void *context,
+                                        struct pcie_t602x_bcm4388_rid_transaction *transaction);
+int pcie_t602x_bcm4388_rollback_port0_rids(const struct pcie_t602x_mmio_ops *ops, void *context,
+                                           struct pcie_t602x_bcm4388_rid_transaction *transaction);
+int pcie_t602x_bcm4388_enable_port0_msi(const struct pcie_t602x_mmio_ops *ops, void *context);
 
 /*
  * Install the two RID-to-SID entries and then program the 32-vector MSI
