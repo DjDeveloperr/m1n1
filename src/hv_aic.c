@@ -57,8 +57,8 @@ void hv_native_aic_enter_cpu(void)
          * CPU-interface window, keep IAR/EOIR state in software queues, and let
          * hv_update_fiq drive HCR.VI for deliverable entries. Target priorities
          * come from the guest's GICR state, and
-         * hv_exc_exit repairs Windows' kernel x18 alias from TPIDR_EL1 while
-         * APs are parked. The first Windows AIC2 CONFIG enable removes ICH,
+         * hv_exc_exit observes Windows' kernel x18 alias while APs are parked.
+         * The first Windows AIC2 CONFIG enable removes ICH,
          * TALL1, IMO, and the carrier VI path permanently.
          */
         msr(ICH_VMCR_EL2, BIT(1));

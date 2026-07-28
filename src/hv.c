@@ -54,6 +54,32 @@ struct hv_secondary_info_t {
 static struct hv_secondary_info_t hv_secondary_info;
 static u64 hv_secondary_regs[MAX_CPUS][4];
 
+/*
+ * Apple WFI mode 0 is the macOS guest policy, but it does not preserve the
+ * complete architectural register state expected by Windows. In particular,
+ * J414s captures prove Windows' reserved x18/KPCR register is valid immediately
+ * before HalProcessorIdle executes WFI and first becomes zero at the following
+ * instruction. m1n1's clock-gate-only mode 2 explicitly preserves CPU
+ * registers, so retain it for the native-AIC Windows profile on every CPU.
+ */
+static void hv_configure_guest_wfi_mode(void)
+{
+    if (!cpu_features->cyc_ovrd)
+        return;
+
+#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
+    const u64 mode = 2;
+#else
+    const u64 mode = 0;
+#endif
+    reg_mask(SYS_IMP_APL_CYC_OVRD, CYC_OVRD_WFI_MODE_MASK, CYC_OVRD_WFI_MODE(mode));
+    sysop("isb");
+
+    u64 value = mrs(SYS_IMP_APL_CYC_OVRD);
+    printf("HV: guest WFI mode %lu on CPU %d (CYC_OVRD=0x%lx)\n",
+           FIELD_GET(CYC_OVRD_WFI_MODE_MASK, value), smp_id(), value);
+}
+
 void hv_init(void)
 {
     pcie_shutdown();
@@ -182,9 +208,7 @@ void hv_init(void)
         hv_secondary_tick_interval = hv_tick_interval;
     }
 
-    // Set deep WFI back to defaults
-    if (cpu_features->cyc_ovrd)
-        reg_mask(SYS_IMP_APL_CYC_OVRD, CYC_OVRD_WFI_MODE_MASK, CYC_OVRD_WFI_MODE(0));
+    hv_configure_guest_wfi_mode();
 
     sysop("dsb ishst");
     sysop("tlbi alle1is");
@@ -347,8 +371,7 @@ static void hv_init_secondary(struct hv_secondary_info_t *info)
     hv_vgicv3_init_list_registers();
 #endif
 
-    if (cpu_features->cyc_ovrd)
-        reg_mask(SYS_IMP_APL_CYC_OVRD, CYC_OVRD_WFI_MODE_MASK, CYC_OVRD_WFI_MODE(0));
+    hv_configure_guest_wfi_mode();
 
     if (gxf_enabled())
         gl2_call(hv_set_gxf_vbar, 0, 0, 0, 0);

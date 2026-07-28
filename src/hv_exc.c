@@ -83,7 +83,7 @@ extern spinlock_t bhl;
  * Keep this offset next to the carrier workaround rather than pretending it
  * is architectural.  The checks are read-only and fail closed: both ends of
  * the space consumed by KiKernelStackException must translate writable before
- * m1n1 repairs x18 or drains an SGI to the AP.
+ * m1n1 observes x18 or drains an SGI to the AP.
  */
 #define HV_WINDOWS_PANIC_STACK_SLOT_OFFSET 0x24d8
 #define HV_WINDOWS_INTERRUPT_STACK_SLOT_OFFSET 0x24e0
@@ -139,7 +139,7 @@ struct hv_pcpu_data {
     bool timer_v_event_unread;
     bool native_doorbell_posted;
     bool carrier_timer_ready;
-    bool carrier_x18_repair_logged;
+    bool carrier_x18_zero_logged;
     bool carrier_stack_defer_logged;
     bool carrier_stack_ready;
     bool carrier_vi_logged;
@@ -253,7 +253,7 @@ void hv_timer_reflect_init(void)
         PERCPU_N(cpu, timer_v_event_unread) = false;
         PERCPU_N(cpu, native_doorbell_posted) = false;
         PERCPU_N(cpu, carrier_timer_ready) = false;
-        PERCPU_N(cpu, carrier_x18_repair_logged) = false;
+        PERCPU_N(cpu, carrier_x18_zero_logged) = false;
         PERCPU_N(cpu, carrier_stack_defer_logged) = false;
         PERCPU_N(cpu, carrier_stack_ready) = false;
         PERCPU_N(cpu, carrier_vi_logged) = false;
@@ -474,7 +474,7 @@ void hv_add_time(s64 time)
     stolen_time -= (u64)time;
 }
 
-static void hv_carrier_repair_x18(struct exc_info *ctx)
+static void hv_carrier_observe_x18(struct exc_info *ctx)
 {
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
     if (ctx == NULL || !hv_native_aic_windows_active() ||
@@ -490,6 +490,14 @@ static void hv_carrier_repair_x18(struct exc_info *ctx)
     u64 guest_pcr = mrs(TPIDR_EL1) & ~0xfffULL;
     if (guest_pcr == 0)
         return;
+
+    if (ctx->regs[18] == 0 && !PERCPU(carrier_x18_zero_logged)) {
+        printf("HV: windows-native-aic: observed zero guest x18 on CPU %d "
+               "with tag-stripped TPIDR_EL1=0x%lx at ELR=0x%lx "
+               "CYC_OVRD=0x%lx\n",
+               smp_id(), guest_pcr, ctx->elr, mrs(SYS_IMP_APL_CYC_OVRD));
+        PERCPU(carrier_x18_zero_logged) = true;
+    }
 
     /*
      * Do not cache this translation. Windows changes AP page tables during
@@ -539,16 +547,6 @@ static void hv_carrier_repair_x18(struct exc_info *ctx)
         PERCPU(carrier_stack_ready) = true;
     }
 
-    if (ctx->regs[18] != 0)
-        return;
-
-    if (!PERCPU(carrier_x18_repair_logged)) {
-        printf("HV: windows-native-aic: repaired carrier CPU %d x18 from "
-               "tag-stripped TPIDR_EL1=0x%lx at ELR=0x%lx\n",
-               smp_id(), guest_pcr, ctx->elr);
-        PERCPU(carrier_x18_repair_logged) = true;
-    }
-    ctx->regs[18] = guest_pcr;
 #else
     (void)ctx;
 #endif
@@ -557,7 +555,7 @@ static void hv_carrier_repair_x18(struct exc_info *ctx)
 static void hv_carrier_drain_pending(struct exc_info *ctx)
 {
 #if defined(ENABLE_VGIC_MODULE) && defined(ENABLE_NATIVE_AIC_PASSTHROUGH)
-    hv_carrier_repair_x18(ctx);
+    hv_carrier_observe_x18(ctx);
 #else
     (void)ctx;
 #endif
@@ -710,7 +708,7 @@ static void hv_update_fiq(struct exc_info *ctx)
     u64 hcr = mrs(HCR_EL2);
     bool fiq_pending = false;
 
-    hv_carrier_repair_x18(ctx);
+    hv_carrier_observe_x18(ctx);
     hv_carrier_drain_pending(ctx);
 
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
@@ -2052,7 +2050,7 @@ static void hv_exc_entry(void)
 static void hv_exc_exit(struct exc_info *ctx)
 {
     hv_wdt_breadcrumb('x');
-    hv_carrier_repair_x18(ctx);
+    hv_carrier_observe_x18(ctx);
     hv_update_fiq(ctx);
     /* reenable PMU counters */
     reg_set(SYS_IMP_APL_PMCR0, PERCPU(exc_entry_pmcr0_cnt));
@@ -2154,7 +2152,7 @@ void hv_exc_sync(struct exc_info *ctx)
 
 void hv_exc_irq(struct exc_info *ctx)
 {
-    hv_carrier_repair_x18(ctx);
+    hv_carrier_observe_x18(ctx);
 #ifdef ENABLE_VGIC_MODULE
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
     /*
@@ -2395,7 +2393,7 @@ void hv_exc_fiq(struct exc_info *ctx)
     // Slow (single threaded) path
     hv_wdt_breadcrumb('F');
     hv_get_context(ctx);
-    hv_carrier_repair_x18(ctx);
+    hv_carrier_observe_x18(ctx);
     hv_exc_entry();
 
     // Only poll for HV events in the interruptible CPU
