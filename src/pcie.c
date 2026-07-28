@@ -46,13 +46,8 @@ static int pcie_t602x_bcm4388_rollback_rids(const struct pcie_t602x_mmio_ops *op
     return PCIE_T602X_BCM4388_OK;
 }
 
-struct pcie_t602x_bcm4388_rid_state {
-    u32 prior_rid0;
-    u32 prior_rid1;
-};
-
 static int pcie_t602x_bcm4388_preflight_rids(const struct pcie_t602x_mmio_ops *ops, void *context,
-                                             struct pcie_t602x_bcm4388_rid_state *state)
+                                             struct pcie_t602x_bcm4388_rid_transaction *state)
 {
     const u64 rid0_address = PCIE_T602X_BCM4388_PORT0_BASE + PCIE_T602X_PORT_RID2SID_OFFSET;
     const u64 rid1_address = rid0_address + 4;
@@ -72,7 +67,7 @@ static int pcie_t602x_bcm4388_preflight_rids(const struct pcie_t602x_mmio_ops *o
 }
 
 static int pcie_t602x_bcm4388_install_rids(const struct pcie_t602x_mmio_ops *ops, void *context,
-                                           const struct pcie_t602x_bcm4388_rid_state *state)
+                                           struct pcie_t602x_bcm4388_rid_transaction *state)
 {
     const u64 rid0_address = PCIE_T602X_BCM4388_PORT0_BASE + PCIE_T602X_PORT_RID2SID_OFFSET;
     const u64 rid1_address = rid0_address + 4;
@@ -83,6 +78,7 @@ static int pcie_t602x_bcm4388_install_rids(const struct pcie_t602x_mmio_ops *ops
 
     if (state->prior_rid0 != PCIE_T602X_BCM4388_WIFI_RID2SID) {
         changed_rid0 = true;
+        state->changed_mask |= UINT32_C(1) << 0;
         if (ops->write32(context, rid0_address, PCIE_T602X_BCM4388_WIFI_RID2SID)) {
             error = PCIE_T602X_BCM4388_ERR_RID0_WRITE;
             goto rollback_rid0;
@@ -99,6 +95,7 @@ static int pcie_t602x_bcm4388_install_rids(const struct pcie_t602x_mmio_ops *ops
 
     if (state->prior_rid1 != PCIE_T602X_BCM4388_BLUETOOTH_RID2SID) {
         attempted_rid1 = true;
+        state->changed_mask |= UINT32_C(1) << 1;
         if (ops->write32(context, rid1_address, PCIE_T602X_BCM4388_BLUETOOTH_RID2SID)) {
             error = PCIE_T602X_BCM4388_ERR_RID1_WRITE;
             goto rollback_both;
@@ -113,6 +110,7 @@ static int pcie_t602x_bcm4388_install_rids(const struct pcie_t602x_mmio_ops *ops
         }
     }
 
+    state->active = true;
     return PCIE_T602X_BCM4388_OK;
 
 rollback_both: {
@@ -171,6 +169,33 @@ static int pcie_t602x_bcm4388_disable_msi(const struct pcie_t602x_mmio_ops *ops,
         return PCIE_T602X_BCM4388_ERR_MSI_DISABLE_MISMATCH;
 
     return PCIE_T602X_BCM4388_OK;
+}
+
+int pcie_t602x_bcm4388_require_port0_msi_disabled(const struct pcie_t602x_mmio_ops *ops,
+                                                  void *context)
+{
+    const u64 address = PCIE_T602X_BCM4388_PORT0_BASE + PCIE_T602X_PORT_MSI_CONFIG_OFFSET;
+    u32 value;
+
+    if (!ops || !ops->read32)
+        return PCIE_T602X_BCM4388_ERR_INVALID_ARGUMENT;
+    if (ops->read32(context, address, &value))
+        return PCIE_T602X_BCM4388_ERR_MSI_PREFLIGHT_READ;
+    return value == 0 ? PCIE_T602X_BCM4388_OK : PCIE_T602X_BCM4388_ERR_MSI_NOT_QUIESCED;
+}
+
+int pcie_t602x_bcm4388_disable_port0_msi(const struct pcie_t602x_mmio_ops *ops, void *context)
+{
+    const u64 address = PCIE_T602X_BCM4388_PORT0_BASE + PCIE_T602X_PORT_MSI_CONFIG_OFFSET;
+    u32 value;
+
+    if (!ops || !ops->read32 || !ops->write32)
+        return PCIE_T602X_BCM4388_ERR_INVALID_ARGUMENT;
+    if (ops->write32(context, address, 0))
+        return PCIE_T602X_BCM4388_ERR_MSI_DISABLE_WRITE;
+    if (ops->read32(context, address, &value))
+        return PCIE_T602X_BCM4388_ERR_MSI_DISABLE_READ;
+    return value == 0 ? PCIE_T602X_BCM4388_OK : PCIE_T602X_BCM4388_ERR_MSI_DISABLE_MISMATCH;
 }
 
 static int pcie_t602x_bcm4388_fail_msi(const struct pcie_t602x_mmio_ops *ops, void *context,
@@ -244,9 +269,63 @@ static int pcie_t602x_bcm4388_program_msi(const struct pcie_t602x_mmio_ops *ops,
     return PCIE_T602X_BCM4388_OK;
 }
 
+int pcie_t602x_bcm4388_route_port0_rids(const struct pcie_t602x_mmio_ops *ops, void *context,
+                                        struct pcie_t602x_bcm4388_rid_transaction *transaction)
+{
+    int ret;
+
+    if (!ops || !ops->read32 || !ops->write32 || !transaction)
+        return PCIE_T602X_BCM4388_ERR_INVALID_ARGUMENT;
+
+    *transaction = (struct pcie_t602x_bcm4388_rid_transaction){0};
+    ret = pcie_t602x_bcm4388_preflight_rids(ops, context, transaction);
+    if (ret)
+        return ret;
+
+    /*
+     * Retain the token even when the first rollback attempt reports failure.
+     * A larger fail-closed transaction may then retry restoration while also
+     * disabling its DART stream.
+     */
+    transaction->active = true;
+    ret = pcie_t602x_bcm4388_install_rids(ops, context, transaction);
+    return ret;
+}
+
+int pcie_t602x_bcm4388_rollback_port0_rids(const struct pcie_t602x_mmio_ops *ops, void *context,
+                                           struct pcie_t602x_bcm4388_rid_transaction *transaction)
+{
+    int ret;
+
+    if (!ops || !ops->read32 || !ops->write32 || !transaction)
+        return PCIE_T602X_BCM4388_ERR_INVALID_ARGUMENT;
+    if (!transaction->active)
+        return PCIE_T602X_BCM4388_OK;
+
+    ret = pcie_t602x_bcm4388_rollback_rids(
+        ops, context, (transaction->changed_mask & (UINT32_C(1) << 0)) != 0,
+        transaction->prior_rid0, (transaction->changed_mask & (UINT32_C(1) << 1)) != 0,
+        transaction->prior_rid1);
+    if (!ret)
+        *transaction = (struct pcie_t602x_bcm4388_rid_transaction){0};
+    return ret;
+}
+
+int pcie_t602x_bcm4388_enable_port0_msi(const struct pcie_t602x_mmio_ops *ops, void *context)
+{
+    int ret;
+
+    if (!ops || !ops->read32 || !ops->write32)
+        return PCIE_T602X_BCM4388_ERR_INVALID_ARGUMENT;
+    ret = pcie_t602x_bcm4388_require_port0_msi_disabled(ops, context);
+    if (ret)
+        return ret;
+    return pcie_t602x_bcm4388_program_msi(ops, context, 0);
+}
+
 int pcie_t602x_bcm4388_setup_port0(const struct pcie_t602x_mmio_ops *ops, void *context)
 {
-    struct pcie_t602x_bcm4388_rid_state rid_state;
+    struct pcie_t602x_bcm4388_rid_transaction rid_state;
     u32 prior_msi_config;
     int rollback_error;
     int ret;
@@ -259,6 +338,7 @@ int pcie_t602x_bcm4388_setup_port0(const struct pcie_t602x_mmio_ops *ops, void *
     if (ret)
         return ret;
 
+    rid_state = (struct pcie_t602x_bcm4388_rid_transaction){0};
     ret = pcie_t602x_bcm4388_preflight_rids(ops, context, &rid_state);
     if (ret)
         return ret;
@@ -277,9 +357,7 @@ int pcie_t602x_bcm4388_setup_port0(const struct pcie_t602x_mmio_ops *ops, void *
         return PCIE_T602X_BCM4388_OK;
 
     /* RID2SID controls DMA independently of MSI; unwind newly acquired slots. */
-    rollback_error = pcie_t602x_bcm4388_rollback_rids(
-        ops, context, rid_state.prior_rid0 != PCIE_T602X_BCM4388_WIFI_RID2SID, rid_state.prior_rid0,
-        rid_state.prior_rid1 != PCIE_T602X_BCM4388_BLUETOOTH_RID2SID, rid_state.prior_rid1);
+    rollback_error = pcie_t602x_bcm4388_rollback_port0_rids(ops, context, &rid_state);
     return rollback_error ? rollback_error : ret;
 }
 
