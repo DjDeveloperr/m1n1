@@ -270,6 +270,42 @@ static bool hv_sgi_queue_push(int cpu, const virq_t *pending)
     return false;
 }
 
+#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
+/*
+ * Windows starts issuing Apple Fast-IPIs while some processors are still in
+ * the short GIC startup-carrier phase.  Do not consume those sends into the
+ * native EVENT transaction before the first Windows AIC2 CONFIG enable: the
+ * readiness bit is global, HCR.VI is CPU-local, and an AP can otherwise take
+ * the transport FIQ just before readiness changes, return with no doorbell,
+ * mask FIQs in KiInitializeKernel, and never enter EL2 again to arm it.
+ *
+ * Keep the request as carrier SGI 0 during that window.  If CONFIG becomes
+ * ready before the target handles it, hv_carrier_migrate_sgis_to_native()
+ * converts the queued SGI into the native transactional EVENT.  If not, the
+ * existing carrier path delivers it directly.  Either ordering therefore
+ * leaves a CPU-local HCR.VI armed before the target returns to EL1.
+ */
+static bool hv_guest_ipi_queue_pre_config_carrier(int cpu)
+{
+    if (!hv_native_aic_windows_active() ||
+        hv_native_aic_windows_ready())
+        return false;
+
+    virq_t pending = {
+        .vintid = 0,
+        .priority = hv_vgic3_get_priority_cpu(cpu, 0),
+        .active = false,
+        .pending = true,
+        .hw_status = false,
+        .hw_irq = 0,
+    };
+
+    if (hv_sgi_queue_push(cpu, &pending))
+        smp_send_ipi(cpu);
+    return true;
+}
+#endif
+
 static bool hv_sgi_queue_pop(virq_t *pending)
 {
     if (!virq_queue_pop(&PERCPU(sgi_queue), pending))
@@ -2235,6 +2271,8 @@ static bool hv_handle_msr(struct exc_info *ctx, u64 iss)
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
                     __atomic_fetch_add(&pcpu[i].guest_ipi_send_count, 1,
                                        __ATOMIC_RELAXED);
+                    if (hv_guest_ipi_queue_pre_config_carrier(i))
+                        return true;
 #endif
                     __atomic_store_n(&pcpu[i].ipi_queued, true,
                                      __ATOMIC_RELEASE);
@@ -2259,6 +2297,8 @@ static bool hv_handle_msr(struct exc_info *ctx, u64 iss)
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
                     __atomic_fetch_add(&pcpu[i].guest_ipi_send_count, 1,
                                        __ATOMIC_RELAXED);
+                    if (hv_guest_ipi_queue_pre_config_carrier(i))
+                        return true;
 #endif
                     __atomic_store_n(&pcpu[i].ipi_queued, true,
                                      __ATOMIC_RELEASE);
