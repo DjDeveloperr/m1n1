@@ -24,6 +24,13 @@ struct rtkit_buffer {
 
 rtkit_dev_t *rtkit_init(const char *name, asc_dev_t *asc, dart_dev_t *dart,
                         iova_domain_t *dart_iovad, sart_dev_t *sart, bool sram);
+/*
+ * Permit IOP-owned preallocated buffers only inside one explicit physical
+ * aperture while retaining the normal DART/SART mapping path for AP-owned
+ * buffers. This is intended for coprocessors such as MTP that combine a DART
+ * with a dedicated SRAM region.
+ */
+bool rtkit_set_phys_window(rtkit_dev_t *rtk, u64 base, size_t size);
 bool rtkit_quiesce(rtkit_dev_t *rtk);
 bool rtkit_sleep(rtkit_dev_t *rtk);
 void rtkit_free(rtkit_dev_t *rtk);

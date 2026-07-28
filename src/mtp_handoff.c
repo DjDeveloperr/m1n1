@@ -43,6 +43,8 @@
 #define J414S_MTP_CONFIG_BASE   0x2a9b30000ULL
 #define J414S_MTP_DATA_BASE     0x2a9b34000ULL
 #define J414S_MTP_APERTURE_SIZE 0x1000
+#define J414S_MTP_SRAM_BASE     0x2a9c00000ULL
+#define J414S_MTP_SRAM_SIZE     SZ_1M
 
 #define DOCKCHANNEL_DATA_OFFSET 0x4000
 #define DOCKCHANNEL_RX_COUNT    0x2c
@@ -62,6 +64,8 @@ struct mtp_handoff_state {
     u64 irq_base;
     u64 config_base;
     u64 data_base;
+    u64 sram_base;
+    u64 sram_size;
     u32 initial_rx_count;
     bool ready;
 };
@@ -89,16 +93,25 @@ static bool mtp_power_enable_if_gated(const char *path)
     return true;
 }
 
-static bool mtp_handoff_get_dockchannel_resources(void)
+static bool mtp_handoff_get_resources(void)
 {
-    int path[8];
+    int dockchannel_path[8];
+    int mtp_path[8];
     u64 irq_size;
     u64 config_size;
 
-    if (adt_path_offset_trace(adt, MTP_DOCKCHANNEL_PATH, path) < 0 ||
-        adt_get_reg(adt, path, "reg", 1, &mtp_handoff.irq_base, &irq_size) < 0 ||
-        adt_get_reg(adt, path, "reg", 2, &mtp_handoff.config_base, &config_size) < 0) {
+    if (adt_path_offset_trace(adt, MTP_DOCKCHANNEL_PATH, dockchannel_path) < 0 ||
+        adt_get_reg(adt, dockchannel_path, "reg", 1, &mtp_handoff.irq_base, &irq_size) < 0 ||
+        adt_get_reg(adt, dockchannel_path, "reg", 2, &mtp_handoff.config_base,
+                    &config_size) < 0) {
         printf("mtp-handoff: incomplete DockChannel ADT resources\n");
+        return false;
+    }
+
+    if (adt_path_offset_trace(adt, MTP_PATH, mtp_path) < 0 ||
+        adt_get_reg(adt, mtp_path, "reg", 1, &mtp_handoff.sram_base,
+                    &mtp_handoff.sram_size) < 0) {
+        printf("mtp-handoff: incomplete MTP SRAM ADT resource\n");
         return false;
     }
 
@@ -112,6 +125,13 @@ static bool mtp_handoff_get_dockchannel_resources(void)
                "config=%#lx/+%#lx data=%#lx\n",
                mtp_handoff.irq_base, irq_size, mtp_handoff.config_base, config_size,
                mtp_handoff.data_base);
+        return false;
+    }
+
+    if (mtp_handoff.sram_base != J414S_MTP_SRAM_BASE ||
+        mtp_handoff.sram_size < J414S_MTP_SRAM_SIZE) {
+        printf("mtp-handoff: unexpected J414s MTP SRAM map %#lx/+%#lx\n",
+               mtp_handoff.sram_base, mtp_handoff.sram_size);
         return false;
     }
 
@@ -146,7 +166,7 @@ void mtp_handoff_init(void)
 
     printf("mtp-handoff: preparing J414s MTP for Windows DockChannel ownership\n");
 
-    if (!mtp_handoff_get_dockchannel_resources() || !mtp_power_enable_if_gated(MTP_PATH) ||
+    if (!mtp_handoff_get_resources() || !mtp_power_enable_if_gated(MTP_PATH) ||
         !mtp_power_enable_if_gated(MTP_DART_PATH) ||
         !mtp_power_enable_if_gated(MTP_DOCKCHANNEL_PATH))
         goto fail;
@@ -183,7 +203,10 @@ void mtp_handoff_init(void)
 
     mtp_handoff.rtkit = rtkit_init("mtp-handoff", mtp_handoff.asc, mtp_handoff.dart,
                                    mtp_handoff.iovad, NULL, false);
-    if (!mtp_handoff.rtkit || !rtkit_boot(mtp_handoff.rtkit)) {
+    if (!mtp_handoff.rtkit ||
+        !rtkit_set_phys_window(mtp_handoff.rtkit, mtp_handoff.sram_base,
+                               mtp_handoff.sram_size) ||
+        !rtkit_boot(mtp_handoff.rtkit)) {
         printf("mtp-handoff: MTP RTKit boot failed\n");
         goto fail;
     }
@@ -197,9 +220,10 @@ void mtp_handoff_init(void)
     mtp_handoff.ready = true;
 
     printf("mtp-handoff: RTKit ready; DockChannel[%d] RX=%u, FIFO preserved "
-           "(irq=%#lx config=%#lx data=%#lx)\n",
+           "(irq=%#lx config=%#lx data=%#lx sram=%#lx/+%#lx)\n",
            MTP_DOCKCHANNEL_INDEX, mtp_handoff.initial_rx_count, mtp_handoff.irq_base,
-           mtp_handoff.config_base, mtp_handoff.data_base);
+           mtp_handoff.config_base, mtp_handoff.data_base, mtp_handoff.sram_base,
+           mtp_handoff.sram_size);
     return;
 
 fail:

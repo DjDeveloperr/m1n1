@@ -18,7 +18,9 @@ the guest runs.  The helper:
    node declares PMGR clock gates;
 2. programs DAPF from `/arm-io/dart-mtp` register index 1;
 3. enables DART-MTP stream 1 with fresh page tables and a private IOVA window
-   `[0x02000000, 0x12000000)` for RTKit's system buffers;
+   `[0x02000000, 0x12000000)` for AP-allocated RTKit system buffers, while
+   admitting IOP-owned fixed buffers only within the ADT-declared MTP SRAM
+   aperture;
 4. boots the MTP ASC via the generic m1n1 RTKit protocol to the IOP/AP `ON`
    state; and
 5. observes the remote FIFO `RX_COUNT` once, without consuming it.
@@ -44,6 +46,7 @@ checked by m1n1 before it changes state:
 | DockChannel parent IRQ registers | `0x2a9b14000` | `0x1000` bytes | parent interrupt block |
 | Remote FIFO configuration | `0x2a9b30000` | `0x1000` bytes | channel 1 thresholds |
 | Remote FIFO data | `0x2a9b34000` | `0x1000` bytes | channel 1 TX/RX and `RX_COUNT` |
+| MTP SRAM | `0x2a9c00000` | `0x100000` bytes | IOP-owned fixed RTKit buffers |
 | DockChannel index | `1` | — | MTP transport |
 | Interrupt GSIV | `677` | — | ACPI interrupt resource |
 
@@ -58,7 +61,9 @@ At handoff the required persistent state is:
 - MTP ASC CPU is running and RTKit's IOP/AP power state is `ON`.
 - DAPF permits the ADT-defined MTP DART aperture.
 - DART-MTP stream 1 has translation enabled and retains m1n1's RTKit system
-  buffer mappings.
+  buffer mappings. Preallocated physical buffer requests are accepted only
+  inside MTP SRAM `0x2a9c00000..0x2a9cfffff`; all other requests continue
+  through normal DART translation.
 - The remote DockChannel index-1 FIFO is untouched; queued `INIT` data remains
   available to Windows.
 - No m1n1 MTP/DockChannel service loop remains active after guest entry.

@@ -90,6 +90,8 @@ struct rtkit_dev {
     bool sram;
 
     u64 dva_base;
+    u64 phys_window_base;
+    size_t phys_window_size;
 
     enum rtkit_power_state iop_power;
     enum rtkit_power_state ap_power;
@@ -171,6 +173,18 @@ rtkit_dev_t *rtkit_init(const char *name, asc_dev_t *asc, dart_dev_t *dart,
 out_free_rtk:
     free(rtk);
     return NULL;
+}
+
+bool rtkit_set_phys_window(rtkit_dev_t *rtk, u64 base, size_t size)
+{
+    if (!rtk || !size || base > UINT64_MAX - size) {
+        printf("rtkit: invalid physical window %#lx/+%#lx\n", base, size);
+        return false;
+    }
+
+    rtk->phys_window_base = base;
+    rtk->phys_window_size = size;
+    return true;
 }
 
 void rtkit_free(rtkit_dev_t *rtk)
@@ -283,7 +297,22 @@ static bool rtkit_handle_buffer_request(rtkit_dev_t *rtk, struct rtkit_message *
     size_t sz = n_4kpages << 12;
     u64 addr = FIELD_GET(MSG_BUFFER_REQUEST_IOVA, msg->msg);
 
-    if (rtk->sram) {
+    if (addr && rtk->phys_window_size && addr >= rtk->phys_window_base &&
+        addr - rtk->phys_window_base < rtk->phys_window_size && sz &&
+        sz <= rtk->phys_window_size - (addr - rtk->phys_window_base)) {
+        /*
+         * Some IOPs expose fixed system buffers in a dedicated physical SRAM
+         * aperture while using DART for ordinary AP allocations. Accept only
+         * the explicitly configured aperture; an arbitrary IOP-supplied
+         * physical address must still fail DART translation below.
+         */
+        bfr->dva = addr;
+        bfr->bfr = (void *)addr;
+        bfr->sz = sz;
+        rtkit_printf("pre-allocated physical buffer (ep 0x%x, phys %#lx, size %#lx)\n",
+                     msg->ep, addr, sz);
+        return true;
+    } else if (rtk->sram) {
         if (!addr) {
             rtkit_printf("SRAM buffers needs to be provided by the IOP\n");
             return false;

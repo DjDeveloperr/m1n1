@@ -6,6 +6,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = (ROOT / "src" / "mtp_handoff.c").read_text()
+RTKIT_SOURCE = (ROOT / "src" / "rtkit.c").read_text()
+RTKIT_HEADER = (ROOT / "src" / "rtkit.h").read_text()
 HV = (ROOT / "src" / "hv.c").read_text()
 CONFIG = (ROOT / "config.h").read_text()
 DOC = (ROOT / "docs" / "windows-mtp-handoff.md").read_text()
@@ -25,7 +27,20 @@ class MtpHandoffContractTests(unittest.TestCase):
         self.assertIn('dapf_init(MTP_DART_PATH, MTP_DOCKCHANNEL_INDEX)', SOURCE)
         self.assertIn('dart_init_adt(MTP_DART_PATH, 0, MTP_DOCKCHANNEL_INDEX, false)', SOURCE)
         self.assertIn('rtkit_init("mtp-handoff"', SOURCE)
+        self.assertIn("rtkit_set_phys_window(mtp_handoff.rtkit", SOURCE)
         self.assertIn("rtkit_boot(mtp_handoff.rtkit)", SOURCE)
+
+    def test_rtkit_physical_buffers_are_bounded_to_mtp_sram(self):
+        self.assertIn("bool rtkit_set_phys_window", RTKIT_HEADER)
+        self.assertIn("base > UINT64_MAX - size", RTKIT_SOURCE)
+        self.assertIn("addr >= rtk->phys_window_base", RTKIT_SOURCE)
+        self.assertIn(
+            "sz <= rtk->phys_window_size - (addr - rtk->phys_window_base)",
+            RTKIT_SOURCE,
+        )
+        self.assertIn("J414S_MTP_SRAM_BASE     0x2a9c00000ULL", SOURCE)
+        self.assertIn("J414S_MTP_SRAM_SIZE     SZ_1M", SOURCE)
+        self.assertIn('adt_get_reg(adt, mtp_path, "reg", 1', SOURCE)
 
     def test_mtp_handoff_preserves_dockchannel_init_fifo(self):
         self.assertIn("sole DockChannel register read", SOURCE)
@@ -36,7 +51,7 @@ class MtpHandoffContractTests(unittest.TestCase):
         self.assertIn("never reads `RX_8` or `RX_32`", DOC)
 
     def test_mtp_handoff_documents_the_acpi_contract(self):
-        for address in ("0x2a9b14000", "0x2a9b30000", "0x2a9b34000"):
+        for address in ("0x2a9b14000", "0x2a9b30000", "0x2a9b34000", "0x2a9c00000"):
             self.assertIn(address, DOC)
             self.assertIn(address, SOURCE)
         self.assertNotIn("0x2a9b28000", SOURCE + DOC)
