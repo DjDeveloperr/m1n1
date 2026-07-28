@@ -2696,8 +2696,19 @@ void hv_exc_fiq(struct exc_info *ctx)
      * recovery point; the second exchange below closes the arrival window
      * around the physical acknowledge.
      */
-    hv_guest_ipi_take_tag();
+    bool guest_ipi_taken = hv_guest_ipi_take_tag();
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
+    /*
+     * The target FIQ is the only guaranteed EL2 entry for this Fast-IPI.
+     * Post the native virtual-IRQ doorbell immediately after consuming a
+     * post-CONFIG guest tag; an AP can mask FIQs as soon as it returns to
+     * KiInitializeKernel, so deferring the CPU-local HCR.VI update to a later
+     * timer/exception entry can strand an otherwise DELIVERABLE transaction.
+     * hv_update_fiq() below remains the level-maintenance path and will keep
+     * the same doorbell asserted until EVENT begins the transaction.
+     */
+    if (guest_ipi_taken && hv_native_aic_windows_ready())
+        hv_native_aic_doorbell_sync();
     if (tick)
         hv_guest_ipi_retry_tick();
 #endif
