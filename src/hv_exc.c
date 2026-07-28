@@ -204,6 +204,19 @@ static_assert(sizeof(struct hv_pcpu_data) == 0x800,
 
 struct hv_pcpu_data pcpu[MAX_CPUS];
 
+#ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
+/*
+ * A native level IRQ can reach EL2 during the short interval in which a
+ * synthetic timer/IPI wake has HCR.IMO asserted.  Keep this outside
+ * hv_pcpu_data: that structure's exact 0x800-byte layout is a debugger ABI.
+ * While set, doorbell synchronization must not restore IMO until EL1 reads
+ * AIC EVENT and thereby auto-masks the real source.  m1n1's private tick stays
+ * armed meanwhile so the proxy remains serviceable without stealing the IRQ.
+ */
+static bool native_irq_rearm_deferred[MAX_CPUS];
+static u32 native_irq_bounce_count[MAX_CPUS];
+#endif
+
 void hv_exit_guest(void) __attribute__((noreturn));
 
 static u64 stolen_time = 0;
@@ -307,6 +320,8 @@ void hv_timer_reflect_init(void)
         PERCPU_N(cpu, guest_ipi_tag_take_count) = 0;
         PERCPU_N(cpu, guest_ipi_event_emit_count) = 0;
         PERCPU_N(cpu, guest_ipi_commit_count) = 0;
+        native_irq_rearm_deferred[cpu] = false;
+        native_irq_bounce_count[cpu] = 0;
         aic_set_sw(HV_TIMER_P_SWIRQ(cpu), false);
         aic_set_sw(HV_TIMER_V_SWIRQ(cpu), false);
     }
@@ -505,6 +520,20 @@ static void hv_native_aic_doorbell_sync(void)
 
     if (!hv_native_aic_windows_ready())
         return;
+
+    if (native_irq_rearm_deferred[smp_id()]) {
+        /*
+         * Do not recreate IMO in the exception that released a real native
+         * IRQ to EL1.  A level source is still asserted until Windows reads
+         * AIC EVENT; immediate re-arm would bounce straight back to EL2 and
+         * livelock both the guest and m1n1's proxy tick.
+         */
+        PERCPU(native_doorbell_posted) = false;
+        hcr = mrs(HCR_EL2);
+        if (hcr & (HCR_IMO | HCR_VI))
+            hv_write_hcr(hcr & ~(HCR_IMO | HCR_VI));
+        return;
+    }
 
     hcr = mrs(HCR_EL2);
     if (carrier_active) {
@@ -1159,8 +1188,12 @@ bool hv_native_aic_event_read(u64 raw_event, u64 *event)
         return false;
 
     if (raw_event != 0 && !reserved) {
-        /* A real native AIC source won arbitration ahead of the synthetic
-         * wakeup. Preserve it, then reassert the local wakeup if needed. */
+        /*
+         * A real native AIC source won arbitration ahead of the synthetic
+         * wakeup.  Reading EVENT has now auto-masked that level source, so it
+         * is finally safe to restore IMO for a queued synthetic wake.
+         */
+        native_irq_rearm_deferred[smp_id()] = false;
         hv_native_aic_doorbell_sync();
         return false;
     }
@@ -2412,13 +2445,18 @@ void hv_exc_irq(struct exc_info *ctx)
         }
         hv_native_aic_enter_cpu();
         /*
-         * hv_native_aic_enter_cpu() deliberately clears HCR.IMO|HCR.VI so
-         * ordinary AIC IRQs return to EL1.  A guest Fast-IPI reflection may
-         * already have been armed, though; dropping VI on this return path
-         * loses its only wake edge and leaves KeIpiGenericCall spinning.
-         * Re-evaluate the per-CPU pending state before returning.
+         * The real native source remains level-asserted until Windows reads
+         * AIC EVENT.  Restoring IMO here would take the same IRQ at EL2 again
+         * before EL1 executes a single instruction.  Preserve all synthetic
+         * pending state until the trapped AIC EVENT read proves that Windows
+         * accepted and auto-masked the source.  Keep m1n1's private tick armed
+         * so debugger/proxy polling continues while that handoff is pending.
          */
-        hv_native_aic_doorbell_sync();
+        if (hv_native_aic_windows_ready()) {
+            native_irq_rearm_deferred[smp_id()] = true;
+            native_irq_bounce_count[smp_id()]++;
+            hv_arm_tick(false);
+        }
         return;
     }
 #endif
