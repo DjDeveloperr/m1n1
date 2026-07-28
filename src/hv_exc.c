@@ -414,6 +414,35 @@ void hv_timer_reflect_hold(void)
     printf("HV: windows-native-aic: holding timer bridge until Windows enables AIC2\n");
 }
 
+void hv_carrier_retire_active_sgis(void)
+{
+#if defined(ENABLE_VGIC_MODULE) && defined(ENABLE_NATIVE_AIC_PASSTHROUGH)
+    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
+        u32 intid = __atomic_load_n(&pcpu[cpu].carrier_active_intid,
+                                   __ATOMIC_ACQUIRE);
+
+        /*
+         * CONFIG changes the interrupt-controller callbacks globally.  An AP
+         * can already have accepted a startup-carrier SGI when the BSP makes
+         * that change; its ISR then completes through the native AIC callback
+         * and no GIC EOIR is issued.  Leaving the software carrier active in
+         * that case suppresses HCR.VI forever on the AP.  The SGI has already
+         * reached Windows, so retire only accepted SGIs here.  Other carrier
+         * interrupt classes remain fail-closed for diagnosis.
+         */
+        if (__atomic_load_n(&pcpu[cpu].carrier_irq_active,
+                            __ATOMIC_ACQUIRE) && intid < 16) {
+            __atomic_store_n(&pcpu[cpu].carrier_active_intid, 0x3ff,
+                             __ATOMIC_RELEASE);
+            __atomic_store_n(&pcpu[cpu].carrier_irq_active, false,
+                             __ATOMIC_RELEASE);
+            printf("HV: windows-native-aic: retired active carrier SGI %u "
+                   "on CPU %d at CONFIG handoff\n", intid, cpu);
+        }
+    }
+#endif
+}
+
 static bool hv_guest_ipi_doorbell_pending(void)
 {
     u32 state = PERCPU(ipi_pending);

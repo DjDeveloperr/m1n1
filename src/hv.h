@@ -143,6 +143,7 @@ void hv_timer_reflect_init(void);
 void hv_timer_native_enable(void);
 void hv_timer_reflect_hold(void);
 void hv_timer_reflect_enable(void);
+void hv_carrier_retire_active_sgis(void);
 bool hv_native_aic_event_read(u64 raw_event, u64 *event);
 /*
  * Mu and Windows both own the real AIC.  Mu receives native IRQ and FIQ

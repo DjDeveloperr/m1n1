@@ -145,6 +145,7 @@ static bool handle_native_aic_transition(struct exc_info *ctx, u64 addr, u64 *va
                smp_id());
     } else if (config_write && (*val & AIC2_GLOBAL_CONFIG_ENABLE) &&
                hv_native_aic_windows_active()) {
+        hv_carrier_retire_active_sgis();
         __atomic_store_n(&windows_aic_enabled, true, __ATOMIC_RELEASE);
         hv_native_aic_enter_cpu();
         hv_timer_reflect_enable();
