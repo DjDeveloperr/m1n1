@@ -86,8 +86,15 @@ static bool mtp_power_enable_if_gated(const char *path)
         return false;
     }
 
-    /* Some MTP-related nodes have no PMGR clock-gates property. */
-    if (!adt_getprop(adt, node, "clock-gates", NULL))
+    /*
+     * Some MTP-related nodes have no PMGR gates.  On J414s /arm-io/mtp carries
+     * a clock-gates property that is present but empty, so testing existence
+     * alone sent it to pmgr, which requires at least one 32-bit entry and
+     * failed with "Error getting /arm-io/mtp clock-gates".  An empty property
+     * means the same thing as an absent one: nothing here to power up.
+     */
+    u32 gates_len = 0;
+    if (!adt_getprop(adt, node, "clock-gates", &gates_len) || gates_len < sizeof(u32))
         return true;
 
     if (pmgr_adt_power_enable(path) < 0) {
