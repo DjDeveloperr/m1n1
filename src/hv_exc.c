@@ -322,12 +322,30 @@ static void hv_native_aic_doorbell_sync(void)
 {
     bool pending = PERCPU(ipi_pending) || PERCPU(timer_p_event_unread) ||
                    PERCPU(timer_v_event_unread);
+    bool carrier_active = hv_native_aic_windows_ready() &&
+                          PERCPU(carrier_irq_active);
     u64 hcr;
 
     if (!hv_native_aic_windows_ready())
         return;
 
     hcr = mrs(HCR_EL2);
+    if (carrier_active) {
+        /*
+         * CONFIG is global, but another CPU can still be between its trapped
+         * carrier IAR and EOIR when CPU 0 enables AIC2.  Keep TALL1 enabled so
+         * that accepted interrupt's EOIR still traps, but stop routing native
+         * physical IRQs to EL2.  Otherwise a pending AIC source immediately
+         * re-enters hv_exc_irq() forever because EL2 deliberately does not
+         * acknowledge it.  A native synthetic wake accumulated meanwhile
+         * remains level-pending in software and is armed by the EOIR exit.
+         */
+        PERCPU(native_doorbell_posted) = false;
+        if (hcr & (HCR_IMO | HCR_VI))
+            hv_write_hcr(hcr & ~(HCR_IMO | HCR_VI));
+        return;
+    }
+
     if (pending) {
         PERCPU(native_doorbell_posted) = true;
         /*
@@ -626,6 +644,37 @@ static void hv_carrier_do_eoir1(u32 intid)
 #endif
 }
 
+/*
+ * A Windows GIC-carrier SGI can race the global AIC2 CONFIG write.  The old
+ * post-CONFIG FIQ path popped such an SGI into an ICH LR after the local CPU
+ * interface had been disabled.  That made every hypervisor pending field
+ * read zero while NT's per-source IPI node remained queued forever.
+ *
+ * Once native AIC is ready, an architectural SGI no longer needs its GIC
+ * INTID: Windows' own per-processor IPI queue is authoritative.  Preserve one
+ * level wake for any queued SGI and let the native EVENT hook return the
+ * Apple Fast-IPI token.  Coalescing is correct because one KiIpiInterrupt
+ * drains the target's NT queue.
+ */
+static void hv_carrier_migrate_sgis_to_native(void)
+{
+#if defined(ENABLE_VGIC_MODULE) && defined(ENABLE_NATIVE_AIC_PASSTHROUGH)
+    if (!hv_native_aic_windows_ready())
+        return;
+
+    virq_t pending;
+    u32 migrated = 0;
+    while (hv_sgi_queue_pop(&pending))
+        migrated++;
+
+    if (migrated != 0) {
+        PERCPU(ipi_pending) = true;
+        printf("HV: windows-native-aic: migrated %u carrier SGI(s) "
+               "to native wake on CPU %d\n", migrated, smp_id());
+    }
+#endif
+}
+
 static bool hv_carrier_irq_pending(void)
 {
 #if defined(ENABLE_VGIC_MODULE) && defined(ENABLE_NATIVE_AIC_PASSTHROUGH)
@@ -666,9 +715,13 @@ static void hv_update_fiq(struct exc_info *ctx)
 
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
     if (hv_native_aic_windows_active() && hv_native_aic_windows_ready()) {
+        hv_carrier_migrate_sgis_to_native();
         /* CONFIG is global, but HCR is per-CPU. Retire the startup carrier on
-         * every AP at its first post-handoff EL2 entry. */
-        if (hcr & HCR_IMO) {
+         * every AP at its first post-handoff EL2 entry.  An AP already between
+         * carrier IAR and EOIR must retain TALL1 until the EOIR trap clears its
+         * software-active state. */
+        if (!PERCPU(carrier_irq_active) &&
+            ((hcr & HCR_IMO) || mrs(ICH_HCR_EL2) != 0)) {
             hv_native_aic_enter_cpu();
             hcr = mrs(HCR_EL2);
         }
@@ -876,7 +929,10 @@ static void hv_update_fiq(struct exc_info *ctx)
                mrs(TPIDR_EL1));
         PERCPU(carrier_vi_logged) = true;
     }
-    if (native_pending) {
+    if (hv_native_aic_windows_ready() && PERCPU(carrier_irq_active)) {
+        if (hcr & (HCR_IMO | HCR_VI))
+            hv_write_hcr(hcr & ~(HCR_IMO | HCR_VI));
+    } else if (native_pending) {
         if ((hcr & (HCR_IMO | HCR_VI)) != (HCR_IMO | HCR_VI))
             hv_write_hcr(hcr | HCR_IMO | HCR_VI);
     } else if (carrier_pending) {
@@ -884,7 +940,7 @@ static void hv_update_fiq(struct exc_info *ctx)
             hv_write_hcr(hcr | HCR_VI);
     } else if (hcr & HCR_VI) {
         hcr &= ~HCR_VI;
-        if (hv_native_aic_windows_ready())
+        if (hv_native_aic_windows_ready() && !PERCPU(carrier_irq_active))
             hcr &= ~HCR_IMO;
         hv_write_hcr(hcr);
     }
@@ -2108,6 +2164,18 @@ void hv_exc_irq(struct exc_info *ctx)
      * allowing the still-pending physical IRQ to be taken again by Windows EL1.
      */
     if (hv_native_aic_active()) {
+        if (hv_native_aic_windows_ready() &&
+            PERCPU(carrier_irq_active)) {
+            /*
+             * The carrier IAR has already been returned to EL1.  Preserve the
+             * software CPU-interface state and TALL1 until its EOIR trap, but
+             * release this native physical IRQ to Windows by clearing IMO.
+             * Calling hv_native_aic_enter_cpu() here would disable TALL1 and
+             * strand carrier_irq_active permanently.
+             */
+            hv_write_hcr(mrs(HCR_EL2) & ~(HCR_IMO | HCR_VI));
+            return;
+        }
         hv_native_aic_enter_cpu();
         /*
          * hv_native_aic_enter_cpu() deliberately clears HCR.IMO|HCR.VI so
@@ -2428,7 +2496,7 @@ void hv_exc_fiq(struct exc_info *ctx)
         msr(SYS_IMP_APL_IPI_SR_EL1, IPI_SR_PENDING);
         sysop("isb");
 #ifdef ENABLE_VGIC_MODULE
-        if (!hv_native_aic_windows_active() || hv_native_aic_windows_ready()) {
+        if (!hv_native_aic_windows_active()) {
             while(hv_vgic3_get_free_lr() != -1){//another CPU sent an IPI, check the sgi_queue
                 virq_t pending;
                 if (!hv_sgi_queue_pop(&pending))
