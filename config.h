@@ -55,6 +55,17 @@
 //
 #define ENABLE_NATIVE_AIC_PASSTHROUGH
 
+//
+// J414s Windows MTP/DockChannel preboot handoff.
+//
+// The MTP coprocessor must already be running when the Windows AppleMtpHid
+// ACPI driver takes ownership of the DockChannel transport.  The handoff
+// helper is deliberately compiled only with the native-AIC Windows profile
+// and has a second, runtime J414sAP check, so normal m1n1/macOS/Linux boots
+// never touch MTP, its DART, or its DockChannel FIFOs.
+//
+#define ENABLE_J414S_WINDOWS_MTP_HANDOFF
+
 #if defined(ENABLE_NATIVE_AIC_PASSTHROUGH) && !defined(ENABLE_VGIC_MODULE)
 #error "ENABLE_NATIVE_AIC_PASSTHROUGH requires ENABLE_VGIC_MODULE -- see config.h comment above"
 #endif

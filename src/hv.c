@@ -6,6 +6,7 @@
 #include "display.h"
 #include "gxf.h"
 #include "memory.h"
+#include "mtp_handoff.h"
 #include "pcie.h"
 #include "smp.h"
 #include "string.h"
@@ -97,6 +98,16 @@ void hv_init(void)
     hv_wdt_init();
 
     hv_pt_init();
+
+#if defined(ENABLE_NATIVE_AIC_PASSTHROUGH) && defined(ENABLE_J414S_WINDOWS_MTP_HANDOFF)
+    /*
+     * J414s-only Windows preboot handoff.  It boots the MTP IOP and prepares
+     * DAPF/DART, but leaves DockChannel INIT/ring ownership to AppleMtpHid.
+     * The helper has a second runtime chip/board guard; other m1n1 guests are
+     * therefore unaffected even when this Windows build option is compiled.
+     */
+    mtp_handoff_init();
+#endif
 
     // Configure hypervisor defaults
 

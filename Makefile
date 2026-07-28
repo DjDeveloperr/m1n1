@@ -142,6 +142,7 @@ OBJECTS := \
 	mitigations.o \
 	mcc.o \
 	memory.o memory_asm.o \
+	mtp_handoff.o \
 	nvme.o \
 	payload.o \
 	pcie.o \
