@@ -37,6 +37,11 @@ void rtkit_free(rtkit_dev_t *rtk);
 
 bool rtkit_start_ep(rtkit_dev_t *rtk, u8 ep);
 bool rtkit_boot(rtkit_dev_t *rtk);
+/*
+ * Bounded boot variant. In addition to timing out while waiting for IOP=ON,
+ * this waits for the AP=ON acknowledgement before returning.
+ */
+bool rtkit_boot_timed(rtkit_dev_t *rtk, u32 timeout_usec);
 
 bool rtkit_can_recv(rtkit_dev_t *rtk);
 

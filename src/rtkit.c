@@ -522,7 +522,32 @@ bool rtkit_start_ep(rtkit_dev_t *rtk, u8 ep)
     return true;
 }
 
-bool rtkit_boot(rtkit_dev_t *rtk)
+static bool rtkit_wait_for_power(rtkit_dev_t *rtk, enum rtkit_power_state *state,
+                                 enum rtkit_power_state target, u32 timeout_usec,
+                                 const char *name)
+{
+    u64 timeout = timeout_usec ? timeout_calculate(timeout_usec) : 0;
+
+    while (*state != target) {
+        struct rtkit_message rtk_msg;
+        int ret = rtkit_recv(rtk, &rtk_msg);
+        if (ret == 1)
+            rtkit_printf("unexpected message to non-system endpoint 0x%02x "
+                         "while waiting for %s power: %lx\n",
+                         rtk_msg.ep, name, rtk_msg.msg);
+        else if (ret < 0)
+            return false;
+
+        if (timeout && timeout_expired(timeout)) {
+            rtkit_printf("timed out waiting for %s power state %#x\n", name, target);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool rtkit_boot_internal(rtkit_dev_t *rtk, u32 timeout_usec)
 {
     struct asc_message msg;
 
@@ -663,15 +688,8 @@ bool rtkit_boot(rtkit_dev_t *rtk)
     if (has_oslog && !rtkit_start_ep(rtk, RTKIT_EP_OSLOG))
         return false;
 
-    while (rtk->iop_power != RTKIT_POWER_ON) {
-        struct rtkit_message rtk_msg;
-        int ret = rtkit_recv(rtk, &rtk_msg);
-        if (ret == 1)
-            rtkit_printf("unexpected message to non-system endpoint 0x%02x during boot: %lx\n",
-                         rtk_msg.ep, rtk_msg.msg);
-        else if (ret < 0)
-            return false;
-    }
+    if (!rtkit_wait_for_power(rtk, &rtk->iop_power, RTKIT_POWER_ON, timeout_usec, "IOP"))
+        return false;
 
     /* this enables syslog */
     msg.msg0 =
@@ -682,7 +700,27 @@ bool rtkit_boot(rtkit_dev_t *rtk)
         return false;
     }
 
+    /* Preserve the historical asynchronous return for existing callers. */
+    if (timeout_usec &&
+        !rtkit_wait_for_power(rtk, &rtk->ap_power, RTKIT_POWER_ON, timeout_usec, "AP"))
+        return false;
+
     return true;
+}
+
+bool rtkit_boot(rtkit_dev_t *rtk)
+{
+    return rtkit_boot_internal(rtk, 0);
+}
+
+bool rtkit_boot_timed(rtkit_dev_t *rtk, u32 timeout_usec)
+{
+    if (!timeout_usec) {
+        rtkit_printf("timed boot requires a nonzero timeout\n");
+        return false;
+    }
+
+    return rtkit_boot_internal(rtk, timeout_usec);
 }
 
 static bool rtkit_switch_power_state(rtkit_dev_t *rtk, enum rtkit_power_state target)

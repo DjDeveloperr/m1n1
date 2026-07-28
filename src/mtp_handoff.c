@@ -55,6 +55,7 @@
  */
 #define MTP_IOVA_WINDOW_BASE SZ_32M
 #define MTP_IOVA_WINDOW_SIZE 0x10000000ULL
+#define MTP_READY_TIMEOUT    (3 * USEC_PER_SEC)
 
 struct mtp_handoff_state {
     asc_dev_t *asc;
@@ -140,12 +141,12 @@ static bool mtp_handoff_get_resources(void)
 
 static void mtp_handoff_rollback(void)
 {
-    if (mtp_handoff.rtkit) {
-        rtkit_quiesce(mtp_handoff.rtkit);
-        rtkit_free(mtp_handoff.rtkit);
-    }
-    if (mtp_handoff.asc) {
+    /* Stop DMA-producing firmware before releasing any RTKit/DART state. */
+    if (mtp_handoff.asc)
         asc_cpu_stop(mtp_handoff.asc);
+    if (mtp_handoff.rtkit)
+        rtkit_free(mtp_handoff.rtkit);
+    if (mtp_handoff.asc) {
         asc_free(mtp_handoff.asc);
     }
     if (mtp_handoff.iovad)
@@ -206,17 +207,28 @@ void mtp_handoff_init(void)
     if (!mtp_handoff.rtkit ||
         !rtkit_set_phys_window(mtp_handoff.rtkit, mtp_handoff.sram_base,
                                mtp_handoff.sram_size) ||
-        !rtkit_boot(mtp_handoff.rtkit)) {
+        !rtkit_boot_timed(mtp_handoff.rtkit, MTP_READY_TIMEOUT)) {
         printf("mtp-handoff: MTP RTKit boot failed\n");
         goto fail;
     }
-
     /*
-     * This is the sole DockChannel register read.  RX_COUNT is a non-consuming
-     * availability observation; reading RX_8/RX_32 would steal INIT from the
-     * Windows driver.  Do not acknowledge IRQs or set masks/thresholds here.
+     * RX_COUNT is the sole DockChannel register polled. It is non-consuming;
+     * reading RX_8/RX_32 would steal INIT from the Windows driver. Do not
+     * acknowledge IRQs or set masks/thresholds here. Requiring queued data
+     * closes the race between AP=ON and Windows taking transport ownership.
      */
-    mtp_handoff.initial_rx_count = read32(mtp_handoff.data_base + DOCKCHANNEL_RX_COUNT);
+    u64 timeout = timeout_calculate(MTP_READY_TIMEOUT);
+    do {
+        mtp_handoff.initial_rx_count =
+            read32(mtp_handoff.data_base + DOCKCHANNEL_RX_COUNT);
+        if (mtp_handoff.initial_rx_count)
+            break;
+    } while (!timeout_expired(timeout));
+
+    if (!mtp_handoff.initial_rx_count) {
+        printf("mtp-handoff: no DockChannel INIT data after RTKit AP reached ON\n");
+        goto fail;
+    }
     mtp_handoff.ready = true;
 
     printf("mtp-handoff: RTKit ready; DockChannel[%d] RX=%u, FIFO preserved "

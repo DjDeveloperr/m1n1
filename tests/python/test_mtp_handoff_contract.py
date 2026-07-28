@@ -28,7 +28,21 @@ class MtpHandoffContractTests(unittest.TestCase):
         self.assertIn('dart_init_adt(MTP_DART_PATH, 0, MTP_DOCKCHANNEL_INDEX, false)', SOURCE)
         self.assertIn('rtkit_init("mtp-handoff"', SOURCE)
         self.assertIn("rtkit_set_phys_window(mtp_handoff.rtkit", SOURCE)
-        self.assertIn("rtkit_boot(mtp_handoff.rtkit)", SOURCE)
+        self.assertIn("rtkit_boot_timed(mtp_handoff.rtkit, MTP_READY_TIMEOUT)", SOURCE)
+        rollback = SOURCE.index("static void mtp_handoff_rollback")
+        stop = SOURCE.index("asc_cpu_stop(mtp_handoff.asc)", rollback)
+        release = SOURCE.index("rtkit_free(mtp_handoff.rtkit)", rollback)
+        self.assertLess(stop, release)
+        self.assertNotIn("rtkit_quiesce(mtp_handoff.rtkit)", SOURCE)
+
+    def test_mtp_handoff_waits_for_ap_on_and_nonempty_init_fifo(self):
+        self.assertIn("bool rtkit_boot_timed", RTKIT_HEADER)
+        self.assertIn("rtkit_wait_for_power", RTKIT_SOURCE)
+        self.assertIn('&rtk->ap_power, RTKIT_POWER_ON, timeout_usec, "AP"', RTKIT_SOURCE)
+        self.assertIn("MTP_READY_TIMEOUT    (3 * USEC_PER_SEC)", SOURCE)
+        self.assertIn("while (!timeout_expired(timeout))", SOURCE)
+        self.assertIn("if (!mtp_handoff.initial_rx_count)", SOURCE)
+        self.assertIn("no DockChannel INIT data after RTKit AP reached ON", SOURCE)
 
     def test_rtkit_physical_buffers_are_bounded_to_mtp_sram(self):
         self.assertIn("bool rtkit_set_phys_window", RTKIT_HEADER)
@@ -43,7 +57,7 @@ class MtpHandoffContractTests(unittest.TestCase):
         self.assertIn('adt_get_reg(adt, mtp_path, "reg", 1', SOURCE)
 
     def test_mtp_handoff_preserves_dockchannel_init_fifo(self):
-        self.assertIn("sole DockChannel register read", SOURCE)
+        self.assertIn("RX_COUNT is the sole DockChannel register polled", SOURCE)
         self.assertIn("read32(mtp_handoff.data_base + DOCKCHANNEL_RX_COUNT)", SOURCE)
         self.assertIn("RX_8", SOURCE)
         self.assertIn("RX_32", SOURCE)

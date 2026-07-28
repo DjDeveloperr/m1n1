@@ -21,9 +21,10 @@ the guest runs.  The helper:
    `[0x02000000, 0x12000000)` for AP-allocated RTKit system buffers, while
    admitting IOP-owned fixed buffers only within the ADT-declared MTP SRAM
    aperture;
-4. boots the MTP ASC via the generic m1n1 RTKit protocol to the IOP/AP `ON`
-   state; and
-5. observes the remote FIFO `RX_COUNT` once, without consuming it.
+4. boots the MTP ASC via a bounded generic m1n1 RTKit handshake and waits for
+   both the IOP and AP to acknowledge `ON`; and
+5. polls only the non-consuming remote FIFO `RX_COUNT` until initial `INIT`
+   data is present, then stops touching the transport.
 
 The ASC startup is the MTP IOP firmware start: like upstream Linux's generic
 `apple-rtkit-helper`, m1n1 sets `ASC_CPU_CONTROL.RUN` and performs the RTKit
@@ -32,7 +33,7 @@ interface firmware image.
 
 ## DockChannel state handed to Windows
 
-The preboot stage treats the remote FIFO as immutable handoff state.  It never
+The preboot stage treats the remote FIFO as immutable handoff state. It never
 writes a DockChannel IRQ mask, IRQ flag, TX/RX threshold, or data register.
 In particular, it never reads `RX_8` or `RX_32`; either operation would consume
 the MTP `INIT` packets that identify keyboard, touch, STM, GPIO, and optional
@@ -91,9 +92,11 @@ The implementation was cross-checked against Asahi Linux's
 
 ## Failure policy
 
-An unexpected ADT map, DAPF/DART setup failure, or failed RTKit boot rolls the
-partial ASC/DART allocation back and leaves the handoff disabled.  This is
-intentional: presenting Windows with a half-initialized MTP transport is less
-safe than not publishing m1n1-owned state at all.  The helper logs its final
+An unexpected ADT map, DAPF/DART setup failure, failed bounded RTKit boot, or
+absence of queued INIT data rolls the partial ASC/DART allocation back and
+leaves the handoff disabled. The ASC is stopped before RTKit buffers or DART
+mappings are released, and rollback never waits for a quiesce acknowledgement.
+This is intentional: presenting Windows with a half-initialized MTP transport
+is less safe than not publishing m1n1-owned state at all. The helper logs its final
 resource map and non-consuming initial `RX_COUNT`; those two lines are the
 pre-run validation evidence for the next hardware test.
