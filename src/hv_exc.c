@@ -144,6 +144,19 @@ struct hv_pcpu_data {
     bool carrier_stack_ready;
     bool carrier_vi_logged;
     bool carrier_irq_active;
+    /*
+     * Set once this CPU has completed a full carrier IAR->EOI cycle.
+     * That proves VBAR, KPCR, stack switching and PMR discipline all work.
+     * After it, the exception-stack gate must not veto delivery: Windows
+     * parks PanicStackBase/InterruptStackBase at 0 while a dispatch is in
+     * flight -- which is exactly when an AP self-requests its software
+     * interrupt via ICC_SGI1R_EL1. Re-checking the slots then deadlocks the
+     * AP forever: NT will not restore them until the interrupt it is waiting
+     * for is delivered. Observed on J414s CPU 4 (first Avalanche core),
+     * 2026-07-27. This closes a carrier-progress hole; it is distinct from
+     * the later NT scheduler 0xA caused by an invalid HAL LocalUnitId.
+     */
+    bool carrier_delivery_proven;
     u32 carrier_active_intid;
     u32 carrier_iar_count;
     u32 carrier_eoi_count;
@@ -245,6 +258,7 @@ void hv_timer_reflect_init(void)
         PERCPU_N(cpu, carrier_stack_ready) = false;
         PERCPU_N(cpu, carrier_vi_logged) = false;
         PERCPU_N(cpu, carrier_irq_active) = false;
+        PERCPU_N(cpu, carrier_delivery_proven) = false;
         PERCPU_N(cpu, carrier_active_intid) = 0x3ff;
         PERCPU_N(cpu, carrier_iar_count) = 0;
         PERCPU_N(cpu, carrier_eoi_count) = 0;
@@ -486,9 +500,9 @@ static void hv_carrier_repair_x18(struct exc_info *ctx)
         if (PERCPU(carrier_stack_ready)) {
             printf("HV: windows-native-aic: carrier CPU %d lost KPCR/panic-stack "
                    "mapping (TPIDR=0x%lx panic=0x%lx interrupt=0x%lx "
-                   "ELR=0x%lx ESR=0x%lx FAR=0x%lx)\n",
+                   "ELR=0x%lx ESR=0x%lx FAR=0x%lx proven=%d)\n",
                    smp_id(), guest_pcr, panic_stack, interrupt_stack, ctx->elr,
-                   ctx->esr, ctx->far);
+                   ctx->esr, ctx->far, PERCPU(carrier_delivery_proven));
         } else if (!PERCPU(carrier_stack_defer_logged)) {
             printf("HV: windows-native-aic: deferring carrier CPU %d; "
                    "exception stacks are not writable (TPIDR=0x%lx "
@@ -605,6 +619,7 @@ static void hv_carrier_do_eoir1(u32 intid)
         PERCPU(carrier_active_intid) == intid) {
         PERCPU(carrier_irq_active) = false;
         PERCPU(carrier_active_intid) = 0x3ff;
+        PERCPU(carrier_delivery_proven) = true;
     }
 #else
     (void)intid;
@@ -615,7 +630,8 @@ static bool hv_carrier_irq_pending(void)
 {
 #if defined(ENABLE_VGIC_MODULE) && defined(ENABLE_NATIVE_AIC_PASSTHROUGH)
     if (!hv_native_aic_windows_active() || hv_native_aic_windows_ready() ||
-        !PERCPU(carrier_stack_ready) || !hv_vgic3_get_igrpen1())
+        !hv_vgic3_get_igrpen1() ||
+        (!PERCPU(carrier_stack_ready) && !PERCPU(carrier_delivery_proven)))
         return false;
 
     /*
@@ -2093,6 +2109,14 @@ void hv_exc_irq(struct exc_info *ctx)
      */
     if (hv_native_aic_active()) {
         hv_native_aic_enter_cpu();
+        /*
+         * hv_native_aic_enter_cpu() deliberately clears HCR.IMO|HCR.VI so
+         * ordinary AIC IRQs return to EL1.  A guest Fast-IPI reflection may
+         * already have been armed, though; dropping VI on this return path
+         * loses its only wake edge and leaves KeIpiGenericCall spinning.
+         * Re-evaluate the per-CPU pending state before returning.
+         */
+        hv_native_aic_doorbell_sync();
         return;
     }
 #endif
@@ -2283,6 +2307,15 @@ void hv_exc_fiq(struct exc_info *ctx)
     if (interruptible_cpu == -1)
         interruptible_cpu = boot_cpu_idx;
 
+    /*
+     * Recover a guest-origin Fast-IPI tag even when its physical IPI latch was
+     * already acknowledged by a racing FIQ.  Every FIQ is a safe owner-CPU
+     * recovery point; the second exchange below closes the arrival window
+     * around the physical acknowledge.
+     */
+    if (__atomic_exchange_n(&PERCPU(ipi_queued), false, __ATOMIC_ACQUIRE))
+        PERCPU(ipi_pending) = true;
+
     if (smp_id() != interruptible_cpu && !(mrs(ISR_EL1) & 0x40) && hv_want_cpu == -1) {
         // Non-interruptible CPU and it was just a timer tick (or spurious), so just update FIQs
         hv_get_context(ctx);
@@ -2385,6 +2418,15 @@ void hv_exc_fiq(struct exc_info *ctx)
     // FIQ, on real hardware is an M1-validation item (docs/windows-native-aic.md OQ-2).
     //
     if (mrs(SYS_IMP_APL_IPI_SR_EL1) & IPI_SR_PENDING) {
+        /*
+         * Acknowledge the physical edge before consuming the guest tag.  If a
+         * sender publishes a new tag while this FIQ is in flight, it either
+         * re-raises IPI_SR after this acknowledge or is consumed by the
+         * exchange below.  The previous consume-then-ack order could clear a
+         * newly-arrived edge while stranding its tag forever.
+         */
+        msr(SYS_IMP_APL_IPI_SR_EL1, IPI_SR_PENDING);
+        sysop("isb");
 #ifdef ENABLE_VGIC_MODULE
         if (!hv_native_aic_windows_active() || hv_native_aic_windows_ready()) {
             while(hv_vgic3_get_free_lr() != -1){//another CPU sent an IPI, check the sgi_queue
@@ -2406,8 +2448,6 @@ void hv_exc_fiq(struct exc_info *ctx)
                                 __ATOMIC_ACQUIRE)) {
             PERCPU(ipi_pending) = true;
         }
-        msr(SYS_IMP_APL_IPI_SR_EL1, IPI_SR_PENDING);
-        sysop("isb");
     }
 
     hv_maybe_switch_cpu(ctx, START_HV, HV_CPU_SWITCH, NULL);
