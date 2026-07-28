@@ -111,6 +111,10 @@ class HV(Reloadable):
         self.started = False
         self.ctx = None
         self.hvcall_handlers = {}
+        # Register-preserving diagnostic calls use the BRK immediate as the
+        # selector.  Unlike the legacy BRK #0x4242 ABI, they do not need to
+        # overwrite guest x0 with a call ID before trapping.
+        self.brkcall_handlers = {}
         self.switching_context = False
         self.show_timestamps = False
         self.virtio_devs = {}
@@ -1202,8 +1206,19 @@ class HV(Reloadable):
     def add_hvcall(self, callid, handler):
         self.hvcall_handlers[callid] = handler
 
+    def add_brkcall(self, callid, handler):
+        if not 0 <= callid <= 0xffff:
+            raise ValueError(f"BRK call ID is not 16-bit: {callid:#x}")
+        self.brkcall_handlers[callid] = handler
+
     def handle_brk(self, ctx):
         iss = ctx.esr.ISS
+        handler = self.brkcall_handlers.get(iss, None)
+        if handler is not None:
+            ok = handler(ctx)
+            if ok:
+                ctx.elr += 4
+            return ok
         if iss != 0x4242:
             return self._lower()
 
