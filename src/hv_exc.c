@@ -1407,6 +1407,60 @@ static void hv_timer_reflect_guest_rearm(bool physical, bool control_write, u64 
             _msr(sr_tkn(sr), regs[rt]);                                                            \
         return true;
 
+/*
+ * Per-CPU one-shot ID-register doorbell.
+ *
+ * HCR_EL2.TID3 traps the whole AArch64 ID group 3 space and this file answers
+ * all of it at EL2, so nothing in that space reaches the proxy client any more.
+ * The Windows debug module in the driver repo needs *some* deterministic point
+ * at which it is called with a live guest context, per CPU, in order to install
+ * its checkpoints; before this it abused the sheer volume of unhandled ID reads
+ * as a clock, which is exactly what made boots slow.
+ *
+ * So forward the *first* ID group 3 read executed on each physical CPU to the
+ * proxy, and answer every subsequent one at EL2.  That is a bounded MAX_CPUS
+ * serial round trips for an entire boot instead of one per instruction, and it
+ * is an ordering guarantee rather than a timing hope: a CPU cannot run guest
+ * code without first running the kernel's own per-CPU feature detection, which
+ * reads these registers.  The host therefore always gets a callback on a CPU
+ * before that CPU can execute anything the host wants to intercept.
+ *
+ * ID_AA64PFR0_EL1 is deliberately NOT a doorbell.  Its case ORs in the GICv3
+ * sysreg-interface bit, while the proxy services a trapped read by issuing its
+ * own remote mrs and overwriting regs[rt]; forwarding it would silently discard
+ * that bit.  Every other encoding here is a plain pass-through whose proxy
+ * answer is bit-identical to the EL2 answer, so forwarding one is unobservable
+ * to the guest.
+ */
+static bool hv_id_doorbell_rung[MAX_CPUS];
+
+static bool hv_ring_id_doorbell(void)
+{
+    int cpu = smp_id();
+
+    if (cpu < 0 || cpu >= MAX_CPUS)
+        return false;
+    if (hv_id_doorbell_rung[cpu])
+        return false;
+
+    hv_id_doorbell_rung[cpu] = true;
+    return true;
+}
+
+/*
+ * Identical to SYSREG_PASS, except that the first access on each CPU falls
+ * through to hv_exc_proxy() so the host sees one deterministic callback per CPU.
+ */
+#define SYSREG_PASS_DOORBELL(sr)                                                                   \
+    case SYSREG_ISS(sr):                                                                           \
+        if (is_read && hv_ring_id_doorbell())                                                      \
+            return false;                                                                          \
+        if (is_read)                                                                               \
+            regs[rt] = _mrs(sr_tkn(sr));                                                           \
+        else                                                                                       \
+            _msr(sr_tkn(sr), regs[rt]);                                                            \
+        return true;
+
 static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
 {
     u64 reg = iss & (ESR_ISS_MSR_OP0 | ESR_ISS_MSR_OP2 | ESR_ISS_MSR_OP1 | ESR_ISS_MSR_CRn |
@@ -2100,15 +2154,33 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
         // for) is unconfirmed; left as-is rather than guessed at, see
         // docs/windows-native-aic.md.
         //
-        SYSREG_PASS(ID_AA64PFR1_EL1)
-        SYSREG_PASS(ID_AA64DFR0_EL1)
-        SYSREG_PASS(ID_AA64DFR1_EL1)
-        SYSREG_PASS(ID_AA64ISAR0_EL1)
-        SYSREG_PASS(ID_AA64ISAR1_EL1)
-        SYSREG_PASS(SYS_ID_AA64MMFR0_EL1)
-        SYSREG_PASS(SYS_ID_AA64MMFR1_EL1)
-        SYSREG_PASS(ID_AA64AFR0_EL1)
-        SYSREG_PASS(ID_AA64AFR1_EL1)
+        SYSREG_PASS_DOORBELL(ID_AA64PFR1_EL1)
+        SYSREG_PASS_DOORBELL(ID_AA64DFR0_EL1)
+        SYSREG_PASS_DOORBELL(ID_AA64DFR1_EL1)
+        SYSREG_PASS_DOORBELL(ID_AA64ISAR0_EL1)
+        SYSREG_PASS_DOORBELL(ID_AA64ISAR1_EL1)
+        SYSREG_PASS_DOORBELL(SYS_ID_AA64MMFR0_EL1)
+        SYSREG_PASS_DOORBELL(SYS_ID_AA64MMFR1_EL1)
+        SYSREG_PASS_DOORBELL(ID_AA64AFR0_EL1)
+        SYSREG_PASS_DOORBELL(ID_AA64AFR1_EL1)
+        //
+        // The remainder of the AArch64 ID group 3 space.  TID3 traps all of it,
+        // and anything not answered here falls through to hv_exc_proxy(), which
+        // costs several serial round trips per instruction: the exception is
+        // shipped to the proxy client, which issues its own remote mrs to read
+        // the register and then logs the access.  Windows reads these constantly
+        // during per-CPU bring-up and driver init, so leaving them unhandled
+        // dominates boot time.  ID_AA64MMFR2_EL1 and ID_AA64ISAR2_EL1 were both
+        // observed taking that path on ten-CPU boots.
+        //
+        SYSREG_PASS_DOORBELL(ID_AA64PFR2_EL1)
+        SYSREG_PASS_DOORBELL(ID_AA64ZFR0_EL1)
+        SYSREG_PASS_DOORBELL(ID_AA64SMFR0_EL1)
+        SYSREG_PASS_DOORBELL(ID_AA64ISAR2_EL1)
+        SYSREG_PASS_DOORBELL(ID_AA64ISAR3_EL1)
+        SYSREG_PASS_DOORBELL(SYS_ID_AA64MMFR2_EL1)
+        SYSREG_PASS_DOORBELL(SYS_ID_AA64MMFR3_EL1)
+        SYSREG_PASS_DOORBELL(SYS_ID_AA64MMFR4_EL1)
         case SYSREG_ISS(ID_AA64PFR0_EL1):
             if(is_read) {
                 //
@@ -2131,17 +2203,11 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
             // all ID-register traffic during Windows' per-CPU bring-up, so this
             // is where the boot time went.
             //
-            // The remaining trapped ID encodings -- ID_AA64ISAR2_EL1 and
-            // ID_AA64MMFR2_EL1 in particular -- are deliberately NOT handled
-            // here.  A Windows-side pre-adapter checkpoint in
-            // tools/m1n1-windows-debug.py hooks hv.handle_msr and uses trapped
-            // MSR accesses as its clock: it retries until storport.sys appears
-            // in PsLoadedModuleList and then applies the Forwarded-I/O unit
-            // patch.  Answering every ID register at EL2 starves that hook, the
-            // patch never lands, and the boot fails closed with "Storport
-            // Forwarded-I/O patch missed the pre-adapter checkpoint".  Leaving
-            // these two on the proxy path keeps that clock running.  Move the
-            // checkpoint onto a deterministic trigger before taking them.
+            // This case is never a doorbell (see SYSREG_PASS_DOORBELL): the
+            // proxy's answer differs from ours by exactly the GIC bit, so
+            // forwarding even one access would hand the guest a value this case
+            // exists to prevent.  The other ID encodings are plain pass-throughs
+            // and carry the doorbell instead.
             //
             return true;
 #endif
