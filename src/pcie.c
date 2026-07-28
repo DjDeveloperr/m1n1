@@ -1,11 +1,281 @@
 /* SPDX-License-Identifier: MIT */
 
-#include "adt.h"
 #include "pcie.h"
+
+#ifndef PCIE_T602X_WIRELESS_HOST_TEST
+#include "adt.h"
 #include "pmgr.h"
 #include "string.h"
 #include "tunables.h"
 #include "utils.h"
+#endif
+
+static int pcie_t602x_bcm4388_restore_rid(const struct pcie_t602x_mmio_ops *ops, void *context,
+                                          u64 address, u32 prior)
+{
+    u32 value;
+
+    if (ops->write32(context, address, prior))
+        return -1;
+    if (ops->read32(context, address, &value))
+        return -1;
+
+    return value == prior ? 0 : -1;
+}
+
+static int pcie_t602x_bcm4388_rollback_rids(const struct pcie_t602x_mmio_ops *ops, void *context,
+                                            bool restore_rid0, u32 prior_rid0, bool restore_rid1,
+                                            u32 prior_rid1)
+{
+    const u64 base = PCIE_T602X_BCM4388_PORT0_BASE + PCIE_T602X_PORT_RID2SID_OFFSET;
+    bool rid0_failed = false;
+    bool rid1_failed = false;
+
+    /* Restore slot 1 first, but always attempt slot 0 as required by the contract. */
+    if (restore_rid1)
+        rid1_failed = pcie_t602x_bcm4388_restore_rid(ops, context, base + 4, prior_rid1) != 0;
+    if (restore_rid0)
+        rid0_failed = pcie_t602x_bcm4388_restore_rid(ops, context, base, prior_rid0) != 0;
+
+    if (rid0_failed)
+        return PCIE_T602X_BCM4388_ERR_RID0_ROLLBACK;
+    if (rid1_failed)
+        return PCIE_T602X_BCM4388_ERR_RID1_ROLLBACK;
+
+    return PCIE_T602X_BCM4388_OK;
+}
+
+struct pcie_t602x_bcm4388_rid_state {
+    u32 prior_rid0;
+    u32 prior_rid1;
+};
+
+static int pcie_t602x_bcm4388_preflight_rids(const struct pcie_t602x_mmio_ops *ops, void *context,
+                                             struct pcie_t602x_bcm4388_rid_state *state)
+{
+    const u64 rid0_address = PCIE_T602X_BCM4388_PORT0_BASE + PCIE_T602X_PORT_RID2SID_OFFSET;
+    const u64 rid1_address = rid0_address + 4;
+
+    /* Read both slots before writing anything so occupied-slot rejection is atomic. */
+    if (ops->read32(context, rid0_address, &state->prior_rid0))
+        return PCIE_T602X_BCM4388_ERR_RID0_READ;
+    if (ops->read32(context, rid1_address, &state->prior_rid1))
+        return PCIE_T602X_BCM4388_ERR_RID1_READ;
+
+    if (state->prior_rid0 != 0 && state->prior_rid0 != PCIE_T602X_BCM4388_WIFI_RID2SID)
+        return PCIE_T602X_BCM4388_ERR_RID0_OCCUPIED;
+    if (state->prior_rid1 != 0 && state->prior_rid1 != PCIE_T602X_BCM4388_BLUETOOTH_RID2SID)
+        return PCIE_T602X_BCM4388_ERR_RID1_OCCUPIED;
+
+    return PCIE_T602X_BCM4388_OK;
+}
+
+static int pcie_t602x_bcm4388_install_rids(const struct pcie_t602x_mmio_ops *ops, void *context,
+                                           const struct pcie_t602x_bcm4388_rid_state *state)
+{
+    const u64 rid0_address = PCIE_T602X_BCM4388_PORT0_BASE + PCIE_T602X_PORT_RID2SID_OFFSET;
+    const u64 rid1_address = rid0_address + 4;
+    u32 value;
+    bool changed_rid0 = false;
+    bool attempted_rid1 = false;
+    int error;
+
+    if (state->prior_rid0 != PCIE_T602X_BCM4388_WIFI_RID2SID) {
+        changed_rid0 = true;
+        if (ops->write32(context, rid0_address, PCIE_T602X_BCM4388_WIFI_RID2SID)) {
+            error = PCIE_T602X_BCM4388_ERR_RID0_WRITE;
+            goto rollback_rid0;
+        }
+        if (ops->read32(context, rid0_address, &value)) {
+            error = PCIE_T602X_BCM4388_ERR_RID0_READBACK_READ;
+            goto rollback_rid0;
+        }
+        if (value != PCIE_T602X_BCM4388_WIFI_RID2SID) {
+            error = PCIE_T602X_BCM4388_ERR_RID0_READBACK_MISMATCH;
+            goto rollback_rid0;
+        }
+    }
+
+    if (state->prior_rid1 != PCIE_T602X_BCM4388_BLUETOOTH_RID2SID) {
+        attempted_rid1 = true;
+        if (ops->write32(context, rid1_address, PCIE_T602X_BCM4388_BLUETOOTH_RID2SID)) {
+            error = PCIE_T602X_BCM4388_ERR_RID1_WRITE;
+            goto rollback_both;
+        }
+        if (ops->read32(context, rid1_address, &value)) {
+            error = PCIE_T602X_BCM4388_ERR_RID1_READBACK_READ;
+            goto rollback_both;
+        }
+        if (value != PCIE_T602X_BCM4388_BLUETOOTH_RID2SID) {
+            error = PCIE_T602X_BCM4388_ERR_RID1_READBACK_MISMATCH;
+            goto rollback_both;
+        }
+    }
+
+    return PCIE_T602X_BCM4388_OK;
+
+rollback_both: {
+    int rollback_error = pcie_t602x_bcm4388_rollback_rids(
+        ops, context, changed_rid0, state->prior_rid0, attempted_rid1, state->prior_rid1);
+    return rollback_error ? rollback_error : error;
+}
+
+rollback_rid0: {
+    int rollback_error =
+        pcie_t602x_bcm4388_rollback_rids(ops, context, changed_rid0, state->prior_rid0, false, 0);
+    return rollback_error ? rollback_error : error;
+}
+}
+
+static int pcie_t602x_bcm4388_force_msi_disabled(const struct pcie_t602x_mmio_ops *ops,
+                                                 void *context)
+{
+    const u64 address = PCIE_T602X_BCM4388_PORT0_BASE + PCIE_T602X_PORT_MSI_CONFIG_OFFSET;
+    u32 value;
+
+    if (ops->write32(context, address, 0))
+        return -1;
+    if (ops->read32(context, address, &value))
+        return -1;
+
+    return value == 0 ? 0 : -1;
+}
+
+static int pcie_t602x_bcm4388_require_msi_quiesced(const struct pcie_t602x_mmio_ops *ops,
+                                                   void *context)
+{
+    const u64 address = PCIE_T602X_BCM4388_PORT0_BASE + PCIE_T602X_PORT_MSI_CONFIG_OFFSET;
+    u32 value;
+
+    if (ops->read32(context, address, &value))
+        return PCIE_T602X_BCM4388_ERR_MSI_PREFLIGHT_READ;
+    if (value != 0)
+        return PCIE_T602X_BCM4388_ERR_MSI_NOT_QUIESCED;
+
+    return PCIE_T602X_BCM4388_OK;
+}
+
+static int pcie_t602x_bcm4388_disable_msi(const struct pcie_t602x_mmio_ops *ops, void *context)
+{
+    const u64 address = PCIE_T602X_BCM4388_PORT0_BASE + PCIE_T602X_PORT_MSI_CONFIG_OFFSET;
+    u32 value;
+
+    if (ops->write32(context, address, 0))
+        return PCIE_T602X_BCM4388_ERR_MSI_DISABLE_WRITE;
+    if (ops->read32(context, address, &value))
+        return PCIE_T602X_BCM4388_ERR_MSI_DISABLE_READ;
+    if (value != 0)
+        return PCIE_T602X_BCM4388_ERR_MSI_DISABLE_MISMATCH;
+
+    return PCIE_T602X_BCM4388_OK;
+}
+
+static int pcie_t602x_bcm4388_fail_msi(const struct pcie_t602x_mmio_ops *ops, void *context,
+                                       int primary_error)
+{
+    if (pcie_t602x_bcm4388_force_msi_disabled(ops, context))
+        return PCIE_T602X_BCM4388_ERR_MSI_DISABLE_RECOVERY;
+
+    return primary_error;
+}
+
+static int pcie_t602x_bcm4388_program_msi(const struct pcie_t602x_mmio_ops *ops, void *context)
+{
+    const u64 base = PCIE_T602X_BCM4388_PORT0_BASE;
+    const u64 config_address = base + PCIE_T602X_PORT_MSI_CONFIG_OFFSET;
+    const u64 address_lo = base + PCIE_T602X_PORT_MSI_ADDRESS_LO;
+    const u64 address_hi = base + PCIE_T602X_PORT_MSI_ADDRESS_HI;
+    u32 value;
+
+    if (ops->write32(context, address_lo, PCIE_T602X_BCM4388_MSI_ADDRESS))
+        return pcie_t602x_bcm4388_fail_msi(ops, context,
+                                           PCIE_T602X_BCM4388_ERR_MSI_ADDRESS_LO_WRITE);
+    if (ops->write32(context, address_hi, 0))
+        return pcie_t602x_bcm4388_fail_msi(ops, context,
+                                           PCIE_T602X_BCM4388_ERR_MSI_ADDRESS_HI_WRITE);
+
+    for (u32 vector = 0; vector < PCIE_T602X_PORT_MSI_VECTOR_COUNT; vector++) {
+        u64 map_address = base + PCIE_T602X_PORT_MSIMAP_OFFSET + 4 * vector;
+
+        if (ops->write32(context, map_address, PCIE_T602X_MSIMAP_VALID | vector))
+            return pcie_t602x_bcm4388_fail_msi(ops, context,
+                                               PCIE_T602X_BCM4388_ERR_MSI_MAP_WRITE(vector));
+    }
+
+    if (ops->read32(context, address_lo, &value))
+        return pcie_t602x_bcm4388_fail_msi(ops, context,
+                                           PCIE_T602X_BCM4388_ERR_MSI_ADDRESS_LO_READ);
+    if (value != PCIE_T602X_BCM4388_MSI_ADDRESS)
+        return pcie_t602x_bcm4388_fail_msi(ops, context,
+                                           PCIE_T602X_BCM4388_ERR_MSI_ADDRESS_LO_MISMATCH);
+    if (ops->read32(context, address_hi, &value))
+        return pcie_t602x_bcm4388_fail_msi(ops, context,
+                                           PCIE_T602X_BCM4388_ERR_MSI_ADDRESS_HI_READ);
+    if (value != 0)
+        return pcie_t602x_bcm4388_fail_msi(ops, context,
+                                           PCIE_T602X_BCM4388_ERR_MSI_ADDRESS_HI_MISMATCH);
+
+    for (u32 vector = 0; vector < PCIE_T602X_PORT_MSI_VECTOR_COUNT; vector++) {
+        u64 map_address = base + PCIE_T602X_PORT_MSIMAP_OFFSET + 4 * vector;
+
+        if (ops->read32(context, map_address, &value))
+            return pcie_t602x_bcm4388_fail_msi(ops, context,
+                                               PCIE_T602X_BCM4388_ERR_MSI_MAP_READ(vector));
+        if (value != (PCIE_T602X_MSIMAP_VALID | vector))
+            return pcie_t602x_bcm4388_fail_msi(ops, context,
+                                               PCIE_T602X_BCM4388_ERR_MSI_MAP_MISMATCH(vector));
+    }
+
+    if (ops->write32(context, config_address, 1))
+        return pcie_t602x_bcm4388_fail_msi(ops, context, PCIE_T602X_BCM4388_ERR_MSI_ENABLE_WRITE);
+    if (ops->read32(context, config_address, &value))
+        return pcie_t602x_bcm4388_fail_msi(ops, context, PCIE_T602X_BCM4388_ERR_MSI_ENABLE_READ);
+    if (value != 1)
+        return pcie_t602x_bcm4388_fail_msi(ops, context,
+                                           PCIE_T602X_BCM4388_ERR_MSI_ENABLE_MISMATCH);
+
+    return PCIE_T602X_BCM4388_OK;
+}
+
+int pcie_t602x_bcm4388_setup_port0(const struct pcie_t602x_mmio_ops *ops, void *context)
+{
+    struct pcie_t602x_bcm4388_rid_state rid_state;
+    int rollback_error;
+    int ret;
+
+    if (!ops || !ops->read32 || !ops->write32)
+        return PCIE_T602X_BCM4388_ERR_INVALID_ARGUMENT;
+
+    /* Never destroy a decoder that another owner may already be using. */
+    ret = pcie_t602x_bcm4388_require_msi_quiesced(ops, context);
+    if (ret)
+        return ret;
+
+    ret = pcie_t602x_bcm4388_preflight_rids(ops, context, &rid_state);
+    if (ret)
+        return ret;
+
+    /* No RID or MSI state is changed before this fail-closed disable succeeds. */
+    ret = pcie_t602x_bcm4388_disable_msi(ops, context);
+    if (ret)
+        return pcie_t602x_bcm4388_fail_msi(ops, context, ret);
+
+    ret = pcie_t602x_bcm4388_install_rids(ops, context, &rid_state);
+    if (ret)
+        return pcie_t602x_bcm4388_fail_msi(ops, context, ret);
+
+    ret = pcie_t602x_bcm4388_program_msi(ops, context);
+    if (!ret)
+        return PCIE_T602X_BCM4388_OK;
+
+    /* RID2SID controls DMA independently of MSI; unwind newly acquired slots. */
+    rollback_error = pcie_t602x_bcm4388_rollback_rids(
+        ops, context, rid_state.prior_rid0 != PCIE_T602X_BCM4388_WIFI_RID2SID, rid_state.prior_rid0,
+        rid_state.prior_rid1 != PCIE_T602X_BCM4388_BLUETOOTH_RID2SID, rid_state.prior_rid1);
+    return rollback_error ? rollback_error : ret;
+}
+
+#ifndef PCIE_T602X_WIRELESS_HOST_TEST
 
 /*
  * The ADT uses 17 register sets:
@@ -67,8 +337,7 @@
 #define APCIE_PORT_RESET     0x814
 #define APCIE_PORT_RESET_DIS BIT(0)
 
-#define APCIE_T602X_PORT_RESET  0x82c
-#define APCIE_T602X_PORT_MSIMAP 0x3800
+#define APCIE_T602X_PORT_RESET 0x82c
 
 /* PCIe capability registers */
 #define PCIE_CAP_BASE    0x70
@@ -543,7 +812,7 @@ static int pcie_init_controller(int controller, const char *path)
             write32(state->port_base[port] + 0x808, 0x1000ff);
             write32(state->port_base[port] + 0x82c, 0x0);
             for (int i = 0; i < 512; i++)
-                write32(state->port_base[port] + APCIE_T602X_PORT_MSIMAP + 4 * i, 0);
+                write32(state->port_base[port] + PCIE_T602X_PORT_MSIMAP_OFFSET + 4 * i, 0);
             write32(state->port_base[port] + 0x397c, 0x0);
             if (controller == APCIE)
                 write32(state->port_base[port] + 0x130, 0x3000000);
@@ -707,7 +976,8 @@ static int pcie_init_controller(int controller, const char *path)
 
             clear32(state->rc_base + 0x3c, 0x1);
             for (int i = 0; i < 32; i++)
-                write32(state->port_base[port] + APCIE_T602X_PORT_MSIMAP + 4 * i, 0x80000000 | i);
+                write32(state->port_base[port] + PCIE_T602X_PORT_MSIMAP_OFFSET + 4 * i,
+                        PCIE_T602X_MSIMAP_VALID | i);
         }
 
         read32(state->port_base[port] + APCIE_PORT_LINKSTS);
@@ -772,3 +1042,5 @@ int pcie_shutdown(void)
 
     return 0;
 }
+
+#endif /* !PCIE_T602X_WIRELESS_HOST_TEST */

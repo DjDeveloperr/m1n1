@@ -64,3 +64,8 @@ jobs:
       - name: Run pytest without clang
         if: matrix.compiler != 'llvm'
         run: pytest
+
+      - name: Run T602x PCIe host tests
+        env:
+          CC: cc
+        run: sh tests/pcie/run-host-tests.sh
