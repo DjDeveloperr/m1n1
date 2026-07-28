@@ -191,6 +191,19 @@
 #define ID_AA64AFR1_EL1        sys_reg(3, 0, 0, 5, 5)
 #define SYS_ID_AA64MMFR0_EL1   sys_reg(3, 0, 0, 7, 0)
 #define SYS_ID_AA64MMFR1_EL1   sys_reg(3, 0, 0, 7, 1)
+/*
+ * The rest of the AArch64 ID group 3 space.  HCR_EL2.TID3 traps every one of
+ * these, so any encoding missing here is answered by a round trip to the
+ * proxy client over the serial link instead of at EL2.
+ */
+#define ID_AA64PFR2_EL1        sys_reg(3, 0, 0, 4, 2)
+#define ID_AA64ZFR0_EL1        sys_reg(3, 0, 0, 4, 4)
+#define ID_AA64SMFR0_EL1       sys_reg(3, 0, 0, 4, 5)
+#define ID_AA64ISAR2_EL1       sys_reg(3, 0, 0, 6, 2)
+#define ID_AA64ISAR3_EL1       sys_reg(3, 0, 0, 6, 3)
+#define SYS_ID_AA64MMFR2_EL1   sys_reg(3, 0, 0, 7, 2)
+#define SYS_ID_AA64MMFR3_EL1   sys_reg(3, 0, 0, 7, 3)
+#define SYS_ID_AA64MMFR4_EL1   sys_reg(3, 0, 0, 7, 4)
 #define ID_AA64MMFR0_ECV       GENMASK(63, 60)
 #define ID_AA64MMFR0_FGT       GENMASK(59, 56)
 #define ID_AA64MMFR0_ExS       GENMASK(47, 44)

@@ -2109,6 +2109,24 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
         SYSREG_PASS(SYS_ID_AA64MMFR1_EL1)
         SYSREG_PASS(ID_AA64AFR0_EL1)
         SYSREG_PASS(ID_AA64AFR1_EL1)
+        //
+        // The remainder of the AArch64 ID group 3 space.  TID3 traps all of it,
+        // and anything not answered here falls through to hv_exc_proxy(), which
+        // costs several serial round trips per instruction: the exception is
+        // shipped to the proxy client, which issues its own remote mrs to read
+        // the register and then logs the access.  Windows reads these constantly
+        // during per-CPU bring-up and driver init, so leaving them unhandled
+        // dominates boot time.  ID_AA64MMFR2_EL1 and ID_AA64ISAR2_EL1 were both
+        // observed taking that path on ten-CPU boots.
+        //
+        SYSREG_PASS(ID_AA64PFR2_EL1)
+        SYSREG_PASS(ID_AA64ZFR0_EL1)
+        SYSREG_PASS(ID_AA64SMFR0_EL1)
+        SYSREG_PASS(ID_AA64ISAR2_EL1)
+        SYSREG_PASS(ID_AA64ISAR3_EL1)
+        SYSREG_PASS(SYS_ID_AA64MMFR2_EL1)
+        SYSREG_PASS(SYS_ID_AA64MMFR3_EL1)
+        SYSREG_PASS(SYS_ID_AA64MMFR4_EL1)
         case SYSREG_ISS(ID_AA64PFR0_EL1):
             if(is_read) {
                 //
@@ -2122,6 +2140,14 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                 // this register is architecturally RO, nothing should *ever* be attempting to write this.
                 //
             }
+            //
+            // Without this return the case fell through to the default and the
+            // access was forwarded to the proxy, which overwrote regs[rt] with
+            // the raw register value -- so the GIC bit this case exists to set
+            // never actually reached the guest, and every read paid for a
+            // serial round trip.
+            //
+            return true;
 #endif
         // SYSREG_MAP(SYS_PMXEVCNTR_EL0, SYS_IMP_APL_PMC2)
         // case SYSREG_ISS(SYS_PMXEVTYPER_EL0):
