@@ -43,6 +43,19 @@
 #define MSG_OSLOG_INIT 0x10
 #define MSG_OSLOG_ACK  0x30
 
+/*
+ * The oslog endpoint uses its own field layout, verified against Linux
+ * drivers/soc/apple/rtkit.c at e8efe09d4f378992c890d181d65e2ed8d8cb1194
+ * (APPLE_RTKIT_OSLOG_TYPE/SIZE/IOVA): type in [63:56], a byte count in
+ * [55:36], and a 4 KiB-shifted IOVA in [35:0].  The J414s MTP IOP sends
+ * 0x0106000000000000 during boot: type 1 (buffer request), 0x6000 bytes,
+ * IOVA 0, i.e. an AP-allocated buffer it expects a reply for.
+ */
+#define OSLOG_TYPE                GENMASK(63, 56)
+#define OSLOG_TYPE_BUFFER_REQUEST 1
+#define OSLOG_SIZE                GENMASK(55, 36)
+#define OSLOG_IOVA                GENMASK(35, 0)
+
 #define MGMT_MSG_HELLO        1
 #define MGMT_MSG_HELLO_ACK    2
 #define MGMT_MSG_HELLO_MINVER GENMASK(15, 0)
@@ -93,12 +106,17 @@ struct rtkit_dev {
     u64 phys_window_base;
     size_t phys_window_size;
 
+    u64 pool_base;
+    size_t pool_size;
+    size_t pool_used;
+
     enum rtkit_power_state iop_power;
     enum rtkit_power_state ap_power;
 
     struct rtkit_buffer syslog_bfr;
     struct rtkit_buffer crashlog_bfr;
     struct rtkit_buffer ioreport_bfr;
+    struct rtkit_buffer oslog_bfr;
 
     u32 syslog_cnt, syslog_size;
 
@@ -187,11 +205,34 @@ bool rtkit_set_phys_window(rtkit_dev_t *rtk, u64 base, size_t size)
     return true;
 }
 
+/*
+ * Route AP-allocated buffer grants into a caller-owned physical region
+ * instead of the m1n1 heap.  A preboot handoff that leaves the IOP running
+ * into the next OS must use this: the heap is conventional memory to the
+ * next stage, while the pool region is expected to be reserved out of its
+ * memory map.  Allocation is a bump allocator; when the pool is set,
+ * exhausting it fails the request instead of silently falling back to heap
+ * memory the IOP would then scribble over post-boot.
+ */
+bool rtkit_set_buffer_pool(rtkit_dev_t *rtk, u64 base, size_t size)
+{
+    if (!rtk || !size || (base % SZ_16K) || (size % SZ_16K) || base > UINT64_MAX - size) {
+        printf("rtkit: invalid buffer pool %#lx/+%#lx\n", base, size);
+        return false;
+    }
+
+    rtk->pool_base = base;
+    rtk->pool_size = size;
+    rtk->pool_used = 0;
+    return true;
+}
+
 void rtkit_free(rtkit_dev_t *rtk)
 {
     rtkit_free_buffer(rtk, &rtk->syslog_bfr);
     rtkit_free_buffer(rtk, &rtk->crashlog_bfr);
     rtkit_free_buffer(rtk, &rtk->ioreport_bfr);
+    rtkit_free_buffer(rtk, &rtk->oslog_bfr);
     free(rtk->name);
     free(rtk);
 }
@@ -257,13 +298,25 @@ bool rtkit_unmap(rtkit_dev_t *rtk, u64 dva, size_t sz)
 
 bool rtkit_alloc_buffer(rtkit_dev_t *rtk, struct rtkit_buffer *bfr, size_t sz)
 {
-    bfr->bfr = memalign(SZ_16K, sz);
-    if (!bfr->bfr) {
-        rtkit_printf("unable to allocate %zu buffer\n", sz);
-        return false;
-    }
+    bool pooled = rtk->pool_size != 0;
 
     sz = ALIGN_UP(sz, 16384);
+
+    if (pooled) {
+        if (sz > rtk->pool_size - rtk->pool_used) {
+            rtkit_printf("buffer pool exhausted (%zu requested, %zu left)\n", sz,
+                         rtk->pool_size - rtk->pool_used);
+            return false;
+        }
+        bfr->bfr = (void *)(rtk->pool_base + rtk->pool_used);
+        rtk->pool_used += sz;
+    } else {
+        bfr->bfr = memalign(SZ_16K, sz);
+        if (!bfr->bfr) {
+            rtkit_printf("unable to allocate %zu buffer\n", sz);
+            return false;
+        }
+    }
 
     bfr->sz = sz;
     if (!rtkit_map(rtk, bfr->bfr, sz, &bfr->dva))
@@ -272,7 +325,10 @@ bool rtkit_alloc_buffer(rtkit_dev_t *rtk, struct rtkit_buffer *bfr, size_t sz)
     return true;
 
 error:
-    free(bfr->bfr);
+    if (pooled)
+        rtk->pool_used -= sz;
+    else
+        free(bfr->bfr);
     bfr->bfr = NULL;
     return false;
 }
@@ -359,6 +415,66 @@ static bool rtkit_handle_buffer_request(rtkit_dev_t *rtk, struct rtkit_message *
 
 error:
     return false;
+}
+
+/*
+ * Grant an oslog buffer.  Both working references for this exact device do
+ * so -- Linux apple_rtkit_oslog_rx() (pinned commit above) allocates and
+ * replies, and proxyclient's ASCOSLogEndpoint.GetBuf allocates and replies
+ * with bit-identical field packing -- and the J414s MTP IOP stalls its HID
+ * bringup on the outstanding request if the grant never comes.  A fixed
+ * (nonzero-IOVA) oslog buffer is admitted only inside the configured
+ * physical window, mirroring rtkit_handle_buffer_request() and Linux
+ * rtkit-helper's resource containment check; those grants send no reply.
+ */
+static bool rtkit_handle_oslog_request(rtkit_dev_t *rtk, struct rtkit_message *msg)
+{
+    size_t sz = FIELD_GET(OSLOG_SIZE, msg->msg);
+    u64 addr = FIELD_GET(OSLOG_IOVA, msg->msg) << 12;
+    struct rtkit_buffer *bfr = &rtk->oslog_bfr;
+
+    if (bfr->bfr) {
+        rtkit_printf("duplicate oslog buffer request %lx\n", msg->msg);
+        return false;
+    }
+
+    if (addr) {
+        if (rtk->phys_window_size && addr >= rtk->phys_window_base &&
+            addr - rtk->phys_window_base < rtk->phys_window_size && sz &&
+            sz <= rtk->phys_window_size - (addr - rtk->phys_window_base)) {
+            bfr->dva = addr;
+            bfr->bfr = (void *)addr;
+            bfr->sz = sz;
+            rtkit_printf("pre-allocated oslog buffer (phys %#lx, size %#zx)\n", addr, sz);
+            return true;
+        }
+        rtkit_printf("oslog buffer request outside physical window (%#lx, %#zx)\n", addr, sz);
+        return false;
+    }
+
+    if (!sz) {
+        rtkit_printf("empty oslog buffer request %lx\n", msg->msg);
+        return false;
+    }
+
+    if (!rtkit_alloc_buffer(rtk, bfr, sz)) {
+        rtkit_printf("unable to allocate oslog buffer\n");
+        return false;
+    }
+
+    struct asc_message reply;
+    reply.msg1 = RTKIT_EP_OSLOG;
+    reply.msg0 = FIELD_PREP(OSLOG_TYPE, OSLOG_TYPE_BUFFER_REQUEST);
+    reply.msg0 |= FIELD_PREP(OSLOG_SIZE, sz);
+    reply.msg0 |= FIELD_PREP(OSLOG_IOVA, bfr->dva >> 12);
+    if (!asc_send(rtk->asc, &reply)) {
+        rtkit_printf("unable to send oslog buffer reply\n");
+        rtkit_free_buffer(rtk, bfr);
+        return false;
+    }
+
+    rtkit_printf("oslog buffer (dva %#lx, phys %p, size %#zx)\n", bfr->dva, bfr->bfr, sz);
+    return true;
 }
 
 static void rtkit_crashed(rtkit_dev_t *rtk)
@@ -490,7 +606,13 @@ int rtkit_recv(rtkit_dev_t *rtk, struct rtkit_message *msg)
                 }
                 break;
             case RTKIT_EP_OSLOG:
-                rtkit_printf("unknown oslog message %lx\n", msg->msg);
+                switch (FIELD_GET(OSLOG_TYPE, msg->msg)) {
+                    case OSLOG_TYPE_BUFFER_REQUEST:
+                        ok = ok && rtkit_handle_oslog_request(rtk, msg);
+                        break;
+                    default:
+                        rtkit_printf("unknown oslog message %lx\n", msg->msg);
+                }
                 break;
             default:
                 rtkit_printf("message to unknown system endpoint 0x%02x: %lx\n", msg->ep, msg->msg);

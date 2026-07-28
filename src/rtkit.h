@@ -31,6 +31,14 @@ rtkit_dev_t *rtkit_init(const char *name, asc_dev_t *asc, dart_dev_t *dart,
  * with a dedicated SRAM region.
  */
 bool rtkit_set_phys_window(rtkit_dev_t *rtk, u64 base, size_t size);
+/*
+ * Serve AP-allocated buffer grants from a caller-owned, 16 KiB-aligned
+ * physical region instead of the m1n1 heap. Required whenever the IOP keeps
+ * running into the next OS: the pool region must be reserved out of that
+ * OS's memory map, and exhaustion fails the request rather than falling
+ * back to heap memory the IOP would scribble over post-boot.
+ */
+bool rtkit_set_buffer_pool(rtkit_dev_t *rtk, u64 base, size_t size);
 bool rtkit_quiesce(rtkit_dev_t *rtk);
 bool rtkit_sleep(rtkit_dev_t *rtk);
 void rtkit_free(rtkit_dev_t *rtk);

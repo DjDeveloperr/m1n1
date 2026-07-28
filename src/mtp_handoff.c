@@ -112,6 +112,18 @@
 #define MTP_FW_STAGING_PHYS 0x10020000000ULL
 #define MTP_FW_STAGING_SIZE 0x100000ULL
 
+/*
+ * Preboot RTKit buffer pool: the second half of the same reserved carveout.
+ * The MTP IOP requests at least one AP-allocated buffer during boot (oslog,
+ * 0x6000 bytes, observed live as 0x0106000000000000) and keeps DMA-writing
+ * into every granted buffer after Windows owns the machine, so grants must
+ * never come from the m1n1 heap -- that is conventional memory to Mu and
+ * Windows.  The Mu MemoryInitPeiLib overlay reserves the full 2 MiB
+ * [staging | pool] region out of the UEFI memory map.
+ */
+#define MTP_RTKIT_POOL_PHYS (MTP_FW_STAGING_PHYS + MTP_FW_STAGING_SIZE)
+#define MTP_RTKIT_POOL_SIZE 0x100000ULL
+
 struct mtp_handoff_state {
     asc_dev_t *asc;
     dart_dev_t *dart;
@@ -355,12 +367,12 @@ void mtp_handoff_init(void)
     }
 
     /*
-     * Pre-map the firmware staging window before the IOP boots.  Wiping it
-     * first means the IOP can never observe stale DRAM contents through the
-     * mapping, and Windows only ever sends command 0x95 after writing a
-     * validated payload here.
+     * Pre-map the firmware staging window before the IOP boots.  Wiping the
+     * whole reserved carveout (staging + RTKit pool) first means the IOP can
+     * never observe stale DRAM contents through a mapping, and Windows only
+     * ever sends command 0x95 after writing a validated payload here.
      */
-    memset((void *)MTP_FW_STAGING_PHYS, 0, MTP_FW_STAGING_SIZE);
+    memset((void *)MTP_FW_STAGING_PHYS, 0, MTP_FW_STAGING_SIZE + MTP_RTKIT_POOL_SIZE);
     if (dart_map(mtp_handoff.dart, MTP_FW_STAGING_DVA, (void *)MTP_FW_STAGING_PHYS,
                  MTP_FW_STAGING_SIZE) < 0) {
         printf("mtp-handoff: could not map firmware staging window\n");
@@ -380,6 +392,8 @@ void mtp_handoff_init(void)
     if (!mtp_handoff.rtkit ||
         !rtkit_set_phys_window(mtp_handoff.rtkit, mtp_handoff.sram_base,
                                mtp_handoff.sram_size) ||
+        !rtkit_set_buffer_pool(mtp_handoff.rtkit, MTP_RTKIT_POOL_PHYS,
+                               MTP_RTKIT_POOL_SIZE) ||
         !rtkit_boot_timed(mtp_handoff.rtkit, MTP_READY_TIMEOUT)) {
         printf("mtp-handoff: MTP RTKit boot failed\n");
         goto fail;
@@ -389,9 +403,27 @@ void mtp_handoff_init(void)
      * reading RX_8/RX_32 would steal INIT from the Windows driver. Do not
      * acknowledge IRQs or set masks/thresholds here. Requiring queued data
      * closes the race between AP=ON and Windows taking transport ownership.
+     *
+     * Keep servicing the RTKit mailbox while waiting: the IOP logs over
+     * syslog during HID bringup and each MSG_SYSLOG_LOG wants an ack, which
+     * is exactly what the working Python flow does in wait_init() via
+     * mtp.work().  rtkit_recv() touches only the ASC mailbox, never
+     * DockChannel, so the non-consuming invariant holds.  After the INIT
+     * data shows up we stop for good; from then on the mailbox is
+     * deliberately unserviced, per the ownership split with AppleMtpHid.
      */
     u64 timeout = timeout_calculate(MTP_READY_TIMEOUT);
     do {
+        struct rtkit_message rtk_msg;
+        int ret = rtkit_recv(mtp_handoff.rtkit, &rtk_msg);
+        if (ret < 0) {
+            printf("mtp-handoff: MTP RTKit failed while waiting for INIT data\n");
+            goto fail;
+        }
+        if (ret > 0)
+            printf("mtp-handoff: ignoring app message to endpoint 0x%02x: %lx\n", rtk_msg.ep,
+                   rtk_msg.msg);
+
         mtp_handoff.initial_rx_count =
             read32(mtp_handoff.data_base + DOCKCHANNEL_RX_COUNT);
         if (mtp_handoff.initial_rx_count)
