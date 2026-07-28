@@ -43,8 +43,12 @@
 #define J414S_MTP_CONFIG_BASE   0x2a9b30000ULL
 #define J414S_MTP_DATA_BASE     0x2a9b34000ULL
 #define J414S_MTP_APERTURE_SIZE 0x1000
-#define J414S_MTP_SRAM_BASE     0x2a9c00000ULL
-#define J414S_MTP_SRAM_SIZE     SZ_1M
+/*
+ * Floor only.  The real window comes from the ADT: J414s reports the MTP ASC
+ * aperture as 0x2a9400000/+0x6c000.  The previous literals (0x2a9c00000/1 MiB)
+ * matched nothing on this machine.
+ */
+#define J414S_MTP_SRAM_MIN_SIZE SZ_16K
 
 #define DOCKCHANNEL_DATA_OFFSET 0x4000
 #define DOCKCHANNEL_RX_COUNT    0x2c
@@ -109,8 +113,16 @@ static bool mtp_handoff_get_resources(void)
         return false;
     }
 
+    /*
+     * reg 0 is the MTP ASC's own aperture -- the same one asc_init() maps -- and
+     * it is where the IOP's fixed RTKit system buffers live.  On J414s the live
+     * ADT reports 0x2a9400000/+0x6c000, far larger than the register block
+     * itself, which is the embedded SRAM.  reg 1 (0x2a9050000/+0x4000) is a
+     * separate 16 KiB block and is not the buffer aperture; reading it here was
+     * what made this handoff reject the machine it was written for.
+     */
     if (adt_path_offset_trace(adt, MTP_PATH, mtp_path) < 0 ||
-        adt_get_reg(adt, mtp_path, "reg", 1, &mtp_handoff.sram_base,
+        adt_get_reg(adt, mtp_path, "reg", 0, &mtp_handoff.sram_base,
                     &mtp_handoff.sram_size) < 0) {
         printf("mtp-handoff: incomplete MTP SRAM ADT resource\n");
         return false;
@@ -129,9 +141,15 @@ static bool mtp_handoff_get_resources(void)
         return false;
     }
 
-    if (mtp_handoff.sram_base != J414S_MTP_SRAM_BASE ||
-        mtp_handoff.sram_size < J414S_MTP_SRAM_SIZE) {
-        printf("mtp-handoff: unexpected J414s MTP SRAM map %#lx/+%#lx\n",
+    /*
+     * The window is whatever the ADT says the ASC aperture is; do not pin it to
+     * a literal.  The board check above already refuses a non-J414s machine, and
+     * rtkit only honours a fixed buffer address that falls inside this window --
+     * anything else still has to survive DART translation.  Keep a floor so a
+     * malformed ADT cannot hand us a degenerate window.
+     */
+    if (!mtp_handoff.sram_base || mtp_handoff.sram_size < J414S_MTP_SRAM_MIN_SIZE) {
+        printf("mtp-handoff: unusable J414s MTP SRAM map %#lx/+%#lx\n",
                mtp_handoff.sram_base, mtp_handoff.sram_size);
         return false;
     }
