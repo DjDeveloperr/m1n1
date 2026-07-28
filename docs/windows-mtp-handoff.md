@@ -41,15 +41,17 @@ checked by m1n1 before it changes state:
 
 | Resource | Physical address | Minimum mapping | Windows use |
 | --- | ---: | ---: | --- |
-| DockChannel parent IRQ registers | `0x2a9b14000` | 8 bytes | parent interrupt block |
-| Remote FIFO configuration | `0x2a9b28000` | 8 bytes | channel 1 thresholds |
-| Remote FIFO data | `0x2a9b2c000` | `0x30` bytes | channel 1 TX/RX and `RX_COUNT` |
+| DockChannel parent IRQ registers | `0x2a9b14000` | `0x1000` bytes | parent interrupt block |
+| Remote FIFO configuration | `0x2a9b30000` | `0x1000` bytes | channel 1 thresholds |
+| Remote FIFO data | `0x2a9b34000` | `0x1000` bytes | channel 1 TX/RX and `RX_COUNT` |
 | DockChannel index | `1` | — | MTP transport |
 | Interrupt GSIV | `677` | — | ACPI interrupt resource |
 
-The data aperture is `config + 0x4000`.  The ACPI `AppleMtpHid` device must
-describe these **physical** ranges and GSIV 677.  Its driver takes the initial
-`INIT` queue as the source of truth and then owns all ring/IRQ configuration.
+The live J414s ADT reports the IRQ and configuration apertures as `0x1000`
+bytes each; the data aperture is `config + 0x4000`.  The ACPI `AppleMtpHid`
+device must describe these **physical** ranges and GSIV 677.  Its driver takes
+the initial `INIT` queue as the source of truth and then owns all ring/IRQ
+configuration.
 
 At handoff the required persistent state is:
 

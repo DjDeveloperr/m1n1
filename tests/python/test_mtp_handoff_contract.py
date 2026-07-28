@@ -36,8 +36,13 @@ class MtpHandoffContractTests(unittest.TestCase):
         self.assertIn("never reads `RX_8` or `RX_32`", DOC)
 
     def test_mtp_handoff_documents_the_acpi_contract(self):
-        for address in ("0x2a9b14000", "0x2a9b28000", "0x2a9b2c000"):
+        for address in ("0x2a9b14000", "0x2a9b30000", "0x2a9b34000"):
             self.assertIn(address, DOC)
+            self.assertIn(address, SOURCE)
+        self.assertNotIn("0x2a9b28000", SOURCE + DOC)
+        self.assertNotIn("0x2a9b2c000", SOURCE + DOC)
+        self.assertIn("0x1000", DOC)
+        self.assertIn("J414S_MTP_APERTURE_SIZE 0x1000", SOURCE)
         self.assertIn("677", DOC)
         self.assertIn("GPIO and interface firmware boundary", DOC)
 

@@ -39,9 +39,10 @@
  * at these physical addresses too; a different layout needs an explicit port
  * rather than a best-effort boot with the wrong device behind the driver.
  */
-#define J414S_MTP_IRQ_BASE    0x2a9b14000ULL
-#define J414S_MTP_CONFIG_BASE 0x2a9b28000ULL
-#define J414S_MTP_DATA_BASE   0x2a9b2c000ULL
+#define J414S_MTP_IRQ_BASE      0x2a9b14000ULL
+#define J414S_MTP_CONFIG_BASE   0x2a9b30000ULL
+#define J414S_MTP_DATA_BASE     0x2a9b34000ULL
+#define J414S_MTP_APERTURE_SIZE 0x1000
 
 #define DOCKCHANNEL_DATA_OFFSET 0x4000
 #define DOCKCHANNEL_RX_COUNT    0x2c
@@ -103,7 +104,8 @@ static bool mtp_handoff_get_dockchannel_resources(void)
 
     mtp_handoff.data_base = mtp_handoff.config_base + DOCKCHANNEL_DATA_OFFSET;
 
-    if (irq_size < 8 || config_size < 8 || mtp_handoff.irq_base != J414S_MTP_IRQ_BASE ||
+    if (irq_size < J414S_MTP_APERTURE_SIZE || config_size < J414S_MTP_APERTURE_SIZE ||
+        mtp_handoff.irq_base != J414S_MTP_IRQ_BASE ||
         mtp_handoff.config_base != J414S_MTP_CONFIG_BASE ||
         mtp_handoff.data_base != J414S_MTP_DATA_BASE) {
         printf("mtp-handoff: unexpected J414s DockChannel map irq=%#lx/+%#lx "
