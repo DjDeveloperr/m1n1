@@ -2122,6 +2122,28 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                 // this register is architecturally RO, nothing should *ever* be attempting to write this.
                 //
             }
+            //
+            // Return here rather than falling through to hv_exc_proxy().  The
+            // proxy services a trapped read by issuing its own remote mrs over
+            // the serial link and overwriting regs[rt], which both discarded
+            // the GIC bit this case exists to set and cost several serial round
+            // trips per instruction.  ID_AA64PFR0_EL1 is roughly four fifths of
+            // all ID-register traffic during Windows' per-CPU bring-up, so this
+            // is where the boot time went.
+            //
+            // The remaining trapped ID encodings -- ID_AA64ISAR2_EL1 and
+            // ID_AA64MMFR2_EL1 in particular -- are deliberately NOT handled
+            // here.  A Windows-side pre-adapter checkpoint in
+            // tools/m1n1-windows-debug.py hooks hv.handle_msr and uses trapped
+            // MSR accesses as its clock: it retries until storport.sys appears
+            // in PsLoadedModuleList and then applies the Forwarded-I/O unit
+            // patch.  Answering every ID register at EL2 starves that hook, the
+            // patch never lands, and the boot fails closed with "Storport
+            // Forwarded-I/O patch missed the pre-adapter checkpoint".  Leaving
+            // these two on the proxy path keeps that clock running.  Move the
+            // checkpoint onto a deterministic trigger before taking them.
+            //
+            return true;
 #endif
         // SYSREG_MAP(SYS_PMXEVCNTR_EL0, SYS_IMP_APL_PMC2)
         // case SYSREG_ISS(SYS_PMXEVTYPER_EL0):
