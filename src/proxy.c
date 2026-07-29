@@ -26,6 +26,7 @@
 #include "uartproxy.h"
 #include "usb.h"
 #include "utils.h"
+#include "wireless_handoff.h"
 #include "xnuboot.h"
 #include "hv_psci.h"
 
@@ -595,6 +596,9 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             break;
         case P_PCIE_SHUTDOWN:
             pcie_shutdown();
+            break;
+        case P_WIRELESS_HANDOFF_INIT:
+            reply->retval = wireless_handoff_init();
             break;
 
         case P_NVME_INIT:

@@ -146,6 +146,7 @@ OBJECTS := \
 	nvme.o \
 	payload.o \
 	pcie.o \
+	wireless_handoff.o \
 	pmgr.o \
 	proxy.o \
 	ringbuffer.o \

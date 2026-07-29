@@ -66,6 +66,11 @@
 //
 #define ENABLE_J414S_WINDOWS_MTP_HANDOFF
 
+// Opt-in proxy operation that installs the persistent J414s BCM4388 SID-1
+// deny-all domain after pcie_init() and before hv_start(). It remains guarded
+// by the runtime T6020/J414sAP identity check.
+#define ENABLE_J414S_WINDOWS_WIRELESS_HANDOFF
+
 #if defined(ENABLE_NATIVE_AIC_PASSTHROUGH) && !defined(ENABLE_VGIC_MODULE)
 #error "ENABLE_NATIVE_AIC_PASSTHROUGH requires ENABLE_VGIC_MODULE -- see config.h comment above"
 #endif

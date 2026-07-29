@@ -711,6 +711,7 @@ class M1N1Proxy(Reloadable):
 
     P_PCIE_INIT = 0xe00
     P_PCIE_SHUTDOWN = 0xe01
+    P_WIRELESS_HANDOFF_INIT = 0xe02
 
     P_NVME_INIT = 0xf00
     P_NVME_SHUTDOWN = 0xf01
@@ -1215,6 +1216,8 @@ class M1N1Proxy(Reloadable):
         return self.request(self.P_PCIE_INIT, signed=True)
     def pcie_shutdown(self):
         return self.request(self.P_PCIE_SHUTDOWN)
+    def wireless_handoff_init(self):
+        return self.request(self.P_WIRELESS_HANDOFF_INIT, signed=True)
 
     def nvme_init(self):
         return self.request(self.P_NVME_INIT)
