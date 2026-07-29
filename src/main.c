@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 
-#include "../build/build_cfg.h"
-#include "../build/build_tag.h"
+#include "build_cfg.h"
+#include "build_tag.h"
 
 #include "../config.h"
 

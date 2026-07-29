@@ -43,27 +43,27 @@ static struct {
     bool active;
 } console;
 
-extern u8 _binary_build_bootlogo_48_bin_start[];
-extern u8 _binary_build_bootlogo_128_bin_start[];
-extern u8 _binary_build_bootlogo_256_bin_start[];
+extern u8 _binary_bootlogo_48_bin_start[];
+extern u8 _binary_bootlogo_128_bin_start[];
+extern u8 _binary_bootlogo_256_bin_start[];
 
-extern u8 _binary_build_font_bin_start[];
-extern u8 _binary_build_font_retina_bin_start[];
+extern u8 _binary_font_bin_start[];
+extern u8 _binary_font_retina_bin_start[];
 
 const struct image logo_48 = {
-    .ptr = (void *)_binary_build_bootlogo_48_bin_start,
+    .ptr = (void *)_binary_bootlogo_48_bin_start,
     .width = 48,
     .height = 48,
 };
 
 const struct image logo_128 = {
-    .ptr = (void *)_binary_build_bootlogo_128_bin_start,
+    .ptr = (void *)_binary_bootlogo_128_bin_start,
     .width = 128,
     .height = 128,
 };
 
 const struct image logo_256 = {
-    .ptr = (void *)_binary_build_bootlogo_256_bin_start,
+    .ptr = (void *)_binary_bootlogo_256_bin_start,
     .width = 256,
     .height = 256,
 };
@@ -421,17 +421,17 @@ void fb_init(bool clear)
     // This is the touchbar, make everything tiny
     if (chip_id == T8012) {
         logo = &logo_48;
-        console.font.ptr = _binary_build_font_bin_start;
+        console.font.ptr = _binary_font_bin_start;
         console.font.width = 8;
         console.font.height = 16;
     } else if (cur_boot_args.video.depth & FB_DEPTH_FLAG_RETINA) {
         logo = &logo_256;
-        console.font.ptr = _binary_build_font_retina_bin_start;
+        console.font.ptr = _binary_font_retina_bin_start;
         console.font.width = 16;
         console.font.height = 32;
     } else {
         logo = &logo_128;
-        console.font.ptr = _binary_build_font_bin_start;
+        console.font.ptr = _binary_font_bin_start;
         console.font.width = 8;
         console.font.height = 16;
     }

@@ -64,12 +64,18 @@ def main() -> int:
         print(f"J414s unified m1n1 source: PASS {commit}")
         return 0
 
-    subprocess.run(["make", f"-j{args.jobs}"], cwd=root, check=True)
-    artifact_dir = args.output.resolve() / commit / "artifacts"
+    output_root = args.output.resolve() / commit
+    build_dir = output_root / "work"
+    subprocess.run(
+        ["make", f"-j{args.jobs}", f"BUILD_DIR={build_dir}"],
+        cwd=root,
+        check=True,
+    )
+    artifact_dir = output_root / "artifacts"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     files: dict[str, dict[str, int | str]] = {}
     for name in FILES:
-        source = root / "build" / name
+        source = build_dir / name
         if not source.is_file():
             raise SystemExit(f"build omitted {source}")
         target = artifact_dir / name

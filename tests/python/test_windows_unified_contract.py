@@ -30,7 +30,9 @@ class WindowsUnifiedContractTests(unittest.TestCase):
         )
         self.assertIn('BRANCH = "feature/j414s-windows-unified"', builder)
         self.assertIn('"schema": "ntasi.j414s.m1n1-unified.v1"', builder)
-        self.assertIn('args.output.resolve() / commit / "artifacts"', builder)
+        self.assertIn("output_root = args.output.resolve() / commit", builder)
+        self.assertIn('artifact_dir = output_root / "artifacts"', builder)
+        self.assertIn('f"BUILD_DIR={build_dir}"', builder)
         self.assertIn("refusing a modified m1n1 source tree", builder)
 
 

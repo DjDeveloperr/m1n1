@@ -7,7 +7,7 @@
  * - https://www.beyondlogic.org/usbnutshell/usb1.shtml
  */
 
-#include "../build/build_tag.h"
+#include "build_tag.h"
 
 #include "usb_dwc3.h"
 #include "adt.h"

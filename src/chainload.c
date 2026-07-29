@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 
-#include "../build/build_cfg.h"
+#include "build_cfg.h"
 
 #include "chainload.h"
 #include "adt.h"
