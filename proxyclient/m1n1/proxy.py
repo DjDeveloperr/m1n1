@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-import platform, os, sys, struct, serial, time
+import platform, os, sys, struct, serial, time, signal
 from construct import *
 from enum import IntEnum, IntFlag
 from serial.tools.miniterm import Miniterm
@@ -31,6 +31,55 @@ class UartChecksumError(UartError):
 
 class UartRemoteError(UartError):
     pass
+
+
+class _DeferredKeyboardInterrupt:
+    """Keep an in-flight unframed data transfer protocol-synchronized.
+
+    REQ_MEMWRITE has a framed command header followed by an exact-size raw
+    byte stream.  If Python accepts SIGINT between those two boundaries, the
+    target remains blocked in iodev_read() and consumes every later command as
+    payload until it receives the missing bytes.  Defer Ctrl-C until the reply
+    closes the request.  Signal handlers can only be changed from the main
+    thread; worker-thread users retain the historical behavior.
+    """
+
+    def __init__(self):
+        self._previous = None
+        self._pending = None
+        self._armed = False
+
+    def _handle(self, signum, frame):
+        self._pending = (signum, frame)
+
+    def __enter__(self):
+        try:
+            previous = signal.getsignal(signal.SIGINT)
+            if previous == signal.SIG_IGN:
+                return self
+            signal.signal(signal.SIGINT, self._handle)
+        except ValueError:
+            return self
+
+        self._previous = previous
+        self._armed = True
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if not self._armed:
+            return False
+
+        signal.signal(signal.SIGINT, self._previous)
+        if self._pending is None or exc_type is not None:
+            return False
+
+        signum, frame = self._pending
+        if callable(self._previous):
+            self._previous(signum, frame)
+        else:
+            raise KeyboardInterrupt
+        return False
+
 
 class Feature(IntFlag):
     DISABLE_DATA_CSUMS = 0x01  # Data transfers don't use checksums
@@ -397,23 +446,24 @@ class UartInterface(Reloadable):
         checksum = self.data_checksum(data)
         size = len(data)
         req = struct.pack("<QQI", addr, size, checksum)
-        self.cmd(self.REQ_MEMWRITE, req)
-        if self.debug:
-            print("<< DATA:")
-            chexdump(data)
-        for i in range(0, len(data), 8192):
-            self.dev.write(data[i:i + 8192])
+        with _DeferredKeyboardInterrupt():
+            self.cmd(self.REQ_MEMWRITE, req)
+            if self.debug:
+                print("<< DATA:")
+                chexdump(data)
+            for i in range(0, len(data), 8192):
+                self.dev.write(data[i:i + 8192])
+                if progress:
+                    sys.stdout.write(".")
+                    sys.stdout.flush()
             if progress:
-                sys.stdout.write(".")
-                sys.stdout.flush()
-        if progress:
-            print()
-        if self.enabled_features & Feature.DISABLE_DATA_CSUMS:
-            # Extra sentinel after the data to make sure no data is lost
-            self.dev.write(struct.pack("<I", self.DATA_END_SENTINEL))
+                print()
+            if self.enabled_features & Feature.DISABLE_DATA_CSUMS:
+                # Extra sentinel after the data to make sure no data is lost
+                self.dev.write(struct.pack("<I", self.DATA_END_SENTINEL))
 
-        # should automatically report a CRC failure
-        self.reply(self.REQ_MEMWRITE)
+            # should automatically report a CRC failure
+            self.reply(self.REQ_MEMWRITE)
 
     def readmem(self, addr, size):
         if size == 0:
