@@ -41,6 +41,19 @@ class WirelessHandoffContractTests(unittest.TestCase):
             "return self.request(self.P_WIRELESS_HANDOFF_INIT, signed=True)",
             PROXY_PY,
         )
+        self.assertIn("P_PCIE_WIRELESS_INIT = 0xe03", PROXY_PY)
+        self.assertIn(
+            "return self.request(self.P_PCIE_WIRELESS_INIT, signed=True)",
+            PROXY_PY,
+        )
+
+    def test_exact_endpoints_are_required_before_writes(self) -> None:
+        preflight = SOURCE.index("static int wlan_check_endpoints_quiescent")
+        tables = SOURCE.index("wlan_build_tables();")
+        section = SOURCE[preflight:tables]
+        self.assertIn("WLAN_WIFI_ID", section)
+        self.assertIn("WLAN_BT_ID", section)
+        self.assertIn("WLAN_ERR_ENDPOINT_ID", section)
 
     def test_domain_precedes_requester_routing(self) -> None:
         table = SOURCE.index("wlan_build_tables();")

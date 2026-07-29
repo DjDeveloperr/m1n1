@@ -192,6 +192,18 @@ static void test_idempotent_preinstalled_rids(void)
                 true);
 }
 
+static void test_preserves_disabled_msi_geometry(void)
+{
+    const u64 config = PCIE_T602X_BCM4388_PORT0_BASE +
+                       PCIE_T602X_PORT_MSI_CONFIG_OFFSET;
+    struct mock_mmio mock = {.msi_config = UINT32_C(0x100)};
+
+    CHECK(pcie_t602x_bcm4388_setup_port0(&mock_ops, &mock) ==
+          PCIE_T602X_BCM4388_OK);
+    check_write(&mock, 0, config, UINT32_C(0x100), true);
+    CHECK(mock.msi_config == UINT32_C(0x101));
+}
+
 static void test_occupied_rid_rejection_has_zero_writes(void)
 {
     struct mock_mmio rid0_occupied = {.rid2sid = {UINT32_C(0x80020200), 0}};
@@ -315,6 +327,23 @@ static void test_msi_failure_rolls_back_new_rids(void)
     CHECK(mock.writes[mock.write_count - 1].value == 0);
 }
 
+static void test_msi_failure_preserves_disabled_geometry(void)
+{
+    const u32 failed_vector = 7;
+    const u64 base = PCIE_T602X_BCM4388_PORT0_BASE;
+    const u64 failed_address =
+        base + PCIE_T602X_PORT_MSIMAP_OFFSET + 4 * failed_vector;
+    struct mock_mmio mock = {
+        .msi_config = UINT32_C(0x100),
+        .fail_read_address = failed_address,
+        .fail_read_count = 1,
+    };
+
+    CHECK(pcie_t602x_bcm4388_setup_port0(&mock_ops, &mock) ==
+          PCIE_T602X_BCM4388_ERR_MSI_MAP_READ(failed_vector));
+    CHECK(mock.msi_config == UINT32_C(0x100));
+}
+
 static void test_invalid_ops(void)
 {
     struct mock_mmio mock = {0};
@@ -333,12 +362,14 @@ int main(void)
 {
     test_success_write_order();
     test_idempotent_preinstalled_rids();
+    test_preserves_disabled_msi_geometry();
     test_occupied_rid_rejection_has_zero_writes();
     test_active_msi_decoder_rejection_has_zero_writes();
     test_slot1_failure_rolls_back_slot0();
     test_slot1_readback_mismatch_rolls_back_both_slots();
     test_msi_read_failure_leaves_decoder_disabled();
     test_msi_failure_rolls_back_new_rids();
+    test_msi_failure_preserves_disabled_geometry();
     test_invalid_ops();
 
     puts("T602X BCM4388 PCIe host tests: PASS");

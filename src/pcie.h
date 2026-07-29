@@ -20,6 +20,7 @@ typedef uint64_t u64;
  */
 #define PCIE_T602X_BCM4388_PORT0_BASE        UINT64_C(0x594008000)
 #define PCIE_T602X_PORT_MSI_CONFIG_OFFSET    UINT64_C(0x124)
+#define PCIE_T602X_PORT_MSI_ENABLE           UINT32_C(0x1)
 #define PCIE_T602X_PORT_MSI_ADDRESS_LO       UINT64_C(0x16c)
 #define PCIE_T602X_PORT_MSI_ADDRESS_HI       UINT64_C(0x170)
 #define PCIE_T602X_PORT_RID2SID_OFFSET       UINT64_C(0x3000)
@@ -94,13 +95,16 @@ enum pcie_t602x_bcm4388_error {
  * decoder.  This function does not train the link, touch ECAM or endpoint PCI
  * configuration, enable bus mastering, configure DART, or alter endpoint MSI
  * capabilities.  The caller must serialize access to the two RID2SID slots and
- * the MSI registers for the full duration of the call.  The port MSI decoder
- * must read as zero, and both endpoint functions must have MSI and bus mastering
- * disabled before entry; otherwise this one-way bring-up helper must not run.
+ * the MSI registers for the full duration of the call.  The port MSI decoder's
+ * enable bit must be clear, and both endpoint functions must have MSI and bus
+ * mastering disabled before entry; otherwise this one-way bring-up helper must
+ * not run. Other MSICFG fields established by pcie_init() are preserved.
  */
 int pcie_t602x_bcm4388_setup_port0(const struct pcie_t602x_mmio_ops *ops, void *context);
 
 int pcie_init(void);
+/* Exact-J414s opt-in: initialize only APCIE port 0 and require link-up. */
+int pcie_init_wireless(void);
 int pcie_shutdown(void);
 
 #endif

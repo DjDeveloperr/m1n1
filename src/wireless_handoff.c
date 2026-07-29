@@ -27,6 +27,8 @@
 #define WLAN_DART0_BASE 0x594000000ULL
 #define WLAN_DART0_SIZE 0x4000ULL
 #define WLAN_ECAM_BASE  0x580000000ULL
+#define WLAN_WIFI_ID    0x443414e4U
+#define WLAN_BT_ID      0x5f7214e4U
 
 #define WLAN_DART_PARAMS1              0x000
 #define WLAN_DART_PARAMS1_LOG2_PAGE    GENMASK(27, 24)
@@ -82,6 +84,7 @@ enum wlan_handoff_error {
     WLAN_ERR_PORT_SETUP = -10,
     WLAN_ERR_PREEXISTING_FAULT = -11,
     WLAN_ERR_IDENTITY = -12,
+    WLAN_ERR_ENDPOINT_ID = -13,
 };
 
 static u64 wlan_dart_regs;
@@ -94,14 +97,25 @@ static u32 wlan_pci_command(u32 function)
     return read32(config + 4) & 0xffff;
 }
 
+static u32 wlan_pci_identity(u32 function)
+{
+    u64 config = WLAN_ECAM_BASE + (1ULL << 20) + ((u64)function << 12);
+
+    return read32(config);
+}
+
 static int wlan_check_endpoints_quiescent(void)
 {
+    static const u32 expected_identity[2] = {WLAN_WIFI_ID, WLAN_BT_ID};
+
     for (u32 function = 0; function < 2; function++) {
+        u32 identity = wlan_pci_identity(function);
         u32 command = wlan_pci_command(function);
 
-        if (command == 0xffff) {
-            printf("wlan-handoff: bus 1 function %u is absent\n", function);
-            return WLAN_ERR_LAYOUT;
+        if (identity != expected_identity[function]) {
+            printf("wlan-handoff: function %u identity %#x, expected %#x\n", function,
+                   identity, expected_identity[function]);
+            return WLAN_ERR_ENDPOINT_ID;
         }
         if (command & BIT(2)) {
             printf("wlan-handoff: function %u already bus-mastering (cmd %#x)\n", function,
