@@ -147,7 +147,7 @@ OBJECTS := \
 	nvme.o \
 	payload.o \
 	pcie.o \
-	wireless_handoff.o \
+	wireless_handoff.o wireless_handoff_abi.o \
 	pmgr.o \
 	platform_identity.o \
 	proxy.o \

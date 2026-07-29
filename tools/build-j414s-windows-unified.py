@@ -20,6 +20,10 @@ REQUIRED_SOURCE = {
     "native_aic": ("config.h", "#define ENABLE_NATIVE_AIC_PASSTHROUGH"),
     "mtp": ("config.h", "#define ENABLE_J414S_WINDOWS_MTP_HANDOFF"),
     "wireless_contract": ("src/wireless_handoff.c", "wlan_validate_reservation"),
+    "wireless_descriptor_abi": (
+        "src/wireless_handoff_abi.h",
+        "struct wireless_handoff_descriptor_v2",
+    ),
     "bcm4388_dormant_transaction": (
         "src/bcm4388_handoff.c",
         "int bcm4388_legacy_dormant_handoff_install(",
@@ -144,6 +148,13 @@ def main() -> int:
             "ans_explicit": True,
             "wireless_explicit_reserved_range": True,
             "authoritative_wireless_contract": "dynamic_reserved_wireless_handoff_v2",
+            "wireless_descriptor": {
+                "signature": "NWH2",
+                "version": 2,
+                "size": 96,
+                "offset": "0xc000",
+                "capture_manifest_schema": "ntasi.j414s.wireless-handoff.v2",
+            },
             "bcm4388_descriptor_transaction": (
                 "legacy_reference_fixed_layout_no_current_abi_no_call_site"
             ),

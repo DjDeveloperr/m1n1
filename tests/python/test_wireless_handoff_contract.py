@@ -82,6 +82,10 @@ class WirelessHandoffContractTests(unittest.TestCase):
             "WLAN_DART_TLB_CMD_FLUSH_SID1   0x101",
         ):
             self.assertIn(literal, SOURCE)
+        abi = (ROOT / "src/wireless_handoff_abi.h").read_text()
+        self.assertIn("WIRELESS_HANDOFF_V2_DESCRIPTOR_OFFSET 0xc000ULL", abi)
+        self.assertIn("struct wireless_handoff_descriptor_v2", abi)
+        self.assertIn("wireless_handoff_v2_descriptor_validate", SOURCE)
 
     def test_reservation_is_dynamic_and_above_guest_system_memory(self) -> None:
         self.assertNotIn("0x10022000000ULL", SOURCE)

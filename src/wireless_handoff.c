@@ -19,6 +19,7 @@
 #include "types.h"
 #include "utils.h"
 #include "wireless_handoff.h"
+#include "wireless_handoff_abi.h"
 #include "xnuboot.h"
 
 #if defined(ENABLE_NATIVE_AIC_PASSTHROUGH) && defined(ENABLE_J414S_WINDOWS_WIRELESS_HANDOFF)
@@ -69,6 +70,9 @@
 #define WLAN_PT_CARVEOUT_SIZE 0x10000ULL
 #define WLAN_PT_ALIGNMENT     0x4000ULL
 
+_Static_assert(WLAN_PT_CARVEOUT_SIZE == WIRELESS_HANDOFF_V2_RESERVATION_SIZE,
+               "runtime and ABI reservation size");
+
 enum wlan_handoff_error {
     WLAN_HANDOFF_OK = 0,
     WLAN_ERR_ADT = -1,
@@ -93,6 +97,8 @@ static u64 wlan_pt_carveout_phys;
 
 #define WLAN_PT_L1_PHYS     (wlan_pt_carveout_phys + 0x0000)
 #define WLAN_PT_MSI_L2_PHYS (wlan_pt_carveout_phys + 0x4000)
+#define WLAN_DESCRIPTOR_PHYS \
+    (wlan_pt_carveout_phys + WIRELESS_HANDOFF_V2_DESCRIPTOR_OFFSET)
 
 static int wlan_validate_reservation(u64 base, u64 size)
 {
@@ -203,6 +209,42 @@ static void wlan_build_tables(void)
     msi_l2[WLAN_MSI_L2_INDEX] = wlan_encode_pte(WLAN_MSI_DOORBELL_PAGE);
     l1[WLAN_MSI_L1_INDEX] = wlan_encode_pte(WLAN_PT_MSI_L2_PHYS);
     dma_wmb();
+}
+
+static int wlan_publish_descriptor(u64 reservation_size)
+{
+    struct wireless_handoff_descriptor_v2 descriptor = {
+        .signature = WIRELESS_HANDOFF_V2_SIGNATURE,
+        .version = WIRELESS_HANDOFF_V2_VERSION,
+        .structure_size = sizeof(descriptor),
+        .flags = WIRELESS_HANDOFF_V2_FLAG_INSTALLED,
+        .sid = WIRELESS_HANDOFF_V2_SID,
+        .page_shift = WIRELESS_HANDOFF_V2_PAGE_SHIFT,
+        .reservation_base = wlan_pt_carveout_phys,
+        .reservation_size = reservation_size,
+        .guest_memory_top = cur_boot_args.phys_base + cur_boot_args.mem_size,
+        .physical_memory_top = ALIGN_DOWN(cur_boot_args.phys_base, BIT(32)) +
+                               mem_size_actual,
+        .dart_base = WLAN_DART0_BASE,
+        .l1_physical = WLAN_PT_L1_PHYS,
+        .msi_l2_physical = WLAN_PT_MSI_L2_PHYS,
+        .descriptor_physical = WLAN_DESCRIPTOR_PHYS,
+    };
+
+    descriptor.l1_crc32 = wireless_handoff_v2_crc32(
+        (const void *)WLAN_PT_L1_PHYS, WIRELESS_HANDOFF_V2_PAGE_SIZE);
+    descriptor.msi_l2_crc32 = wireless_handoff_v2_crc32(
+        (const void *)WLAN_PT_MSI_L2_PHYS, WIRELESS_HANDOFF_V2_PAGE_SIZE);
+    descriptor.descriptor_crc32 = 0;
+    descriptor.descriptor_crc32 = wireless_handoff_v2_crc32(
+        &descriptor, sizeof(descriptor));
+    memcpy((void *)WLAN_DESCRIPTOR_PHYS, &descriptor, sizeof(descriptor));
+    dma_wmb();
+    return wireless_handoff_v2_descriptor_validate(
+        (const void *)WLAN_DESCRIPTOR_PHYS,
+        (const void *)wlan_pt_carveout_phys,
+        wlan_pt_carveout_phys, reservation_size,
+        cur_boot_args.phys_base + cur_boot_args.mem_size);
 }
 
 static int wlan_flush_sid1(void)
@@ -319,8 +361,16 @@ int wireless_handoff_init(u64 reservation_base, u64 reservation_size)
         goto fail;
     }
 
-    printf("wlan-handoff: SID 1 deny-all domain installed, reservation %#llx+%#llx, "
-           "L1 %#llx, MSI L2 %#llx\n",
+    status = wlan_publish_descriptor(reservation_size);
+    if (status) {
+        printf("wlan-handoff: ABI v2 descriptor validation failed: %d\n", status);
+        status = WLAN_ERR_READBACK;
+        goto fail;
+    }
+
+    printf("wlan-handoff: SID 1 deny-all domain installed, ABI v2 descriptor %#llx, "
+           "reservation %#llx+%#llx, L1 %#llx, MSI L2 %#llx\n",
+           (unsigned long long)WLAN_DESCRIPTOR_PHYS,
            (unsigned long long)wlan_pt_carveout_phys, (unsigned long long)reservation_size,
            (unsigned long long)WLAN_PT_L1_PHYS, (unsigned long long)WLAN_PT_MSI_L2_PHYS);
     return WLAN_HANDOFF_OK;

@@ -40,6 +40,16 @@ its immutable pairing manifest and Mu DRT0 resources, then call
 above the reduced guest SystemMemory top or outside physical DRAM.  Missing
 that contract means DRT0 and wireless handoff are absent.
 
+On success the authoritative producer writes an `NWH2` version-2 descriptor
+at reservation offset `0xc000`. It binds the dynamic base/size, reduced guest
+memory top, physical memory top, DART base, L1/MSI-L2 addresses, and CRC-32 of
+both live tables plus the descriptor. The host must capture the complete
+64-KiB reservation and seal it with
+`tools/j414s-wireless-handoff-manifest.py`; Mu consumes that exact manifest on
+the same m1n1 instance. A missing/corrupt descriptor or any base/CRC/version
+mismatch forbids DRT0 and Windows. The legacy `BCM1` fixed-layout transaction
+remains test-only and has no proxy or runtime call site.
+
 GPU calibration is similarly explicit: run the drivers-repo GPU pass-one
 tool, build Mu from the emitted live six-region manifest, and start that Mu on
 the same m1n1 instance.  Merely chainloading this m1n1 image does not start GPU
