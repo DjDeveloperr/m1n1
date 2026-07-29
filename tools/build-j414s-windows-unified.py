@@ -18,7 +18,7 @@ REQUIRED_SOURCE = {
     "native_aic": ("config.h", "#define ENABLE_NATIVE_AIC_PASSTHROUGH"),
     "mtp": ("config.h", "#define ENABLE_J414S_WINDOWS_MTP_HANDOFF"),
     "wireless_contract": ("src/wireless_handoff.c", "wlan_validate_reservation"),
-    "gpu": ("src/kboot_gpu.c", "rust_gpu_initdata_fill"),
+    "gpu": ("src/kboot_gpu.c", "rust_fill_gpu_initdata"),
     "tpm": ("src/hv_tpm.c", "hv_map_tpm"),
     "sparse_identity": ("src/platform_identity.c", "platform_is_j414s"),
 }
