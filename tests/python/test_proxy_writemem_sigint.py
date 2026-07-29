@@ -16,7 +16,7 @@ class _FakeDevice:
 
 
 class ProxyWriteMemSignalTests(unittest.TestCase):
-    def test_sigint_is_replayed_only_after_memwrite_reply(self):
+    def _exercise(self, signum, exception):
         iface = UartInterface.__new__(UartInterface)
         events = []
         iface.dev = _FakeDevice(events)
@@ -26,7 +26,7 @@ class ProxyWriteMemSignalTests(unittest.TestCase):
 
         def cmd(opcode, request):
             events.append(("cmd", opcode, request))
-            signal.raise_signal(signal.SIGINT)
+            signal.raise_signal(signum)
 
         def reply(opcode):
             events.append(("reply", opcode))
@@ -35,8 +35,12 @@ class ProxyWriteMemSignalTests(unittest.TestCase):
         iface.cmd = cmd
         iface.reply = reply
 
-        with self.assertRaises(KeyboardInterrupt):
+        previous = signal.getsignal(signum)
+        with self.assertRaises(exception) as raised:
             iface.writemem(0x12340000, b"payload")
+        self.assertIs(signal.getsignal(signum), previous)
+        if exception is SystemExit:
+            self.assertEqual(raised.exception.code, 128 + signum)
 
         self.assertEqual(events[0][0], "cmd")
         self.assertEqual(events[1], ("write", b"payload"))
@@ -45,6 +49,15 @@ class ProxyWriteMemSignalTests(unittest.TestCase):
         self.assertEqual(address, 0x12340000)
         self.assertEqual(size, 7)
         self.assertEqual(checksum, 0x12345678)
+
+    def test_sigint_is_replayed_only_after_memwrite_reply(self):
+        self._exercise(signal.SIGINT, KeyboardInterrupt)
+
+    def test_sigterm_is_replayed_only_after_memwrite_reply(self):
+        self._exercise(signal.SIGTERM, SystemExit)
+
+    def test_sighup_is_replayed_only_after_memwrite_reply(self):
+        self._exercise(signal.SIGHUP, SystemExit)
 
 
 if __name__ == "__main__":

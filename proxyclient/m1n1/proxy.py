@@ -33,51 +33,62 @@ class UartRemoteError(UartError):
     pass
 
 
-class _DeferredKeyboardInterrupt:
+class _DeferredTerminationSignals:
     """Keep an in-flight unframed data transfer protocol-synchronized.
 
     REQ_MEMWRITE has a framed command header followed by an exact-size raw
-    byte stream.  If Python accepts SIGINT between those two boundaries, the
-    target remains blocked in iodev_read() and consumes every later command as
-    payload until it receives the missing bytes.  Defer Ctrl-C until the reply
+    byte stream.  If Python accepts an ordinary termination signal between
+    those two boundaries, the target remains blocked in iodev_read() and
+    consumes every later command as payload until it receives the missing
+    bytes.  Defer Ctrl-C, SIGTERM, and terminal-loss SIGHUP until the reply
     closes the request.  Signal handlers can only be changed from the main
     thread; worker-thread users retain the historical behavior.
     """
 
     def __init__(self):
-        self._previous = None
+        self._previous = {}
         self._pending = None
-        self._armed = False
+        self._armed = []
 
     def _handle(self, signum, frame):
-        self._pending = (signum, frame)
+        if self._pending is None:
+            self._pending = (signum, frame)
 
     def __enter__(self):
         try:
-            previous = signal.getsignal(signal.SIGINT)
-            if previous == signal.SIG_IGN:
-                return self
-            signal.signal(signal.SIGINT, self._handle)
+            for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                previous = signal.getsignal(signum)
+                if previous == signal.SIG_IGN:
+                    continue
+                signal.signal(signum, self._handle)
+                self._previous[signum] = previous
+                self._armed.append(signum)
         except ValueError:
+            for signum in reversed(self._armed):
+                signal.signal(signum, self._previous[signum])
+            self._previous.clear()
+            self._armed.clear()
             return self
 
-        self._previous = previous
-        self._armed = True
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
         if not self._armed:
             return False
 
-        signal.signal(signal.SIGINT, self._previous)
+        for signum in reversed(self._armed):
+            signal.signal(signum, self._previous[signum])
         if self._pending is None or exc_type is not None:
             return False
 
         signum, frame = self._pending
-        if callable(self._previous):
-            self._previous(signum, frame)
-        else:
+        previous = self._previous[signum]
+        if callable(previous):
+            previous(signum, frame)
+        elif signum == signal.SIGINT:
             raise KeyboardInterrupt
+        else:
+            raise SystemExit(128 + signum)
         return False
 
 
@@ -446,7 +457,7 @@ class UartInterface(Reloadable):
         checksum = self.data_checksum(data)
         size = len(data)
         req = struct.pack("<QQI", addr, size, checksum)
-        with _DeferredKeyboardInterrupt():
+        with _DeferredTerminationSignals():
             self.cmd(self.REQ_MEMWRITE, req)
             if self.debug:
                 print("<< DATA:")
