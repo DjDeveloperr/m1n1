@@ -600,6 +600,9 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
         case P_WIRELESS_HANDOFF_INIT:
             reply->retval = wireless_handoff_init();
             break;
+        case P_PCIE_WIRELESS_INIT:
+            reply->retval = pcie_init_wireless();
+            break;
 
         case P_NVME_INIT:
             reply->retval = nvme_init();

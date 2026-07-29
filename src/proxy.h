@@ -165,6 +165,7 @@ typedef enum {
     P_PCIE_INIT = 0xe00,
     P_PCIE_SHUTDOWN,
     P_WIRELESS_HANDOFF_INIT,
+    P_PCIE_WIRELESS_INIT,
 
     P_NVME_INIT = 0xf00,
     P_NVME_SHUTDOWN,
