@@ -183,6 +183,8 @@ typedef enum {
     P_DAPF_INIT_ALL = 0x1200,
     P_DAPF_INIT,
 
+    P_HV_MAP_TPM = 0x1400,
+
     P_CPUFREQ_INIT = 0x1300,
 } ProxyOp;
 

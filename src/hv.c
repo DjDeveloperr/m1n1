@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 
 #include "hv.h"
+#include "hv_tpm.h"
 #include "assert.h"
 #include "cpu_regs.h"
 #include "display.h"
@@ -307,6 +308,14 @@ void hv_start(void *entry, u64 regs[4])
 
     //map the address of the (EL2) ADT to a fixed location so EL1 can patch it
     hv_map_hw(adt_base, (u64)adt, ALIGN_UP(cur_boot_args.devtree_size, SZ_16K));
+
+    /*
+     * TEE ACPI Profile 4.6.3 requires a TPM's Error, Cancel and Start bits to
+     * be clear when firmware hands control to the OS. No-op unless a CRB was
+     * mapped, so this is unconditional rather than gated on a flag nobody
+     * would remember to set.
+     */
+    hv_tpm_prepare_for_guest();
 
     hv_enter_guest(regs[0], regs[1], regs[2], regs[3], entry);
 
