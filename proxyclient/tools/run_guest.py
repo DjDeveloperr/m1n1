@@ -3,7 +3,7 @@
 import sys, pathlib, traceback
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 
-import argparse, pathlib
+import argparse, pathlib, os
 from io import BytesIO
 
 def volumespec(s):
@@ -23,6 +23,9 @@ parser.add_argument('-C', '--cpus', default=None)
 parser.add_argument('-r', '--raw', action="store_true")
 parser.add_argument('-E', '--entry-point', action="store", type=int, help="Entry point for the raw image", default=0x800)
 parser.add_argument('-a', '--append-payload', type=pathlib.Path, action="append", default=[])
+parser.add_argument('--proxy-heap-size', type=lambda value: int(value, 0),
+                    default=int(os.environ.get("M1N1_PROXY_HEAP_SIZE", 768 * 1024 * 1024)),
+                    help="proxy scratch heap size in bytes (accepts 0x-prefixed values)")
 parser.add_argument('-v', '--volume', type=volumespec, action='append',
                     help='Attach a 9P virtio device for file export to the guest. The argument is a host path to the '
                          'exported tree, joined by colon (\':\') with a tag under which the tree will be advertised '
@@ -42,7 +45,9 @@ from m1n1.hw.pmu import PMU
 iface = UartInterface()
 p = M1N1Proxy(iface, debug=False)
 bootstrap_port(iface, p)
-u = ProxyUtils(p, heap_size = 768 * 1024 * 1024)
+if args.proxy_heap_size < 256 * 1024 * 1024:
+    parser.error("--proxy-heap-size must be at least 256 MiB")
+u = ProxyUtils(p, heap_size=args.proxy_heap_size)
 
 hv = HV(iface, p, u)
 

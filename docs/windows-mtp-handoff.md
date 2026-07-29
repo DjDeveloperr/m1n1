@@ -100,3 +100,14 @@ This is intentional: presenting Windows with a half-initialized MTP transport
 is less safe than not publishing m1n1-owned state at all. The helper logs its final
 resource map and non-consuming initial `RX_COUNT`; those two lines are the
 pre-run validation evidence for the next hardware test.
+
+Capture the m1n1 console and validate that evidence without touching the live
+target:
+
+```sh
+tools/validate_mtp_handoff_log.py path/to/m1n1-console.log
+```
+
+The checker requires exactly one success record, the live J414s resource map,
+and a nonzero INIT `RX_COUNT`. It rejects stale addresses, bounded setup
+failures, missing terminal output, duplicate runs, and zero-byte handoffs.
