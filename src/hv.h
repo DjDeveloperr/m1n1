@@ -49,6 +49,7 @@ typedef enum _hv_entry_type {
     HV_CPU_SWITCH,
     HV_VIRTIO,
     HV_PANIC,
+    HV_TPM, /* one event per TPM command -- see hv_tpm.c */
 } hv_entry_type;
 
 

@@ -1171,8 +1171,10 @@ class M1N1Proxy(Reloadable):
         return self.request(self.P_HV_PIN_CPU, cpu)
     def hv_write_hcr(self, hcr):
         return self.request(self.P_HV_WRITE_HCR, hcr)
-    def hv_map_tpm(self, base):
-        return self.request(self.P_HV_MAP_TPM, base)
+    def hv_map_tpm(self, base, engine=0):
+        # engine: 0 = no backend (TPM_RC_FAILURE device), 1 = host engine
+        # over the proxy (one HV_TPM event per command).
+        return self.request(self.P_HV_MAP_TPM, base, engine)
     def hv_map_virtio(self, base, config):
         return self.request(self.P_HV_MAP_VIRTIO, base, config)
     def virtio_put_buffer(self, base, qu, idx, length):
