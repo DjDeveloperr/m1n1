@@ -97,6 +97,7 @@ typedef enum {
     P_MALLOC,
     P_MEMALIGN,
     P_FREE,
+    P_TOP_OF_MEMORY_ALLOC,
 
     P_KBOOT_BOOT = 0x700, // Kernel boot ops
     P_KBOOT_SET_CHOSEN,

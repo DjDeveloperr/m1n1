@@ -26,7 +26,10 @@ class WirelessHandoffContractTests(unittest.TestCase):
         self.assertIn('"Mac14,9"', IDENTITY)
         self.assertIn('"J414sAP\\0Mac14,9\\0AppleARM"', IDENTITY)
         self.assertIn("identity->chosen_target_type_len != 0", IDENTITY)
-        self.assertIn("int wireless_handoff_init(void);", HEADER)
+        self.assertIn(
+            "int wireless_handoff_init(u64 reservation_base, u64 reservation_size);",
+            HEADER,
+        )
 
     def test_explicit_identity_mismatch_is_an_error(self) -> None:
         self.assertIn("WLAN_ERR_IDENTITY = -12", SOURCE)
@@ -37,10 +40,9 @@ class WirelessHandoffContractTests(unittest.TestCase):
         self.assertIn("P_WIRELESS_HANDOFF_INIT", PROXY_H)
         self.assertIn("case P_WIRELESS_HANDOFF_INIT:", PROXY_C)
         self.assertIn("P_WIRELESS_HANDOFF_INIT = 0xe02", PROXY_PY)
-        self.assertIn(
-            "return self.request(self.P_WIRELESS_HANDOFF_INIT, signed=True)",
-            PROXY_PY,
-        )
+        self.assertIn("reservation_base=None, reservation_size=None", PROXY_PY)
+        self.assertIn("reservation_base,", PROXY_PY)
+        self.assertIn("reservation_size,", PROXY_PY)
         self.assertIn("P_PCIE_WIRELESS_INIT = 0xe03", PROXY_PY)
         self.assertIn(
             "return self.request(self.P_PCIE_WIRELESS_INIT, signed=True)",
@@ -74,12 +76,22 @@ class WirelessHandoffContractTests(unittest.TestCase):
             "WLAN_MSI_DOORBELL_PAGE 0xffffc000ULL",
             "WLAN_MSI_L1_INDEX      127",
             "WLAN_MSI_L2_INDEX      2047",
-            "WLAN_PT_CARVEOUT_PHYS 0x10022000000ULL",
             "WLAN_PT_CARVEOUT_SIZE 0x10000ULL",
+            "WLAN_PT_ALIGNMENT     0x4000ULL",
             "WLAN_DART_TLB_CMD              0x080",
             "WLAN_DART_TLB_CMD_FLUSH_SID1   0x101",
         ):
             self.assertIn(literal, SOURCE)
+
+    def test_reservation_is_dynamic_and_above_guest_system_memory(self) -> None:
+        self.assertNotIn("0x10022000000ULL", SOURCE)
+        self.assertIn("wlan_validate_reservation", SOURCE)
+        self.assertIn("cur_boot_args.phys_base + cur_boot_args.mem_size", SOURCE)
+        self.assertIn("ram_base + mem_size_actual", SOURCE)
+        self.assertIn("base < guest_top + SZ_16K", SOURCE)
+        self.assertIn("P_TOP_OF_MEMORY_ALLOC", PROXY_C)
+        self.assertIn("top_of_memory_alloc(request->args[0])", PROXY_C)
+        self.assertIn("memcpy((void *)boot_args_addr, &cur_boot_args", PROXY_C)
 
     def test_preflight_rejects_live_or_faulted_hardware(self) -> None:
         preflight = SOURCE.index("static int wlan_check_dart_quiescent")

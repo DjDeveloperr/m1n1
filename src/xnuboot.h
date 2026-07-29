@@ -47,6 +47,7 @@ struct boot_args {
 };
 
 extern u64 boot_args_addr;
+extern u64 boot_flags, mem_size_actual;
 extern struct boot_args cur_boot_args;
 
 #endif

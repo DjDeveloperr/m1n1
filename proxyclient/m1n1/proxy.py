@@ -643,7 +643,8 @@ class M1N1Proxy(Reloadable):
     P_HEAPBLOCK_ALLOC = 0x600
     P_MALLOC = 0x601
     P_MEMALIGN = 0x602
-    P_FREE = 0x602
+    P_FREE = 0x603
+    P_TOP_OF_MEMORY_ALLOC = 0x604
 
     P_KBOOT_BOOT = 0x700
     P_KBOOT_SET_CHOSEN = 0x701
@@ -1091,6 +1092,9 @@ class M1N1Proxy(Reloadable):
         return self.request(self.P_MEMALIGN, align, size)
     def free(self, ptr):
         self.request(self.P_FREE, ptr)
+    def top_of_memory_alloc(self, size):
+        """Reserve RAM above the guest-visible top and persist boot_args."""
+        return self.request(self.P_TOP_OF_MEMORY_ALLOC, size)
 
     def kboot_boot(self, kernel):
         self.request(self.P_KBOOT_BOOT, kernel)
@@ -1223,8 +1227,18 @@ class M1N1Proxy(Reloadable):
         return self.request(self.P_PCIE_INIT, signed=True)
     def pcie_shutdown(self):
         return self.request(self.P_PCIE_SHUTDOWN)
-    def wireless_handoff_init(self):
-        return self.request(self.P_WIRELESS_HANDOFF_INIT, signed=True)
+    def wireless_handoff_init(self, reservation_base=None, reservation_size=None):
+        if reservation_base is None or reservation_size is None:
+            raise ValueError(
+                "wireless handoff requires an explicit top-of-memory "
+                "reservation base and size"
+            )
+        return self.request(
+            self.P_WIRELESS_HANDOFF_INIT,
+            reservation_base,
+            reservation_size,
+            signed=True,
+        )
     def pcie_wireless_init(self):
         return self.request(self.P_PCIE_WIRELESS_INIT, signed=True)
 

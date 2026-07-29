@@ -390,6 +390,11 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
         case P_FREE:
             free((void *)request->args[0]);
             break;
+        case P_TOP_OF_MEMORY_ALLOC:
+            reply->retval = top_of_memory_alloc(request->args[0]);
+            /* A later run_guest reads the original boot_args, not this copy. */
+            memcpy((void *)boot_args_addr, &cur_boot_args, sizeof(cur_boot_args));
+            break;
 
         case P_KBOOT_BOOT:
             if (kboot_boot((void *)request->args[0]) == 0)
@@ -614,7 +619,7 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             pcie_shutdown();
             break;
         case P_WIRELESS_HANDOFF_INIT:
-            reply->retval = wireless_handoff_init();
+            reply->retval = wireless_handoff_init(request->args[0], request->args[1]);
             break;
         case P_PCIE_WIRELESS_INIT:
             reply->retval = pcie_init_wireless();

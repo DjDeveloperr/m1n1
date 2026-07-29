@@ -19,6 +19,7 @@
 #include "types.h"
 #include "utils.h"
 #include "wireless_handoff.h"
+#include "xnuboot.h"
 
 #if defined(ENABLE_NATIVE_AIC_PASSTHROUGH) && defined(ENABLE_J414S_WINDOWS_WIRELESS_HANDOFF)
 
@@ -64,11 +65,9 @@
 #define WLAN_MSI_L1_INDEX      127
 #define WLAN_MSI_L2_INDEX      2047
 
-/* Fixed persistent carveout, reserved by Mu and published as DRT0 resource 1. */
-#define WLAN_PT_CARVEOUT_PHYS 0x10022000000ULL
+/* Runtime reservation geometry, published by the paired Mu DRT0 profile. */
 #define WLAN_PT_CARVEOUT_SIZE 0x10000ULL
-#define WLAN_PT_L1_PHYS       (WLAN_PT_CARVEOUT_PHYS + 0x0000)
-#define WLAN_PT_MSI_L2_PHYS   (WLAN_PT_CARVEOUT_PHYS + 0x4000)
+#define WLAN_PT_ALIGNMENT     0x4000ULL
 
 enum wlan_handoff_error {
     WLAN_HANDOFF_OK = 0,
@@ -85,10 +84,36 @@ enum wlan_handoff_error {
     WLAN_ERR_PREEXISTING_FAULT = -11,
     WLAN_ERR_IDENTITY = -12,
     WLAN_ERR_ENDPOINT_ID = -13,
+    WLAN_ERR_RESERVATION = -14,
 };
 
 static u64 wlan_dart_regs;
 static bool wlan_wrote_dart;
+static u64 wlan_pt_carveout_phys;
+
+#define WLAN_PT_L1_PHYS     (wlan_pt_carveout_phys + 0x0000)
+#define WLAN_PT_MSI_L2_PHYS (wlan_pt_carveout_phys + 0x4000)
+
+static int wlan_validate_reservation(u64 base, u64 size)
+{
+    u64 ram_base = ALIGN_DOWN(cur_boot_args.phys_base, BIT(32));
+    u64 physical_top = ram_base + mem_size_actual;
+    u64 guest_top = cur_boot_args.phys_base + cur_boot_args.mem_size;
+
+    if (size != WLAN_PT_CARVEOUT_SIZE || (base & (WLAN_PT_ALIGNMENT - 1)) ||
+        base > ~0ULL - size)
+        return WLAN_ERR_RESERVATION;
+
+    /*
+     * top_of_memory_alloc() leaves a 16-KiB guard below its first result.
+     * Requiring this range above the reduced boot_args top proves Mu cannot
+     * allocate it as SystemMemory. The physical-top bound proves real DRAM.
+     */
+    if (base < guest_top + SZ_16K || base + size > physical_top)
+        return WLAN_ERR_RESERVATION;
+
+    return WLAN_HANDOFF_OK;
+}
 
 static u32 wlan_pci_command(u32 function)
 {
@@ -174,7 +199,7 @@ static void wlan_build_tables(void)
     u64 *l1 = (u64 *)WLAN_PT_L1_PHYS;
     u64 *msi_l2 = (u64 *)WLAN_PT_MSI_L2_PHYS;
 
-    memset((void *)WLAN_PT_CARVEOUT_PHYS, 0, WLAN_PT_CARVEOUT_SIZE);
+    memset((void *)wlan_pt_carveout_phys, 0, WLAN_PT_CARVEOUT_SIZE);
     msi_l2[WLAN_MSI_L2_INDEX] = wlan_encode_pte(WLAN_MSI_DOORBELL_PAGE);
     l1[WLAN_MSI_L1_INDEX] = wlan_encode_pte(WLAN_PT_MSI_L2_PHYS);
     dma_wmb();
@@ -229,7 +254,7 @@ static const struct pcie_t602x_mmio_ops wlan_mmio_ops = {
     .write32 = wlan_mmio_write32,
 };
 
-int wireless_handoff_init(void)
+int wireless_handoff_init(u64 reservation_base, u64 reservation_size)
 {
     int adt_path[8];
     u64 dart_base;
@@ -238,10 +263,19 @@ int wireless_handoff_init(void)
 
     wlan_dart_regs = 0;
     wlan_wrote_dart = false;
+    wlan_pt_carveout_phys = 0;
     if (!platform_is_j414s()) {
         printf("wlan-handoff: exact J414s platform identity mismatch\n");
         return WLAN_ERR_IDENTITY;
     }
+
+    status = wlan_validate_reservation(reservation_base, reservation_size);
+    if (status) {
+        printf("wlan-handoff: invalid reservation %#llx+%#llx\n",
+               (unsigned long long)reservation_base, (unsigned long long)reservation_size);
+        return status;
+    }
+    wlan_pt_carveout_phys = reservation_base;
 
     if (adt_path_offset_trace(adt, WLAN_DART_PATH, adt_path) < 0 ||
         adt_get_reg(adt, adt_path, "reg", 0, &dart_base, &dart_size) < 0)
@@ -285,8 +319,10 @@ int wireless_handoff_init(void)
         goto fail;
     }
 
-    printf("wlan-handoff: SID 1 deny-all domain installed, L1 %#llx, MSI L2 %#llx\n",
-           WLAN_PT_L1_PHYS, WLAN_PT_MSI_L2_PHYS);
+    printf("wlan-handoff: SID 1 deny-all domain installed, reservation %#llx+%#llx, "
+           "L1 %#llx, MSI L2 %#llx\n",
+           (unsigned long long)wlan_pt_carveout_phys, (unsigned long long)reservation_size,
+           (unsigned long long)WLAN_PT_L1_PHYS, (unsigned long long)WLAN_PT_MSI_L2_PHYS);
     return WLAN_HANDOFF_OK;
 
 fail:
@@ -297,8 +333,10 @@ fail:
 
 #else
 
-int wireless_handoff_init(void)
+int wireless_handoff_init(u64 reservation_base, u64 reservation_size)
 {
+    UNUSED(reservation_base);
+    UNUSED(reservation_size);
     return 0;
 }
 
