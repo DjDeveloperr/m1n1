@@ -824,10 +824,10 @@ static int fail_after_write(struct bcm4388_handoff_result *result,
     return primary_status;
 }
 
-int bcm4388_handoff_install(struct bcm4388_handoff_result *result,
-                            const struct bcm4388_handoff_io *io,
-                            const struct bcm4388_handoff_pages *pages, u64 generation,
-                            u32 poll_attempts)
+int bcm4388_legacy_dormant_handoff_install(struct bcm4388_handoff_result *result,
+                                           const struct bcm4388_handoff_io *io,
+                                           const struct bcm4388_handoff_pages *pages,
+                                           u64 generation, u32 poll_attempts)
 {
     struct bcm4388_handoff_preflight preflight;
     struct pcie_t602x_mmio_ops pcie_ops;

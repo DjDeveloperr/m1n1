@@ -243,13 +243,14 @@ u32 bcm4388_handoff_crc32(const void *data, u32 length);
 int bcm4388_handoff_descriptor_validate(const struct bcm4388_handoff_descriptor_v1 *descriptor);
 
 /*
- * Dormant transaction core.  There is intentionally no runtime call site.
- * The caller must exclusively own all four zeroed 16-KiB pages and serialize
- * every endpoint/port/DART access for the duration of the call.
+ * Legacy dormant transaction core retained for conformance and rollback
+ * testing. There is intentionally no runtime or proxy call site. Its fixed
+ * four-page descriptor ABI is NOT the authoritative dynamic Windows wireless
+ * contract and must not be paired with current Mu/AppleDart.
  */
-int bcm4388_handoff_install(struct bcm4388_handoff_result *result,
-                            const struct bcm4388_handoff_io *io,
-                            const struct bcm4388_handoff_pages *pages, u64 generation,
-                            u32 poll_attempts);
+int bcm4388_legacy_dormant_handoff_install(struct bcm4388_handoff_result *result,
+                                           const struct bcm4388_handoff_io *io,
+                                           const struct bcm4388_handoff_pages *pages,
+                                           u64 generation, u32 poll_attempts);
 
 #endif

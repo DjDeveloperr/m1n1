@@ -12,8 +12,28 @@ class WindowsUnifiedContractTests(unittest.TestCase):
         self.assertIn("#define ENABLE_NATIVE_AIC_PASSTHROUGH", config)
         self.assertIn("#define ENABLE_J414S_WINDOWS_MTP_HANDOFF", config)
         self.assertIn("#define ENABLE_J414S_WINDOWS_WIRELESS_HANDOFF", config)
-        for obj in ("mtp_handoff.o", "wireless_handoff.o", "hv_tpm.o", "kboot_gpu.o"):
+        for obj in (
+            "mtp_handoff.o",
+            "wireless_handoff.o",
+            "bcm4388_handoff.o",
+            "hv_tpm.o",
+            "kboot_gpu.o",
+        ):
             self.assertIn(obj, makefile)
+
+    def test_descriptor_handoff_core_is_linked_but_dormant(self) -> None:
+        core = (ROOT / "src/bcm4388_handoff.c").read_text(encoding="utf-8")
+        legacy_api = "bcm4388_legacy_dormant_handoff_install("
+        self.assertIn(f"int {legacy_api}", core)
+        for source in (ROOT / "src").glob("*.c"):
+            if source.name != "bcm4388_handoff.c":
+                self.assertNotIn(
+                    legacy_api,
+                    source.read_text(encoding="utf-8"),
+                    source.name,
+                )
+        proxy = (ROOT / "proxyclient/m1n1/proxy.py").read_text(encoding="utf-8")
+        self.assertNotIn("legacy_dormant_handoff", proxy)
 
     def test_mutating_capabilities_are_explicit(self) -> None:
         proxy = (ROOT / "proxyclient/m1n1/proxy.py").read_text(encoding="utf-8")
@@ -34,6 +54,13 @@ class WindowsUnifiedContractTests(unittest.TestCase):
         self.assertIn('artifact_dir = output_root / "artifacts"', builder)
         self.assertIn('f"BUILD_DIR={build_dir}"', builder)
         self.assertIn("refusing a modified m1n1 source tree", builder)
+        self.assertIn("BCM4388_DORMANT_ORIGIN", builder)
+        self.assertIn(
+            '"authoritative_wireless_contract": "dynamic_reserved_wireless_handoff_v2"',
+            builder,
+        )
+        self.assertIn("legacy_reference_fixed_layout_no_current_abi_no_call_site", builder)
+        self.assertIn('"mainline_snapshot"', builder)
 
 
 if __name__ == "__main__":

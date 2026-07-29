@@ -14,6 +14,7 @@ One image contains the non-conflicting capabilities needed by every profile:
 - retained DCP framebuffer and DART ownership handoff;
 - J414s MTP/DockChannel firmware, keyboard, trackpad, and backlight preboot;
 - PCIe initialization plus the guarded ANS and BCM4388 proxy helpers;
+- a dormant, versioned BCM4388 SID1 descriptor/rollback transaction core;
 - GPU DT/initdata/calibration production; and
 - an EL2 TPM 2.0 CRB with the host engine bridge.
 
@@ -21,6 +22,15 @@ Compiling a capability is not permission to mutate its device.  Baseline MTP
 is the sole automatic J414s peripheral handoff.  ANS/PCIe endpoint operations,
 wireless DART setup, GPU calibration, and TPM attachment require explicit host
 calls.  Each explicit call is exact-board gated and fail-closed.
+
+The legacy dormant BCM4388 descriptor producer from `b6616476` is deliberately
+separate from the authoritative dynamic runtime Wi-Fi handoff. It has
+host-tested fixed four-page ownership, CRC descriptor publication, and full
+rollback semantics, but no runtime or proxy call site. Its exported test API
+is named `bcm4388_legacy_dormant_handoff_install` to prevent it being confused
+with the current Windows contract. Linking it does not configure PCIe, DART,
+RID2SID, MSI, or endpoint BME. Its fixed layout is incompatible with the
+current dynamic Mu/AppleDart ABI and must not be used by a hardware profile.
 
 Wireless is stricter than the historical implementation.  There is no fixed
 `0x10022000000` carveout.  A Wi-Fi profile must first call
@@ -53,3 +63,9 @@ The build is incremental.  It copies `m1n1.macho`, `m1n1.elf`, and
 manifest with source and file hashes.  Hardware launchers must pin both the
 manifest SHA-256 and Mach-O SHA-256; they must never select another checkout
 by convention or fallback.
+
+The manifest also pins the Windows-native-AIC ancestor, the original and
+integrated dormant BCM4388 commits, and the audited local `main` head,
+merge-base, and cherry-distinct update count. See
+[`windows-unified-main-update-debt.md`](windows-unified-main-update-debt.md)
+before advancing the upstream base.

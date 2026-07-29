@@ -304,8 +304,9 @@ static void init_fixture(struct fixture *fixture)
 
 static int install(struct fixture *fixture, u32 poll_attempts)
 {
-    return bcm4388_handoff_install(&fixture->result, &fixture->io, &fixture->pages,
-                                   UINT64_C(0x1122334455667788), poll_attempts);
+    return bcm4388_legacy_dormant_handoff_install(
+        &fixture->result, &fixture->io, &fixture->pages, UINT64_C(0x1122334455667788),
+        poll_attempts);
 }
 
 static void check_pages_zero(void)
