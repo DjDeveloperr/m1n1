@@ -494,7 +494,19 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             hv_map_vuart(request->args[0], request->args[1], request->args[2]);
             break;
         case P_HV_MAP_TPM:
-            reply->retval = hv_map_tpm(request->args[0], NULL, NULL);
+            /*
+             * args[1] selects the backend: 0 = none (every command answers
+             * TPM_RC_FAILURE; interface bring-up only), 1 = host engine over
+             * the proxy, one HV_TPM event per command. Anything else is
+             * refused -- an unknown engine must not silently degrade into
+             * "no engine" or the operator would debug the wrong layer.
+             */
+            if (request->args[1] == 0)
+                reply->retval = hv_map_tpm(request->args[0], NULL, NULL);
+            else if (request->args[1] == 1)
+                reply->retval = hv_map_tpm_proxy(request->args[0]);
+            else
+                reply->retval = -1;
             break;
         case P_HV_MAP_VIRTIO:
             hv_map_virtio(request->args[0], (void *)request->args[1]);

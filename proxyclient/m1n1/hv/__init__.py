@@ -15,6 +15,8 @@ from .gdbserver import *
 from .types import *
 from .virtutils import *
 from .virtio import *
+from .tpm import TpmExcInfo, TpmHostDevice, load_tpm_host
+from .tpm import TPM_STATUS_OK, TPM_STATUS_DECLINED
 
 __all__ = ["HV"]
 
@@ -118,6 +120,9 @@ class HV(Reloadable):
         self.switching_context = False
         self.show_timestamps = False
         self.virtio_devs = {}
+        self.tpm_dev = None
+        self.tpm_profile = None
+        self.tpm_engine = None
 
     def _reloadme(self):
         super()._reloadme()
@@ -1435,7 +1440,8 @@ class HV(Reloadable):
         dev.hv = self
         self.virtio_devs[base] = dev
 
-    def attach_tpm(self, base=None):
+    def attach_tpm(self, base=None, profile=None, create=False, engine=None,
+                   verbose=True):
         """Map an emulated TPM 2.0 CRB and reserve its window.
 
         No ADT node is created, deliberately. Unlike virtio -- which Linux
@@ -1443,6 +1449,26 @@ class HV(Reloadable):
         purely through ACPI: the TPM2 table's AddressOfControlArea and the
         MSFT0101 device's _CRS. Mu is told the base out of band, so inventing
         an ADT node here would describe the device to an OS that never looks.
+
+        Engine selection, fail-closed at every step:
+
+          attach_tpm()                     no engine. The CRB enumerates and
+                                           every command answers TPM_RC_FAILURE
+                                           -- interface bring-up only.
+          attach_tpm(profile="~/…/p0")     swtpm on the Mac, NV persisted in
+                                           the profile directory. The profile
+                                           must already exist (create=True to
+                                           make a fresh one -- explicitly,
+                                           never as a fallback).
+          attach_tpm(engine=obj)           a caller-managed engine object
+                                           (e.g. tpm_host.MssimEngine),
+                                           already started.
+
+        With an engine, the store is validated and the engine is probed
+        BEFORE the CRB is mapped: if either refuses, this raises and the
+        guest boots with no TPM at all -- byte-identical to today. That is
+        the loud path; a TPM that silently forgot its state would cost a
+        BitLocker recovery prompt with no diagnostic pointing here.
 
         Returns the base so the caller can hand it to the firmware builder;
         the control area Mu must publish is base + 0x40, NOT base.
@@ -1453,15 +1479,87 @@ class HV(Reloadable):
         if base & 0xfff:
             raise ValueError(f"TPM base 0x{base:x} is not locality-aligned")
 
-        print(f"Adding TPM CRB @ 0x{base:x} (control area 0x{base + 0x40:x})")
-        if self.p.hv_map_tpm(base) < 0:
+        tpm_dev = None
+        if profile is not None or engine is not None:
+            tpm_host = load_tpm_host()
+            if engine is None:
+                self.tpm_profile = tpm_host.TpmProfile(profile) \
+                    .open(create=create)  # loud on corruption/mismatch
+                engine = tpm_host.SwtpmEngine(self.tpm_profile.dir)
+                engine.start()
+            # Liveness probe (GetCapability): proves a TPM 2.0 engine parses
+            # commands without consuming the guest's own Startup transition.
+            tpm_host.probe(engine)
+            self.tpm_engine = engine
+            tpm_dev = TpmHostDevice(engine, tpm_host, verbose=verbose)
+
+        mode = 1 if tpm_dev is not None else 0
+        print(f"Adding TPM CRB @ 0x{base:x} (control area 0x{base + 0x40:x}, "
+              f"engine={'host' if mode else 'none/RC_FAILURE'})")
+        if self.p.hv_map_tpm(base, mode) < 0:
             raise Exception("hv_map_tpm failed")
+
+        # Registered only after the map succeeded, so a failed map cannot
+        # leave a handler answering for a device that does not exist.
+        self.tpm_dev = tpm_dev
 
         # RESERVED, not a tracer: the EL2 hook owns every access in this page,
         # and a tracer would fight it for the same faults.
         self.add_tracer(irange(base, 0x1000), "TPM", TraceMode.RESERVED)
         self.tpm_base = base
         return base
+
+    def detach_tpm_engine(self):
+        """Stop the host engine and mark the NV store cleanly closed."""
+        if self.tpm_engine is not None:
+            try:
+                self.tpm_engine.stop()
+            finally:
+                self.tpm_engine = None
+        if self.tpm_profile is not None:
+            self.tpm_profile.close()
+            self.tpm_profile = None
+        self.tpm_dev = None
+
+    def handle_tpm(self, reason, code, info):
+        """One HV_TPM event per guest TPM command (mirrors handle_virtio).
+
+        The guest's vCPU is parked inside hv_exc_proxy() until this returns,
+        so the reply is synchronous from its point of view. Every outcome
+        writes an explicit status back into hv_tpm_exc_info: the EL2 device
+        initialises it to a poison value, and anything but 0 makes the guest
+        see TPM_RC_FAILURE rather than stale buffer bytes or a hang.
+        """
+        ctx = self.iface.readstruct(info, ExcInfo)
+        tinfo = self.iface.readstruct(ctx.data, TpmExcInfo)
+
+        rsp = None
+        try:
+            if self.tpm_dev is None:
+                self.log("TPM event with no host device attached")
+            elif tinfo.cmd_len == 0 or tinfo.cmd_len > tinfo.rsp_max:
+                self.log(f"TPM event with bad cmd_len {tinfo.cmd_len}")
+            else:
+                cmd = self.iface.readmem(tinfo.buf, tinfo.cmd_len)
+                rsp = self.tpm_dev.execute(cmd)
+                if rsp is not None and len(rsp) > tinfo.rsp_max:
+                    self.log(f"TPM response too large: {len(rsp)}")
+                    rsp = None
+        except Exception:
+            self.log("Python exception from within TPM handler")
+            traceback.print_exc()
+            rsp = None
+
+        if rsp is not None:
+            self.iface.writemem(tinfo.buf, rsp)
+            tinfo.rsp_len = len(rsp)
+            tinfo.status = TPM_STATUS_OK
+        else:
+            tinfo.rsp_len = 0
+            tinfo.status = TPM_STATUS_DECLINED
+
+        self.iface.writemem(ctx.data, TpmExcInfo.build(tinfo))
+        self.p.exit(EXC_RET.HANDLED)
 
     def handle_virtio(self, reason, code, info):
         ctx = self.iface.readstruct(info, ExcInfo)
@@ -1790,6 +1888,7 @@ class HV(Reloadable):
         self.iface.set_handler(START.HV, HV_EVENT.WDT_BARK, self.handle_bark)
         self.iface.set_handler(START.HV, HV_EVENT.CPU_SWITCH, self.handle_exception)
         self.iface.set_handler(START.HV, HV_EVENT.VIRTIO, self.handle_virtio)
+        self.iface.set_handler(START.HV, HV_EVENT.TPM, self.handle_tpm)
         self.iface.set_handler(START.HV, HV_EVENT.PANIC, self.handle_bark)
         self.iface.set_event_handler(EVENT.MMIOTRACE, self.handle_mmiotrace)
         self.iface.set_event_handler(EVENT.IRQTRACE, self.handle_irqtrace)
