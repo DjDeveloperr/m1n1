@@ -12,12 +12,14 @@ class WindowsUnifiedContractTests(unittest.TestCase):
         self.assertIn("#define ENABLE_NATIVE_AIC_PASSTHROUGH", config)
         self.assertIn("#define ENABLE_J414S_WINDOWS_MTP_HANDOFF", config)
         self.assertIn("#define ENABLE_J414S_WINDOWS_WIRELESS_HANDOFF", config)
+        self.assertIn("#define ENABLE_J414S_WINDOWS_USB_HOST_HANDOFF", config)
         for obj in (
             "mtp_handoff.o",
             "wireless_handoff.o",
             "bcm4388_handoff.o",
             "hv_tpm.o",
             "kboot_gpu.o",
+            "tps6598x_host_policy.o",
         ):
             self.assertIn(obj, makefile)
 
@@ -61,6 +63,38 @@ class WindowsUnifiedContractTests(unittest.TestCase):
         )
         self.assertIn("legacy_reference_fixed_layout_no_current_abi_no_call_site", builder)
         self.assertIn('"mainline_snapshot"', builder)
+        self.assertIn('USB_ROLE_SWAP_EXPERIMENT = "f17a15d1"', builder)
+        self.assertIn('USB_INTERNAL_PHY_HANDOFF = "da86932a"', builder)
+        self.assertIn(
+            'J414S_ADT_SHA256 = "93d96b4a3ea736288278606b723f263361c6ae6c3d5c4f24f08f6f7a73f4b66e"',
+            builder,
+        )
+        self.assertIn('"regression_recovery": True', builder)
+
+    def test_xhc2_typec_policy_is_bounded_and_does_not_touch_proxy(self) -> None:
+        hv = (ROOT / "src/hv.c").read_text(encoding="utf-8")
+        usb = (ROOT / "src/usb.c").read_text(encoding="utf-8")
+        tps = (ROOT / "src/tps6598x.c").read_text(encoding="utf-8")
+        policy = (ROOT / "src/tps6598x_host_policy.c").read_text(encoding="utf-8")
+
+        self.assertIn("platform_is_j414s()", hv)
+        self.assertIn("usb_hpm_handoff_host(uartproxy_iodev)", hv)
+        self.assertIn("(s32)idx == preserved_index", usb)
+        self.assertIn('adt_getprop(adt, node, "rid"', usb)
+        self.assertIn('adt_getprop(adt, node, "port-number"', usb)
+        self.assertIn('adt_getprop(adt, node, "port-location"', usb)
+        self.assertIn("J414S_USB_CONTROLLER_COUNT", usb)
+        self.assertIn("TPS_REG_SYSTEM_CONFIG", tps)
+        self.assertIn("System Configuration readback mismatch", tps)
+        self.assertIn("timeout_expired(timeout)", tps)
+        self.assertIn("TPS6598X_HOST_POLICY_ERR_ROLE", policy)
+        self.assertNotIn('tps6598x_command(dev, "GAID"', tps)
+
+        verifier = (ROOT / "tools/verify-j414s-usb-host-adt.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('"hpm2": {"rid": 2, "port-number": 3, "port-location": "right"}', verifier)
+        self.assertIn('hpm5.getprop("port-location") is not None', verifier)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,8 @@ One image contains the non-conflicting capabilities needed by every profile:
 - exact J414s/T6020 identity and ten-core sparse-topology handling;
 - native AIC2 handoff, Fast-IPI, timer reflection, and startup carrier fixes;
 - retained DCP framebuffer and DART ownership handoff;
+- both non-proxy xHCI controllers, their DARTs, USB2 PHY host role, and the
+  external Type-C source/DFP policy needed to power a right-side USB-C device;
 - J414s MTP/DockChannel firmware, keyboard, trackpad, and backlight preboot;
 - PCIe initialization plus the guarded ANS and BCM4388 proxy helpers;
 - a dormant, versioned BCM4388 SID1 descriptor/rollback transaction core;
@@ -19,9 +21,33 @@ One image contains the non-conflicting capabilities needed by every profile:
 - an EL2 TPM 2.0 CRB with the host engine bridge.
 
 Compiling a capability is not permission to mutate its device.  Baseline MTP
-is the sole automatic J414s peripheral handoff.  ANS/PCIe endpoint operations,
+and the non-proxy USB Type-C host policy are the only automatic J414s
+peripheral handoffs.  ANS/PCIe endpoint operations,
 wireless DART setup, GPU calibration, and TPM attachment require explicit host
 calls.  Each explicit call is exact-board gated and fail-closed.
+
+The Type-C handoff is deliberately narrower than a general USB-C driver.  On
+J414s only, after m1n1 releases each unused DWC3/DART, it reads the complete
+17-byte CD3217/TPS6598x System Configuration register and changes only a
+dual-role Sink/UFP `PortInfo` value to its matching Source/DFP value.  The
+controller specification defines that write as a disconnect/reconnect with
+the new settings.  The exact proxy-selected HPM is skipped, sink-only and
+disabled power paths are rejected, and an exact full-register readback is
+mandatory before HPM interrupts are restored.  No GAID/cold reset is issued.
+
+This is regression recovery, not a new USB feature.  The original
+`f17a15d1` hardware experiment explicitly issued `SWDF` and `SWSr` to the HPMs,
+which could leave the connectors in working host/source state.  The later
+`da86932a` Windows handoff made the internal USB2 PHY host role durable but did
+not preserve that external HPM state; logs can therefore show XHC2 released,
+mapped, and started while the connector still has no VBUS.  The new register
+policy makes that formerly stateful step part of the unified baseline.
+
+This makes right-side VBUS and USB2 hotplug a baseline candidate, not yet a
+hardware success claim.  SuperSpeed remains disabled on the safe dummy PHY
+backend.  The next physical gate must cover an adapter present at boot and an
+unplug/replug cycle; if only the first succeeds, a resident Windows Type-C
+policy driver is still required.
 
 The legacy dormant BCM4388 descriptor producer from `b6616476` is deliberately
 separate from the authoritative dynamic runtime Wi-Fi handoff. It has

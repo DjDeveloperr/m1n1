@@ -11,6 +11,7 @@ dwc3_dev_t *usb_bringup(u32 idx);
 
 void usb_init(void);
 void usb_hpm_restore_irqs(bool force);
+void usb_hpm_handoff_host(iodev_id_t keep);
 void usb_iodev_init(void);
 void usb_iodev_shutdown_except(iodev_id_t keep);
 void usb_iodev_shutdown(void);

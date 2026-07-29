@@ -445,6 +445,12 @@ RAM-chainloaded over the older resident proxy.  Observed hardware evidence:
   host mode, Mu enumerates a Satechi NVMe enclosure as high-speed USB mass storage,
   validates its GPT/FAT ESP, and loads `EFI/BOOT/BOOTAA64.EFI` and `bootmgfw.efi`.
   SuperSpeed operation is not yet proven; the successful enumeration is USB2.
+- The right-side XHC2 root hub has also been observed starting, but a later
+  USB-C Ethernet test had no connector power.  The root cause is above xHCI:
+  the internal USB2 PHY host-role bit does not configure the external
+  CD3217/TPS6598x policy controller to source VBUS.  The unified baseline now
+  carries a guarded, exact-readback Source/DFP policy handoff for every
+  non-proxy HPM.  It is not yet live-validated and does not enable SuperSpeed.
 - Windows reaches its kernel transition and executes PMUv3/PSCI and feature-register
   probes.  An EL2 undefined exception caused by operandless `TLBI VMALLE1OS` was
   fixed by explicitly issuing `TLBI VMALLE1IS` with the reserved `XZR` operand.

@@ -14,6 +14,8 @@ void tps6598x_shutdown(tps6598x_dev_t *dev);
 int tps6598x_command(tps6598x_dev_t *dev, const char *cmd, const u8 *data_in, size_t len_in,
                      u8 *data_out, size_t len_out);
 int tps6598x_powerup(tps6598x_dev_t *dev);
+int tps6598x_prepare_host(tps6598x_dev_t *dev, u32 hpm_index, u32 controller_count,
+                          s32 preserved_index);
 
 #define CD3218B12_IRQ_WIDTH 9
 

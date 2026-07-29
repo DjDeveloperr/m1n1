@@ -16,9 +16,24 @@ BRANCH = "feature/j414s-windows-unified"
 FILES = ("m1n1.macho", "m1n1.elf", "m1n1.bin")
 WINDOWS_LINEAGE = "eb256adf60f181ab79e643d37fcd1aeee63224de"
 BCM4388_DORMANT_ORIGIN = "b661647696191a177ea15ea1a9d5f69ae422c31d"
+USB_ROLE_SWAP_EXPERIMENT = "f17a15d1"
+USB_INTERNAL_PHY_HANDOFF = "da86932a"
+J414S_ADT_SHA256 = "93d96b4a3ea736288278606b723f263361c6ae6c3d5c4f24f08f6f7a73f4b66e"
 REQUIRED_SOURCE = {
     "native_aic": ("config.h", "#define ENABLE_NATIVE_AIC_PASSTHROUGH"),
     "mtp": ("config.h", "#define ENABLE_J414S_WINDOWS_MTP_HANDOFF"),
+    "usb_typec_host_policy": (
+        "config.h",
+        "#define ENABLE_J414S_WINDOWS_USB_HOST_HANDOFF",
+    ),
+    "usb_typec_policy_readback": (
+        "src/tps6598x.c",
+        "System Configuration readback mismatch",
+    ),
+    "usb_typec_adt_verifier": (
+        "tools/verify-j414s-usb-host-adt.py",
+        '"hpm2": {"rid": 2, "port-number": 3, "port-location": "right"}',
+    ),
     "wireless_contract": ("src/wireless_handoff.c", "wlan_validate_reservation"),
     "wireless_descriptor_abi": (
         "src/wireless_handoff_abi.h",
@@ -102,6 +117,11 @@ def validate(root: Path) -> tuple[str, dict[str, str], dict[str, object]]:
             ),
             "debt_record": "docs/windows-unified-main-update-debt.md",
         },
+        "usb_host_role_history": {
+            "manual_hpm_role_swap_experiment": USB_ROLE_SWAP_EXPERIMENT,
+            "internal_phy_host_handoff": USB_INTERNAL_PHY_HANDOFF,
+            "regression_recovery": True,
+        },
     }
     return commit, proofs, provenance
 
@@ -144,6 +164,18 @@ def main() -> int:
             "ten_core_sparse": True,
             "dcp_dart_handoff": True,
             "mtp_input": True,
+            "xhc2_right_usb_c": {
+                "controller": "CD3217/TPS6598x System Configuration 0x28",
+                "policy": "non_proxy_dual_role_source_dfp_v1",
+                "exact_readback": True,
+                "controller_reset": False,
+                "usb2_host_phy": True,
+                "superspeed": False,
+                "live_validated": False,
+                "adt_sha256": J414S_ADT_SHA256,
+                "hpm": {"node": "hpm2", "rid": 2, "port_number": 3,
+                        "port_location": "right"},
+            },
             "pcie_capability": True,
             "ans_explicit": True,
             "wireless_explicit_reserved_range": True,

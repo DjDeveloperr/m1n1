@@ -9,6 +9,7 @@
 #include "memory.h"
 #include "mtp_handoff.h"
 #include "pcie.h"
+#include "platform_identity.h"
 #include "smp.h"
 #include "string.h"
 #include "usb.h"
@@ -89,6 +90,16 @@ void hv_init(void)
     // The guest can then reset those DWC3 blocks into host mode and own their
     // DARTs without stale m1n1 device-mode endpoints or DMA mappings.
     usb_iodev_shutdown_except(uartproxy_iodev);
+#if defined(ENABLE_NATIVE_AIC_PASSTHROUGH) && defined(ENABLE_J414S_WINDOWS_USB_HOST_HANDOFF)
+    /*
+     * The internal PHY host signal does not control connector VBUS.  Put each
+     * unused J414s CD3217/TPS6598x policy controller into its source-preferred
+     * dual-role configuration while its IRQs are still masked.  The exact
+     * proxy-selected controller remains untouched.
+     */
+    if (platform_is_j414s())
+        usb_hpm_handoff_host(uartproxy_iodev);
+#endif
     // Make sure we wake up DCP if we put it to sleep, just quiesce it to match ADT
     if (display_is_external && display_start_dcp() >= 0)
         display_shutdown(DCP_QUIESCED);

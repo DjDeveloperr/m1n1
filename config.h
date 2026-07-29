@@ -64,6 +64,12 @@
 //
 #define ENABLE_J414S_WINDOWS_MTP_HANDOFF
 
+// Leave every non-proxy J414s Type-C policy controller in a Source/DFP
+// configuration before Windows takes ownership of its xHCI controller.  This
+// is required in addition to the internal USB2 PHY host-role handoff: the PHY
+// signal alone does not make the external Type-C controller source VBUS.
+#define ENABLE_J414S_WINDOWS_USB_HOST_HANDOFF
+
 // Opt-in proxy operation that installs the persistent J414s BCM4388 SID-1
 // deny-all domain after pcie_init() and before hv_start(). It additionally
 // requires an explicit top-of-memory reservation paired with Mu's DRT0

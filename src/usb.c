@@ -9,6 +9,7 @@
 #include "pmgr.h"
 #include "string.h"
 #include "tps6598x.h"
+#include "tps6598x_host_policy.h"
 #include "types.h"
 #include "usb_dwc3.h"
 #include "usb_dwc3_regs.h"
@@ -34,6 +35,7 @@ struct usb_drd_regs {
 // HPM_PATH string is at most
 // "/arm-io/i2cX" (12) + "/" + hpmBusManagerX (14) + "/" + "hpmX" (4) + '\0'
 #define MAX_HPM_PATH_LEN 40
+#define J414S_USB_CONTROLLER_COUNT 3
 
 static tps6598x_irq_state_t tps6598x_irq_state[USB_IODEV_COUNT];
 static bool usb_is_initialized = false;
@@ -482,6 +484,82 @@ void usb_hpm_restore_irqs(bool force)
     if (adt_is_compatible(adt, 0, "J180dAP"))
         usb_i2c_restore_irqs("/arm-io/i2c3", force);
     usb_i2c_restore_irqs("/arm-io/i2c0", force);
+}
+
+static void usb_i2c_handoff_host(const char *i2c_path, iodev_id_t keep)
+{
+    char hpm_path[MAX_HPM_PATH_LEN];
+
+    int node = adt_path_offset(adt, i2c_path);
+    if (node < 0)
+        return;
+
+    node = adt_first_child_offset(adt, node);
+    if (node < 0 || !adt_is_compatible(adt, node, "usbc,manager"))
+        return;
+
+    const char *hpm_mngr_name = adt_get_name(adt, node);
+    if (!hpm_mngr_name || strnlen(hpm_mngr_name, 16) >= 16)
+        return;
+
+    s32 preserved_index = -1;
+    if (keep >= IODEV_USB0 && keep < IODEV_USB0 + USB_IODEV_COUNT)
+        preserved_index = (s32)(keep - IODEV_USB0);
+
+    i2c_dev_t *i2c = i2c_init_allow_powered(i2c_path);
+    if (!i2c) {
+        printf("usb: host handoff i2c init failed for %s\n", i2c_path);
+        return;
+    }
+
+    ADT_FOREACH_CHILD(adt, node)
+    {
+        const char *name = adt_get_name(adt, node);
+        if (!name || strnlen(name, 16) >= 16)
+            continue;
+
+        u32 rid_size = 0;
+        u32 port_number_size = 0;
+        u32 port_location_size = 0;
+        const u32 *rid = adt_getprop(adt, node, "rid", &rid_size);
+        const u32 *port_number = adt_getprop(adt, node, "port-number", &port_number_size);
+        const char *port_location = adt_getprop(adt, node, "port-location", &port_location_size);
+        if (!rid || rid_size != sizeof(*rid) || !port_number ||
+            port_number_size != sizeof(*port_number) || !port_location || !port_location_size) {
+            printf("usb: skipping non-port HPM node %s\n", name);
+            continue;
+        }
+
+        u32 idx;
+        if (tps6598x_host_port_resolve(*rid, *port_number, port_location, port_location_size,
+                                       J414S_USB_CONTROLLER_COUNT, &idx) < 0) {
+            printf("usb: refusing unmapped HPM node %s (rid=%u port=%u)\n", name, *rid,
+                   *port_number);
+            continue;
+        }
+        if ((s32)idx == preserved_index)
+            continue;
+
+        snprintf(hpm_path, sizeof(hpm_path), "%s/%s/%s", i2c_path, hpm_mngr_name, name);
+        tps6598x_dev_t *tps = hpm_init(i2c, hpm_path);
+        if (!tps) {
+            printf("usb: failed to init %s for host policy\n", name);
+            continue;
+        }
+
+        if (tps6598x_prepare_host(tps, idx, J414S_USB_CONTROLLER_COUNT, preserved_index) < 0)
+            printf("usb: unable to prepare %s as Source/DFP\n", name);
+        tps6598x_shutdown(tps);
+    }
+
+    i2c_shutdown(i2c);
+}
+
+void usb_hpm_handoff_host(iodev_id_t keep)
+{
+    if (adt_is_compatible(adt, 0, "J180dAP"))
+        usb_i2c_handoff_host("/arm-io/i2c3", keep);
+    usb_i2c_handoff_host("/arm-io/i2c0", keep);
 }
 
 void usb_iodev_init(void)
