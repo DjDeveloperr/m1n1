@@ -18,9 +18,9 @@
 #include "dart.h"
 #include "iova.h"
 #include "mtp_handoff.h"
+#include "platform_identity.h"
 #include "pmgr.h"
 #include "rtkit.h"
-#include "soc.h"
 #include "string.h"
 #include "utils.h"
 
@@ -317,7 +317,7 @@ void mtp_handoff_init(void)
     if (mtp_handoff.ready)
         return;
 
-    if (chip_id != T6020 || !adt_is_compatible(adt, 0, "J414sAP"))
+    if (!platform_is_j414s())
         return;
 
     printf("mtp-handoff: preparing J414s MTP for Windows DockChannel ownership\n");

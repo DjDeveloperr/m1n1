@@ -14,7 +14,7 @@
 
 #include "adt.h"
 #include "pcie.h"
-#include "soc.h"
+#include "platform_identity.h"
 #include "string.h"
 #include "types.h"
 #include "utils.h"
@@ -81,15 +81,11 @@ enum wlan_handoff_error {
     WLAN_ERR_FLUSH = -9,
     WLAN_ERR_PORT_SETUP = -10,
     WLAN_ERR_PREEXISTING_FAULT = -11,
+    WLAN_ERR_IDENTITY = -12,
 };
 
 static u64 wlan_dart_regs;
 static bool wlan_wrote_dart;
-
-static bool wlan_is_j414s(void)
-{
-    return chip_id == T6020 && adt_is_compatible(adt, 0, "J414sAP");
-}
 
 static u32 wlan_pci_command(u32 function)
 {
@@ -228,8 +224,10 @@ int wireless_handoff_init(void)
 
     wlan_dart_regs = 0;
     wlan_wrote_dart = false;
-    if (!wlan_is_j414s())
-        return WLAN_HANDOFF_OK;
+    if (!platform_is_j414s()) {
+        printf("wlan-handoff: exact J414s platform identity mismatch\n");
+        return WLAN_ERR_IDENTITY;
+    }
 
     if (adt_path_offset_trace(adt, WLAN_DART_PATH, adt_path) < 0 ||
         adt_get_reg(adt, adt_path, "reg", 0, &dart_base, &dart_size) < 0)

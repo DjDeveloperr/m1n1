@@ -148,6 +148,7 @@ OBJECTS := \
 	pcie.o \
 	wireless_handoff.o \
 	pmgr.o \
+	platform_identity.o \
 	proxy.o \
 	ringbuffer.o \
 	rtkit.o \

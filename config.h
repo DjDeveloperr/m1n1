@@ -61,14 +61,15 @@
 // The MTP coprocessor must already be running when the Windows AppleMtpHid
 // ACPI driver takes ownership of the DockChannel transport.  The handoff
 // helper is deliberately compiled only with the native-AIC Windows profile
-// and has a second, runtime J414sAP check, so normal m1n1/macOS/Linux boots
+// and has a second, exact runtime J414s identity check, so normal
+// m1n1/macOS/Linux boots
 // never touch MTP, its DART, or its DockChannel FIFOs.
 //
 #define ENABLE_J414S_WINDOWS_MTP_HANDOFF
 
 // Opt-in proxy operation that installs the persistent J414s BCM4388 SID-1
 // deny-all domain after pcie_init() and before hv_start(). It remains guarded
-// by the runtime T6020/J414sAP identity check.
+// by the exact runtime J414s identity check.
 #define ENABLE_J414S_WINDOWS_WIRELESS_HANDOFF
 
 #if defined(ENABLE_NATIVE_AIC_PASSTHROUGH) && !defined(ENABLE_VGIC_MODULE)

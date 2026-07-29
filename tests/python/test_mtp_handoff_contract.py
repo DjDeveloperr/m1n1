@@ -6,6 +6,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = (ROOT / "src" / "mtp_handoff.c").read_text()
+IDENTITY = (ROOT / "src" / "platform_identity.c").read_text()
 RTKIT_SOURCE = (ROOT / "src" / "rtkit.c").read_text()
 RTKIT_HEADER = (ROOT / "src" / "rtkit.h").read_text()
 HV = (ROOT / "src" / "hv.c").read_text()
@@ -20,7 +21,8 @@ class MtpHandoffContractTests(unittest.TestCase):
             "defined(ENABLE_NATIVE_AIC_PASSTHROUGH) && defined(ENABLE_J414S_WINDOWS_MTP_HANDOFF)",
             SOURCE,
         )
-        self.assertIn('chip_id != T6020 || !adt_is_compatible(adt, 0, "J414sAP")', SOURCE)
+        self.assertIn("if (!platform_is_j414s())", SOURCE)
+        self.assertIn("bool platform_identity_matches_j414s", IDENTITY)
         self.assertIn("mtp_handoff_init();", HV)
 
     def test_mtp_handoff_uses_the_mtp_dart_and_rtkit_boot_path(self):
@@ -52,9 +54,12 @@ class MtpHandoffContractTests(unittest.TestCase):
             "sz <= rtk->phys_window_size - (addr - rtk->phys_window_base)",
             RTKIT_SOURCE,
         )
-        self.assertIn("J414S_MTP_SRAM_BASE     0x2a9c00000ULL", SOURCE)
-        self.assertIn("J414S_MTP_SRAM_SIZE     SZ_1M", SOURCE)
-        self.assertIn('adt_get_reg(adt, mtp_path, "reg", 1', SOURCE)
+        self.assertIn("J414S_MTP_FIXED_BUFFER_BASE 0x2a9c00000ULL", SOURCE)
+        self.assertIn("J414S_MTP_FIXED_BUFFER_SIZE 0x100000ULL", SOURCE)
+        self.assertIn(
+            "mtp_handoff.sram_base = J414S_MTP_FIXED_BUFFER_BASE", SOURCE
+        )
+        self.assertIn("rtkit_set_phys_window(mtp_handoff.rtkit", SOURCE)
 
     def test_mtp_handoff_preserves_dockchannel_init_fifo(self):
         self.assertIn("RX_COUNT is the sole DockChannel register polled", SOURCE)

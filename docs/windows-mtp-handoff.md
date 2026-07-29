@@ -3,8 +3,12 @@
 This document specifies the ownership transfer used by the
 `ENABLE_J414S_WINDOWS_MTP_HANDOFF` build option.  It exists solely for the
 Windows-native-AIC profile on the `J414sAP` M2 Pro MacBook Pro.  It is compiled
-only with `ENABLE_NATIVE_AIC_PASSTHROUGH` and is a runtime no-op unless both
-`chip_id == T6020` and the root ADT is compatible with `J414sAP`.
+only with `ENABLE_NATIVE_AIC_PASSTHROUGH` and is a runtime no-op unless the
+live ADT matches the measured J414s identity tuple: `/chosen` has chip ID
+`0x6020`, board ID `4`, and no `target-type` payload; the root has target type
+`J414s`, model `Mac14,9`, and the exact compatible byte sequence
+`J414sAP\0Mac14,9\0AppleARM\0`. Any missing, extra, or reordered identity
+value leaves the handoff disabled.
 
 Normal m1n1/macOS/Linux boots therefore do not touch the MTP ASC, its DART, or
 the DockChannel transport.
