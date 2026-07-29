@@ -32,12 +32,9 @@
  #define ENABLE_VGIC_MODULE
 
 //
-// windows-native-aic transform (branch windows-native-aic; see
+// Unified J414s Windows profile (branch feature/j414s-windows-unified; see
 // docs/windows-native-aic.md for the full design writeup, the timer re-arm handshake,
-// and the M1-VALIDATION CHECKLIST). UNTESTED -- there is no aarch64 m1n1 toolchain on
-// the machine this was written on and no M1 to boot it on; every register/bit fact
-// below is cited from m1n1's own headers, and every genuinely uncertain point is
-// called out explicitly rather than guessed.
+// and docs/windows-unified.md for the build and ownership contract).
 //
 // When this is defined (it requires ENABLE_VGIC_MODULE, enforced below), a guest
 // booted under the hypervisor starts on the emulated GICv3 carrier, then drives
@@ -68,8 +65,9 @@
 #define ENABLE_J414S_WINDOWS_MTP_HANDOFF
 
 // Opt-in proxy operation that installs the persistent J414s BCM4388 SID-1
-// deny-all domain after pcie_init() and before hv_start(). It remains guarded
-// by the exact runtime J414s identity check.
+// deny-all domain after pcie_init() and before hv_start(). It additionally
+// requires an explicit top-of-memory reservation paired with Mu's DRT0
+// profile; compiling this capability never reserves or mutates wireless state.
 #define ENABLE_J414S_WINDOWS_WIRELESS_HANDOFF
 
 #if defined(ENABLE_NATIVE_AIC_PASSTHROUGH) && !defined(ENABLE_VGIC_MODULE)
