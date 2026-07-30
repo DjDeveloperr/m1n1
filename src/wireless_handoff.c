@@ -42,6 +42,8 @@
 #define WLAN_DART_TLB_CMD_BUSY         BIT(31)
 #define WLAN_DART_TLB_CMD_FLUSH_SID1   0x101
 #define WLAN_DART_ERROR                0x100
+/* A latched fault is FLAG only; the lower fields are stale residue. */
+#define WLAN_DART_ERROR_FLAG           BIT(31)
 #define WLAN_DART_ERROR_STREAMS        0x1c0
 #define WLAN_DART_PROTECT              0x200
 #define WLAN_DART_PROTECT_TTBR_TCR     BIT(0)
@@ -203,9 +205,27 @@ static int wlan_check_dart_quiescent(void)
                sid_ttbr, enabled_streams);
         return WLAN_ERR_SID1_LIVE;
     }
-    if (read32(wlan_dart_regs + WLAN_DART_ERROR) != 0 ||
-        read32(wlan_dart_regs + WLAN_DART_ERROR_STREAMS) != 0)
+    /*
+     * A latched fault is indicated by ERROR.FLAG (bit 31), not by the register
+     * being non-zero.  The lower fields (SID, WRITE_nREAD, and the fault-type
+     * bits) retain residue from whatever transaction last set them and are
+     * meaningless while FLAG is clear -- m1n1's own DART driver gates on
+     * exactly this bit (see proxyclient/m1n1/hw/dart8110.py, which only
+     * reports when ERROR.reg.FLAG is set).
+     *
+     * Measured on J414s: ERROR reads 0x10700000 (FLAG=0, SID=7,
+     * WRITE_nREAD=1, no fault-type bits) with ERROR_STREAMS = 0, and the word
+     * is not write-1-to-clear.  Testing the whole word therefore rejected the
+     * handoff permanently over stale residue with no fault present.
+     */
+    u32 dart_error = read32(wlan_dart_regs + WLAN_DART_ERROR);
+    u32 dart_error_streams = read32(wlan_dart_regs + WLAN_DART_ERROR_STREAMS);
+
+    if ((dart_error & WLAN_DART_ERROR_FLAG) || dart_error_streams != 0) {
+        printf("wlan-handoff: pre-existing DART fault (error=%#x streams=%#x)\n", dart_error,
+               dart_error_streams);
         return WLAN_ERR_PREEXISTING_FAULT;
+    }
     return WLAN_HANDOFF_OK;
 }
 
