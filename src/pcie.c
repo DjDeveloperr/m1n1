@@ -500,10 +500,30 @@ static int pcie_find_rail_owner(int bridge_offset, u32 bridge_phandle)
  * all log and continue.  A wrong or missing rail must degrade a device, never
  * refuse the boot.
  */
+/*
+ * Rails are OPT-IN, and deliberately off for the generic pcie_init() path.
+ *
+ * Powering these ports is correct firmware behaviour, but it is premature for
+ * a Windows boot: raising them hands Windows three PCIe devices (BCM4388 WiFi,
+ * its Bluetooth function, and the GL9755 SD reader) whose MSI delivery is not
+ * yet activated on this platform.  Measured consequence -- with rails on,
+ * Windows bugchecked BUGCODE_USB3_DRIVER (0x144) on a gpu-only profile, and
+ * INACCESSIBLE_BOOT_DEVICE (0x7B) on ans-gpu; xHCI shares the interrupt setup
+ * these undeliverable devices disturb.  Both boots showed "rail" asserted
+ * twice with no link failures, so the rails were the common factor.
+ *
+ * pcie_init_wireless() opts in, because wireless/SD bring-up cannot proceed
+ * without power.  Flip the default only once MSI delivery works.
+ */
+static bool pcie_rails_enabled = false;
+
 static bool pcie_enable_port_rail(int bridge_offset, int port)
 {
     u32 bridge_phandle = 0;
     int owner;
+
+    if (!pcie_rails_enabled)
+        return false;
 
     if (ADT_GETPROP(adt, bridge_offset, "AAPL,phandle", &bridge_phandle) < 0)
         return false;
@@ -1596,8 +1616,23 @@ int pcie_init_wireless(void)
     if (pcie_initialized)
         return -1;
 
-    if (pcie_init_controller(APCIE, "/arm-io/apcie", BIT(0), true))
+    /*
+     * The wireless/SD bring-up path is the one caller that needs the port
+     * power rails.  See pcie_rails_enabled: the generic pcie_init() path used
+     * by Windows boots leaves them alone, because these devices' MSI delivery
+     * is not activated yet and powering them destabilises xHCI.
+     *
+     * Both ports: WiFi/BT is on pci-bridge0 and the SD reader on pci-bridge1,
+     * so BIT(0) alone would leave SD dark.  require_link_up stays false --
+     * port 1 having no link must not fail the wireless profile, and vice
+     * versa.
+     */
+    pcie_rails_enabled = true;
+
+    if (pcie_init_controller(APCIE, "/arm-io/apcie", BIT(0) | BIT(1), false)) {
+        pcie_rails_enabled = false;
         return -1;
+    }
     pcie_initialized = true;
     return 0;
 }
