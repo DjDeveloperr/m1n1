@@ -178,9 +178,31 @@ static int wlan_check_dart_quiescent(void)
         return WLAN_ERR_DART_LOCKED;
     if (read32(wlan_dart_regs + WLAN_DART_TLB_CMD) & WLAN_DART_TLB_CMD_BUSY)
         return WLAN_ERR_DART_BUSY;
-    if (read32(wlan_dart_regs + WLAN_DART_TCR(WLAN_SID)) != 0 ||
-        read32(wlan_dart_regs + WLAN_DART_TTBR(WLAN_SID)) != 0)
+    /*
+     * "Live" means the stream can actually translate, which requires a VALID
+     * TTBR and the stream enabled.  It is NOT simply a non-zero TCR.
+     *
+     * Measured on J414s once the WLAN rail is up and the link trains: every
+     * SID reads TCR = WLAN_DART_TCR_TRANSLATE_ENABLE with TTBR = 0 and
+     * ENABLE_STREAMS = 0.  That uniformity across all SIDs is the signature of
+     * the DART's reset default, not of anybody's configuration -- and with no
+     * valid TTBR and the stream disabled the endpoint cannot DMA at all, so
+     * there is nothing to clobber.  Refusing on raw TCR != 0 made the handoff
+     * unreachable on this machine (it returned WLAN_ERR_SID1_LIVE forever).
+     *
+     * Still fail closed on anything that could be a real translation: a valid
+     * TTBR, an enabled stream, or TCR bits beyond translate-enable.
+     */
+    u32 sid_tcr = read32(wlan_dart_regs + WLAN_DART_TCR(WLAN_SID));
+    u32 sid_ttbr = read32(wlan_dart_regs + WLAN_DART_TTBR(WLAN_SID));
+    u32 enabled_streams = read32(wlan_dart_regs + WLAN_DART_ENABLE_STREAMS);
+
+    if ((sid_ttbr & WLAN_DART_TTBR_VALID) || (enabled_streams & BIT(WLAN_SID)) ||
+        (sid_tcr & ~WLAN_DART_TCR_TRANSLATE_ENABLE) != 0) {
+        printf("wlan-handoff: SID%d is live (tcr=%#x ttbr=%#x streams=%#x)\n", WLAN_SID, sid_tcr,
+               sid_ttbr, enabled_streams);
         return WLAN_ERR_SID1_LIVE;
+    }
     if (read32(wlan_dart_regs + WLAN_DART_ERROR) != 0 ||
         read32(wlan_dart_regs + WLAN_DART_ERROR_STREAMS) != 0)
         return WLAN_ERR_PREEXISTING_FAULT;
