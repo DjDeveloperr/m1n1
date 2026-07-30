@@ -15,6 +15,13 @@ u32 ufstat = 0;
 
 int vuart_irq = 0;
 
+/*
+ * Guest TX bytes discarded because the host end of the CDC pipe was not
+ * draining. Non-zero means "currently dropping"; it is reset to 0 and reported
+ * when the host catches up. See the UTXH case in handle_vuart().
+ */
+static u32 vuart_tx_dropped = 0;
+
 static void update_irq(void)
 {
     ssize_t rx_queued;
@@ -94,8 +101,45 @@ static bool handle_vuart(struct exc_info *ctx, u64 addr, u64 *val, bool write, i
                 break;
             case UTXH: {
                 uint8_t b = *val;
-                if (iodev_can_write(IODEV_USB_VUART))
+                /*
+                 * NEVER let a guest TX byte block here.
+                 *
+                 * This runs in EL2 exception context, under the big hypervisor
+                 * lock, with the 1 s HV watchdog armed. iodev_write() ->
+                 * usb_dwc3_queue() spins until the TX ring accepts the byte, and
+                 * iodev_can_write() only reports "the host configured the CDC
+                 * pipe", not "there is room". So the previous guard was not a
+                 * guard at all: any host that stops draining the secondary TTY
+                 * (terminal closed, socat SIGKILLed, client crashed, or simply a
+                 * guest that outruns the reader) would wedge EL2 and trip the
+                 * watchdog -- stranding the single physical serial link and
+                 * forcing a physical reboot.
+                 *
+                 * Policy is therefore drop-on-full, which is the standard
+                 * behaviour of a real UART whose FIFO has overrun: the guest is
+                 * told the byte was accepted (UTRSTAT already reports TXBE/TXE
+                 * unconditionally in update_irq()), and the byte is discarded.
+                 * Losing console output is recoverable; losing the link is not.
+                 */
+                if (usb_iodev_vuart_write_space() > 0) {
+                    if (vuart_tx_dropped) {
+                        printf("HV: vuart: host drained, resuming TX (dropped %u byte%s)\n",
+                               vuart_tx_dropped, vuart_tx_dropped == 1 ? "" : "s");
+                        vuart_tx_dropped = 0;
+                    }
                     iodev_write(IODEV_USB_VUART, &b, 1);
+                } else {
+                    /*
+                     * Report only the transition into the dropping state, once.
+                     * The recovery message above reports the total. Printing per
+                     * dropped byte would flood m1n1's own console -- the very
+                     * link we are protecting.
+                     */
+                    if (!vuart_tx_dropped)
+                        printf("HV: vuart: TX buffer full, host is not draining; dropping bytes\n");
+                    if (vuart_tx_dropped != UINT32_MAX)
+                        vuart_tx_dropped++;
+                }
                 handle_vuart_passthrough(b);
                 break;
             }

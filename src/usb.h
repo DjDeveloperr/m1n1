@@ -16,5 +16,6 @@ void usb_iodev_init(void);
 void usb_iodev_shutdown_except(iodev_id_t keep);
 void usb_iodev_shutdown(void);
 void usb_iodev_vuart_setup(iodev_id_t iodev);
+size_t usb_iodev_vuart_write_space(void);
 
 #endif
