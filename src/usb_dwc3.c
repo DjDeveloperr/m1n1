@@ -1426,6 +1426,41 @@ bool usb_dwc3_can_write(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
     return dev->pipe[pipe].ready;
 }
 
+/*
+ * Number of bytes that can be handed to usb_dwc3_queue()/usb_dwc3_write() right
+ * now WITHOUT that call spinning.
+ *
+ * usb_dwc3_queue() loops until every byte has been accepted by the TX
+ * ringbuffer, pumping the event loop in between. That is fine for m1n1's own
+ * console, which is always eventually drained by the host proxy. It is NOT fine
+ * for a caller that runs inside an EL2 exception handler (the guest-UART MMIO
+ * hook): if the host end of the CDC pipe is not draining -- nobody has the TTY
+ * open, the terminal was SIGKILLed, socat died -- the ring fills, the loop never
+ * terminates, and the HV watchdog (1 s, src/hv_wdt.c) barks and takes the
+ * machine down. That strands the one physical serial link and costs a physical
+ * reboot.
+ *
+ * usb_dwc3_can_write() cannot be used to avoid this: it only reports whether the
+ * pipe has been configured by the host, not whether there is buffer space.
+ *
+ * ringbuffer_write() treats "write + 1 == read" as full, so the usable capacity
+ * is one byte less than ringbuffer_get_free() reports. Subtract that byte here
+ * so the value returned is a hard, directly usable bound.
+ */
+size_t usb_dwc3_write_space(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
+{
+    if (!dev || !dev->pipe[pipe].ready)
+        return 0;
+
+    ringbuffer_t *device2host = dev->pipe[pipe].device2host;
+    if (!device2host)
+        return 0;
+
+    size_t free = ringbuffer_get_free(device2host);
+
+    return free > 1 ? free - 1 : 0;
+}
+
 void usb_dwc3_flush(dwc3_dev_t *dev, cdc_acm_pipe_id_t pipe)
 {
     if (!dev || !dev->pipe[pipe].ready)

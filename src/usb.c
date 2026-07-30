@@ -638,3 +638,19 @@ void usb_iodev_vuart_setup(iodev_id_t iodev)
 
     iodev_usb_vuart.opaque = iodev_get_opaque(iodev);
 }
+
+/*
+ * Bytes the vuart channel (CDC ACM pipe 1) can absorb without blocking.
+ *
+ * Callers running in EL2 exception context must bound every write by this value;
+ * see the comment on usb_dwc3_write_space() for why iodev_can_write() is not a
+ * sufficient guard. Returns 0 if the vuart has not been pointed at a DWC3
+ * controller yet, which is also the correct "drop the byte" answer.
+ */
+size_t usb_iodev_vuart_write_space(void)
+{
+    if (!iodev_usb_vuart.opaque)
+        return 0;
+
+    return usb_dwc3_write_space(iodev_usb_vuart.opaque, CDC_ACM_PIPE_1);
+}
