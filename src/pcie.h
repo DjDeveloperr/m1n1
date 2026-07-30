@@ -225,6 +225,13 @@ int pcie_t602x_bcm4388_setup_port0(const struct pcie_t602x_mmio_ops *ops, void *
 /* Asahi's module default for link training (link_up_timeout = 500 ms). */
 #define PCIE_PERST_LINK_UP_TIMEOUT_US UINT32_C(500000)
 
+/*
+ * Tpvperl: power valid -> PERST# inactive.  PCIe CEM requires 100 ms, and
+ * pcie-apple.c spends exactly that (msleep(100)) after raising a port's pwren
+ * and before releasing PERST#, only for ports that actually have a rail.
+ */
+#define PCIE_PWREN_TO_PERST_US UINT32_C(100000)
+
 struct pcie_perst_delays {
     u32 refclk_to_perst_us;
     u32 perst_to_config_us;

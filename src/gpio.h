@@ -91,6 +91,34 @@ struct apple_gpio_pin {
 };
 
 /*
+ * SMC-backed rails.  Some power enables are not AP GPIO pads at all: the
+ * `function-*` record names the SMC and carries the SMC key in args[0].  On
+ * J414s the SD reader's rail is exactly this:
+ *
+ *   pcie-sdreader.function-sd_pwr_en =
+ *       phandle=210, fourcc renders as 'pKW4', args=[0x67503136, 0]
+ *
+ * where 0x67503136 is the ASCII key "gP16" (SMC GPIO pin 0x16 = 22), verified
+ * live against the J414s ADT.
+ *
+ * WRITE VALUE -- do not copy m1n1's existing pattern here.  src/dcp.c writes
+ * `mode | 1` for the HDMI rails, whose ADT mode word (args[1]) is 0x800000.
+ * The SD rail's mode word is **0**, so `mode | 1` would write a bare 0x1 and
+ * drive nothing.  The command must be CMD_OUTPUT ORed with the level.
+ * CMD_OUTPUT is (1 << 24), per Linux drivers/gpio/gpio-macsmc.c and this
+ * project's own Platform/MacBookProEarly2023Pkg/AcpiTables/SMCG.asl, which
+ * publishes `ntasp,smc-gpio-cmd-output = 0x01000000` and documents the key
+ * format as "gP%02x".
+ */
+#define APPLE_SMC_GPIO_CMD_OUTPUT BIT(24)
+
+/* A resolved SMC-backed rail: an SMC key rather than a pad address. */
+struct apple_smc_rail {
+    u32 key;
+    bool valid;
+};
+
+/*
  * Pure helpers.  These have no MMIO or ADT dependency and are covered by
  * tests/gpio/test_apple_gpio.c.
  */
@@ -114,6 +142,14 @@ bool apple_gpio_pin_in_window(u32 pin, u64 size);
  * can treat "no PERST# GPIO here" as a normal, non-fatal outcome.
  */
 int apple_gpio_resolve_function(int node, const char *name, struct apple_gpio_pin *out);
+
+/*
+ * Resolve an SMC-backed `function-<name>` rail on `node` into its SMC key.
+ * Deliberately the mirror image of apple_gpio_resolve_function(): that one
+ * rejects SMC targets, this one rejects MMIO GPIO targets, so a caller can
+ * never write one kind as if it were the other.
+ */
+int apple_smc_resolve_function(int node, const char *name, struct apple_smc_rail *out);
 
 /*
  * Drive a resolved pin as an output at `level`, preserving every other field

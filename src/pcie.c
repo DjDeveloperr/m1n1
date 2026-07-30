@@ -7,6 +7,7 @@
 #include "gpio.h"
 #include "platform_identity.h"
 #include "pmgr.h"
+#include "smc.h"
 #include "string.h"
 #include "tunables.h"
 #include "utils.h"
@@ -1217,6 +1218,58 @@ static int pcie_init_controller(int controller, const char *path, u32 allowed_po
         if (tunables_apply_local_addr(bridge, "apcie-config-tunables", state->port_base[port])) {
             printf("pcie: Error applying %s for %s\n", "apcie-config-tunables", bridge);
             return -1;
+        }
+
+        /*
+         * Power-enable rails.  PERST# alone is not enough: on J414s both ports
+         * drove PERST# correctly and still reported LINKSTS 0xab000208 forever,
+         * because a device with no power rail is not a link partner at all.
+         *
+         * The rail is declared on the ENDPOINT child, not on the bridge -- on
+         * J414s /arm-io/apcie/pci-bridge1/pcie-sdreader carries
+         * function-sd_pwr_en (SMC key "gP16" == 0x67503136, verified live
+         * against the ADT), while pci-bridge0's wlan/bluetooth-pcie children
+         * carry no such property and need nothing here.  So walk the children
+         * rather than looking at the bridge.
+         *
+         * Ordering follows pcie-apple.c: the rail goes high while PERST# is
+         * still asserted, then Tpvperl settles before PERST# is released.  We
+         * assert here, ahead of pcie_port_release_perst(), so the device is
+         * powered and stable for the whole reset window.
+         *
+         * Best-effort by design: a missing property, an unresolvable key, or a
+         * dead SMC logs and continues.  A port whose link is already up is left
+         * alone entirely -- never power-cycle a working device.
+         */
+        if (!bringup.link_was_up) {
+            int child = adt_first_child_offset(adt, bridge_offset);
+
+            while (child > 0) {
+                struct apple_smc_rail rail = {0};
+
+                if (apple_smc_resolve_function(child, "sd_pwr_en", &rail) == 0 && rail.valid) {
+                    smc_dev_t *smc = smc_init();
+
+                    if (!smc) {
+                        printf("pcie: Port %d power rail %.4s: SMC unavailable\n", port,
+                               (const char *)&rail.key);
+                    } else {
+                        u32 value = APPLE_SMC_GPIO_CMD_OUTPUT | 1;
+
+                        if (smc_write_u32(smc, rail.key, value) < 0)
+                            printf("pcie: Port %d power rail write failed (key %#x)\n", port,
+                                   rail.key);
+                        else
+                            printf("pcie: Port %d power rail enabled (SMC key %#x <- %#x)\n", port,
+                                   rail.key, value);
+                        smc_shutdown(smc);
+                        /* Tpvperl: power valid -> PERST# inactive. */
+                        udelay(PCIE_PWREN_TO_PERST_US);
+                    }
+                }
+
+                child = adt_next_sibling_offset(adt, child);
+            }
         }
 
         /*

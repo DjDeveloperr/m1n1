@@ -188,6 +188,54 @@ int apple_gpio_resolve_function(int node, const char *name, struct apple_gpio_pi
     return 0;
 }
 
+int apple_smc_resolve_function(int node, const char *name, struct apple_smc_rail *out)
+{
+    char prop[64];
+    struct apple_gpio_function fn;
+    const void *value;
+    u32 len = 0;
+
+    if (!out)
+        return -1;
+    *out = (struct apple_smc_rail){0};
+
+    snprintf(prop, sizeof(prop), "function-%s", name);
+
+    value = adt_getprop(adt, node, prop, &len);
+    if (!value || !len)
+        return -1;
+
+    if (apple_gpio_parse_function(value, len, &fn) < 0) {
+        printf("gpio: %s is malformed (%u bytes)\n", prop, len);
+        return -1;
+    }
+
+    /*
+     * Exact mirror of apple_gpio_resolve_function()'s check: an MMIO GPIO is
+     * not an SMC key, and writing one as the other is the bug this pair of
+     * functions exists to make impossible.
+     */
+    if (apple_gpio_function_is_mmio_gpio(&fn)) {
+        printf("gpio: %s is a memory-mapped GPIO, not an SMC rail\n", prop);
+        return -1;
+    }
+
+    /*
+     * args[0] is the SMC key as a packed 4-character code (e.g. 0x67503136 ==
+     * "gP16").  A zero key names nothing.  We deliberately do NOT use args[1]
+     * (the mode word) as the write value -- see APPLE_SMC_GPIO_CMD_OUTPUT.
+     */
+    if (fn.pin == 0) {
+        printf("gpio: %s has a zero SMC key\n", prop);
+        return -1;
+    }
+
+    out->key = fn.pin;
+    out->valid = true;
+
+    return 0;
+}
+
 int apple_gpio_set_output(const struct apple_gpio_pin *pin, bool level)
 {
     u64 address;
