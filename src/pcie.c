@@ -449,24 +449,44 @@ static bool pcie_node_controls_bridge(int node, u32 bridge_phandle)
     return false;
 }
 
-static int pcie_find_rail_owner(int node, u32 bridge_phandle)
+/*
+ * Deliberately NOT a recursive whole-ADT search.  An earlier version walked
+ * the entire tree from the root looking for the owning node; on hardware that
+ * hard-reset the machine mid-`pcie_init` (serial dropped outright), and this
+ * codebase already has a documented history of unreliable generic tree
+ * traversal.  There are only two places an owner is ever found, so look in
+ * exactly those two and keep the traversal bounded and deterministic:
+ *
+ *   1. the bridge's own children  -- /arm-io/apcie/pci-bridgeN/<endpoint>
+ *   2. the fixed top-level node   -- /amfm
+ *
+ * Both are confirmed against the live J414s ADT, and each candidate still has
+ * to prove ownership via function-pcie_port_control* naming this bridge, so a
+ * machine that wires them differently gets nothing rather than the wrong rail.
+ */
+static int pcie_find_rail_owner(int bridge_offset, u32 bridge_phandle)
 {
+    static const char *const owner_paths[] = {"/amfm"};
     int child_count, child;
 
     if (bridge_phandle == 0)
         return -1;
 
-    if (pcie_node_controls_bridge(node, bridge_phandle))
-        return node;
-
-    child_count = adt_get_child_count(adt, node);
-    child = adt_first_child_offset(adt, node);
+    child_count = adt_get_child_count(adt, bridge_offset);
+    child = adt_first_child_offset(adt, bridge_offset);
     while (child_count-- > 0 && child > 0) {
-        int found = pcie_find_rail_owner(child, bridge_phandle);
-
-        if (found >= 0)
-            return found;
+        if (pcie_node_controls_bridge(child, bridge_phandle))
+            return child;
         child = adt_next_sibling_offset(adt, child);
+    }
+
+    for (size_t i = 0; i < ARRAY_SIZE(owner_paths); i++) {
+        int node = adt_path_offset(adt, owner_paths[i]);
+
+        if (node < 0)
+            continue;
+        if (pcie_node_controls_bridge(node, bridge_phandle))
+            return node;
     }
 
     return -1;
@@ -488,7 +508,7 @@ static bool pcie_enable_port_rail(int bridge_offset, int port)
     if (ADT_GETPROP(adt, bridge_offset, "AAPL,phandle", &bridge_phandle) < 0)
         return false;
 
-    owner = pcie_find_rail_owner(0, bridge_phandle);
+    owner = pcie_find_rail_owner(bridge_offset, bridge_phandle);
     if (owner < 0)
         return false;
 
