@@ -13,6 +13,16 @@
 #include "utils.h"
 #endif
 
+/*
+ * PCI-to-PCI bridge (type 1) header, bus number register at 0x18:
+ * primary | secondary << 8 | subordinate << 16 | secondary latency << 24.
+ */
+#define PCI_BRIDGE_BUS_NUMBER      0x18
+#define PCI_BRIDGE_PRIMARY_BUS     GENMASK(7, 0)
+#define PCI_BRIDGE_SECONDARY_BUS   GENMASK(15, 8)
+#define PCI_BRIDGE_SUBORDINATE_BUS GENMASK(23, 16)
+#define PCI_BRIDGE_BUS_RANGE       GENMASK(23, 0)
+
 static int pcie_t602x_bcm4388_restore_rid(const struct pcie_t602x_mmio_ops *ops, void *context,
                                           u64 address, u32 prior)
 {
@@ -417,6 +427,16 @@ void pcie_perst_delays_from_adt(struct pcie_perst_delays *out, bool have_refclk_
  * descendant of the bridge at all, which is why a child-only search finds the
  * SD rail and silently misses the wireless one.
  */
+/*
+ * Everything from here to the matching #endif reads the ADT and talks to the
+ * SMC directly, and is reachable only from pcie_init_controller(), which is
+ * itself hardware-only.  It has to stay inside this guard: tests/pcie builds
+ * src/pcie.c with PCIE_T602X_WIRELESS_HOST_TEST to cover the callback-driven
+ * BCM4388 RID/MSI and port bring-up helpers, and an unguarded adt/smc
+ * reference here breaks that whole suite -- which is exactly what happened
+ * between 3b24e2cb and this commit.
+ */
+#ifndef PCIE_T602X_WIRELESS_HOST_TEST
 static const char *const pcie_port_control_props[] = {
     "function-pcie_port_control",
     "function-pcie_port_control_sd",
@@ -501,28 +521,84 @@ static int pcie_find_rail_owner(int bridge_offset, u32 bridge_phandle)
  * refuse the boot.
  */
 /*
- * Rails are OPT-IN, and deliberately off for the generic pcie_init() path.
+ * Two things are OPT-IN and deliberately off for the generic pcie_init() path:
+ * the port power rails, and the root ports' bridge bus numbers.  They are
+ * co-requisite -- routing without power reaches a dead link, power without
+ * routing reaches a device nothing can address -- so one flag gates both and
+ * the invariant cannot be half-applied.
  *
- * Powering these ports is correct firmware behaviour, but it is premature for
- * a Windows boot: raising them hands Windows three PCIe devices (BCM4388 WiFi,
- * its Bluetooth function, and the GL9755 SD reader) whose MSI delivery is not
- * yet activated on this platform.  Measured consequence -- with rails on,
- * Windows bugchecked BUGCODE_USB3_DRIVER (0x144) on a gpu-only profile, and
+ * Doing either is correct firmware behaviour, but it is premature for a
+ * Windows boot: it hands Windows three PCIe devices (BCM4388 Wi-Fi, its
+ * Bluetooth function, and the GL9755 SD reader) whose MSI delivery is not yet
+ * activated on this platform.  Measured consequence -- with rails on, Windows
+ * bugchecked BUGCODE_USB3_DRIVER (0x144) on a gpu-only profile, and
  * INACCESSIBLE_BOOT_DEVICE (0x7B) on ans-gpu; xHCI shares the interrupt setup
  * these undeliverable devices disturb.  Both boots showed "rail" asserted
  * twice with no link failures, so the rails were the common factor.
  *
  * pcie_init_wireless() opts in, because wireless/SD bring-up cannot proceed
- * without power.  Flip the default only once MSI delivery works.
+ * without power and the SID-1 handoff cannot read endpoint config space
+ * without routing.  Flip the default only once MSI delivery works.
  */
-static bool pcie_rails_enabled = false;
+static bool pcie_wireless_profile = false;
+
+/*
+ * Give a root port a bus number range so config space behind it is routable.
+ *
+ * m1n1 has never done this: it trains the links and stops.  Both J414s root
+ * ports therefore come out of bring-up with primary = secondary = subordinate
+ * = 0, and a bridge whose secondary bus is 0 forwards no configuration request
+ * at all -- every config read of the endpoint returns 0xffffffff even though
+ * LINKSTS reports the link up.  Measured on hardware: after this controller
+ * reported "Port 0 link up (status 0xd9000001)", config 0x18 on both root
+ * ports read zero and neither endpoint was visible; writing the bus numbers by
+ * hand made 14e4:4434 (Wi-Fi, bus 1 dev 0 fn 0), 14e4:5f72 (Bluetooth, fn 1)
+ * and 17a0:9755 (GL9755 SD reader, bus 2 dev 0 fn 0) appear immediately.
+ *
+ * Numbering: each Apple root port owns exactly one downstream bus, and the
+ * root ports themselves are bus 0 devices 0..N-1 (which is precisely why
+ * config_base is controller_config_base + (port << 15) -- ECAM device number
+ * == port index).  So port N gets secondary = subordinate = N + 1, which is
+ * also what a normal OS enumerator ends up assigning.  Primary stays 0.
+ *
+ * This is not a takeover: any OS PCI enumerator reprograms these registers
+ * from scratch during its own scan, and on profiles where the rails stay down
+ * there is no powered device behind the bridge for the routing to expose.
+ * Best-effort -- a read-back mismatch logs and continues, because a bridge
+ * that will not accept a bus number is a diagnosis for the caller to fail on,
+ * not a reason to abort the whole controller.
+ */
+static bool pcie_program_bridge_bus_numbers(u64 config_base, u32 port)
+{
+    u32 secondary = port + 1;
+    u32 want = FIELD_PREP(PCI_BRIDGE_PRIMARY_BUS, 0) |
+               FIELD_PREP(PCI_BRIDGE_SECONDARY_BUS, secondary) |
+               FIELD_PREP(PCI_BRIDGE_SUBORDINATE_BUS, secondary);
+    u32 got;
+
+    if (!pcie_wireless_profile)
+        return false;
+
+    /* Preserve the secondary latency timer in the top byte. */
+    mask32(config_base + PCI_BRIDGE_BUS_NUMBER, PCI_BRIDGE_BUS_RANGE, want);
+    got = read32(config_base + PCI_BRIDGE_BUS_NUMBER) & PCI_BRIDGE_BUS_RANGE;
+    if (got != want) {
+        printf("pcie: Port %d bus-number write did not stick (%#x, wanted %#x)\n", port, got,
+               want);
+        return false;
+    }
+
+    printf("pcie: Port %d routed as primary 0, secondary %u, subordinate %u\n", port, secondary,
+           secondary);
+    return true;
+}
 
 static bool pcie_enable_port_rail(int bridge_offset, int port)
 {
     u32 bridge_phandle = 0;
     int owner;
 
-    if (!pcie_rails_enabled)
+    if (!pcie_wireless_profile)
         return false;
 
     if (ADT_GETPROP(adt, bridge_offset, "AAPL,phandle", &bridge_phandle) < 0)
@@ -570,6 +646,7 @@ static bool pcie_enable_port_rail(int bridge_offset, int port)
 
     return false;
 }
+#endif /* !PCIE_T602X_WIRELESS_HOST_TEST */
 
 static bool pcie_bringup_ops_valid(const struct pcie_port_bringup_ops *ops,
                                    const struct pcie_port_bringup *cfg)
@@ -1579,6 +1656,11 @@ static int pcie_init_controller(int controller, const char *path, u32 allowed_po
                 return -1;
         } else {
             printf("pcie: Port %d link up (status %#x)\n", port, link_status);
+            /*
+             * Only once the link is actually up: a bus number range on a port
+             * with no link partner advertises a hierarchy that does not exist.
+             */
+            pcie_program_bridge_bus_numbers(config_base, port);
         }
 
         state->initialized_port_mask |= BIT(port);
@@ -1618,19 +1700,20 @@ int pcie_init_wireless(void)
 
     /*
      * The wireless/SD bring-up path is the one caller that needs the port
-     * power rails.  See pcie_rails_enabled: the generic pcie_init() path used
-     * by Windows boots leaves them alone, because these devices' MSI delivery
-     * is not activated yet and powering them destabilises xHCI.
+     * power rails AND routable bus numbers behind the root ports.  See
+     * pcie_wireless_profile: the generic pcie_init() path used by non-wireless
+     * Windows boots leaves both alone, because these devices' MSI delivery is
+     * not activated yet and powering them destabilises xHCI.
      *
      * Both ports: WiFi/BT is on pci-bridge0 and the SD reader on pci-bridge1,
      * so BIT(0) alone would leave SD dark.  require_link_up stays false --
      * port 1 having no link must not fail the wireless profile, and vice
      * versa.
      */
-    pcie_rails_enabled = true;
+    pcie_wireless_profile = true;
 
     if (pcie_init_controller(APCIE, "/arm-io/apcie", BIT(0) | BIT(1), false)) {
-        pcie_rails_enabled = false;
+        pcie_wireless_profile = false;
         return -1;
     }
     pcie_initialized = true;

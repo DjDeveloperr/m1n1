@@ -31,6 +31,21 @@
 #define WLAN_DART0_BASE 0x594000000ULL
 #define WLAN_DART0_SIZE 0x4000ULL
 #define WLAN_ECAM_BASE  0x580000000ULL
+/*
+ * ECAM: base + (bus << 20) + (device << 15) + (function << 12).
+ *
+ * Both BCM4388 functions are on ONE device: bus 1, device 0, function 0 is
+ * Wi-Fi (14e4:4434) and function 1 is Bluetooth (14e4:5f72) -- verified by
+ * live bus enumeration, not inferred.  Port 0's root port is bus 0 device 0
+ * (which is why src/pcie.c derives its config base as
+ * controller_config_base + (port << 15)), and it must already carry
+ * secondary bus 1 or no configuration request reaches either function.
+ */
+#define WLAN_ROOT_PORT_CONFIG      WLAN_ECAM_BASE
+#define WLAN_ENDPOINT_BUS          1U
+#define WLAN_PCI_BRIDGE_BUS_NUMBER 0x18
+#define WLAN_PCI_BRIDGE_SECONDARY  GENMASK(15, 8)
+#define WLAN_PCI_BRIDGE_SUBORDINATE GENMASK(23, 16)
 #define WLAN_WIFI_ID    0x443414e4U
 #define WLAN_BT_ID      0x5f7214e4U
 
@@ -96,6 +111,7 @@ enum wlan_handoff_error {
     WLAN_ERR_RESERVATION_NOT_CANONICAL = -15,
     WLAN_ERR_RESERVATION_CLAIMED = -16,
     WLAN_ERR_TABLE_READBACK = -17,
+    WLAN_ERR_BUS_ROUTING = -18,
 };
 
 static u64 wlan_dart_regs;
@@ -274,23 +290,69 @@ static int wlan_validate_reservation(u64 base, u64 size)
     return WLAN_HANDOFF_OK;
 }
 
+static u64 wlan_endpoint_config(u32 function)
+{
+    return WLAN_ECAM_BASE + ((u64)WLAN_ENDPOINT_BUS << 20) + ((u64)function << 12);
+}
+
 static u32 wlan_pci_command(u32 function)
 {
-    u64 config = WLAN_ECAM_BASE + (1ULL << 20) + ((u64)function << 12);
-
-    return read32(config + 4) & 0xffff;
+    return read32(wlan_endpoint_config(function) + 4) & 0xffff;
 }
 
 static u32 wlan_pci_identity(u32 function)
 {
-    u64 config = WLAN_ECAM_BASE + (1ULL << 20) + ((u64)function << 12);
+    return read32(wlan_endpoint_config(function));
+}
 
-    return read32(config);
+/*
+ * Prove the endpoint is addressable before believing anything read from it.
+ *
+ * A PCI-to-PCI bridge forwards a configuration request only when the target
+ * bus falls in [secondary, subordinate].  A root port left at
+ * secondary = subordinate = 0 forwards nothing, and every config read of the
+ * endpoint returns 0xffffffff -- indistinguishable, from here, from a missing
+ * or wrong device.  m1n1 used to leave the root ports exactly like that, so
+ * this check reported "function 0 identity 0xffffffff" and the handoff failed
+ * with WLAN_ERR_ENDPOINT_ID even though the silicon was fine and the link was
+ * up.  src/pcie.c now programs the bus numbers on the wireless profile
+ * (pcie_program_bridge_bus_numbers()); this verifies the routing actually
+ * exists so a genuine identity mismatch and an unroutable bus can never again
+ * be confused for each other.
+ */
+static int wlan_check_bus_routing(void)
+{
+    u32 bus_number = read32(WLAN_ROOT_PORT_CONFIG + WLAN_PCI_BRIDGE_BUS_NUMBER);
+    u32 secondary = FIELD_GET(WLAN_PCI_BRIDGE_SECONDARY, bus_number);
+    u32 subordinate = FIELD_GET(WLAN_PCI_BRIDGE_SUBORDINATE, bus_number);
+
+    if (bus_number == 0xffffffffU) {
+        printf("wlan-handoff: APCIE port 0 root port is not responding (bus reg %#x); "
+               "was pcie_init_wireless() called?\n",
+               bus_number);
+        return WLAN_ERR_BUS_ROUTING;
+    }
+    if (secondary != WLAN_ENDPOINT_BUS || subordinate < WLAN_ENDPOINT_BUS) {
+        printf("wlan-handoff: APCIE port 0 does not route bus %u (secondary %u, "
+               "subordinate %u); endpoint config space is unreachable\n",
+               WLAN_ENDPOINT_BUS, secondary, subordinate);
+        return WLAN_ERR_BUS_ROUTING;
+    }
+    return WLAN_HANDOFF_OK;
 }
 
 static int wlan_check_endpoints_quiescent(void)
 {
+    /*
+     * Index is the PCI function number of bus 1 device 0: function 0 is Wi-Fi,
+     * function 1 is the Bluetooth function of the same device.  Both IDs are
+     * little-endian (device << 16) | vendor, i.e. 14e4:4434 and 14e4:5f72.
+     */
     static const u32 expected_identity[2] = {WLAN_WIFI_ID, WLAN_BT_ID};
+    int status = wlan_check_bus_routing();
+
+    if (status)
+        return status;
 
     for (u32 function = 0; function < 2; function++) {
         u32 identity = wlan_pci_identity(function);
@@ -301,6 +363,15 @@ static int wlan_check_endpoints_quiescent(void)
                    identity, expected_identity[function]);
             return WLAN_ERR_ENDPOINT_ID;
         }
+        /*
+         * The quiescence rule is exactly one bit: Bus Master Enable
+         * (COMMAND bit 2) must be clear, because a bus-mastering endpoint can
+         * DMA through SID 1 while this code is rewriting its translation
+         * tables.  Memory/IO decode, assigned BARs, and anything else an
+         * earlier enumerator left behind are all accepted -- command is NOT
+         * required to be zero.  Mu and Windows both enumerate and assign BARs,
+         * and neither sets Bus Master Enable before pci.sys does.
+         */
         if (command & BIT(2)) {
             printf("wlan-handoff: function %u already bus-mastering (cmd %#x)\n", function,
                    command);
