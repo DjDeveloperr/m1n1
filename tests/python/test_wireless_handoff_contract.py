@@ -91,7 +91,14 @@ class WirelessHandoffContractTests(unittest.TestCase):
         self.assertNotIn("0x10022000000ULL", SOURCE)
         self.assertIn("wlan_validate_reservation", SOURCE)
         self.assertIn("cur_boot_args.phys_base + cur_boot_args.mem_size", SOURCE)
-        self.assertIn("ram_base + mem_size_actual", SOURCE)
+        # The physical-memory-top bound now lives in wlan_physical_memory_top();
+        # tests/python/test_wireless_handoff_derivation.py pins the formula and
+        # its agreement with Mu's own derivation.
+        self.assertIn("wlan_physical_memory_top", SOURCE)
+        self.assertIn(
+            "ALIGN_DOWN(cur_boot_args.phys_base, BIT(32)) + mem_size_actual",
+            SOURCE,
+        )
         self.assertIn("base < guest_top + SZ_16K", SOURCE)
         self.assertIn("P_TOP_OF_MEMORY_ALLOC", PROXY_C)
         self.assertIn("top_of_memory_alloc(request->args[0])", PROXY_C)

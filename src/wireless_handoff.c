@@ -13,6 +13,8 @@
 #include "../config.h"
 
 #include "adt.h"
+#include "mcc.h"
+#include "memory.h"
 #include "pcie.h"
 #include "platform_identity.h"
 #include "string.h"
@@ -91,6 +93,9 @@ enum wlan_handoff_error {
     WLAN_ERR_IDENTITY = -12,
     WLAN_ERR_ENDPOINT_ID = -13,
     WLAN_ERR_RESERVATION = -14,
+    WLAN_ERR_RESERVATION_NOT_CANONICAL = -15,
+    WLAN_ERR_RESERVATION_CLAIMED = -16,
+    WLAN_ERR_TABLE_READBACK = -17,
 };
 
 static u64 wlan_dart_regs;
@@ -102,11 +107,144 @@ static u64 wlan_pt_carveout_phys;
 #define WLAN_DESCRIPTOR_PHYS \
     (wlan_pt_carveout_phys + WIRELESS_HANDOFF_V2_DESCRIPTOR_OFFSET)
 
+static u64 wlan_physical_memory_top(void)
+{
+    return ALIGN_DOWN(cur_boot_args.phys_base, BIT(32)) + mem_size_actual;
+}
+
+/*
+ * The single address both sides must agree on, bit for bit.
+ *
+ * This handoff is installed at EL2 before Mu exists, so there is no channel
+ * over which Mu could hand m1n1 a base and none over which m1n1 could hand Mu
+ * one.  Both sides therefore *derive* the same address from the same
+ * boot_args inputs:
+ *
+ *     phys_top = ALIGN_DOWN(boot_args.phys_base, 4 GiB) + mem_size_actual
+ *     base     = ALIGN_DOWN(phys_top - 0x10000, 0x4000)
+ *
+ * Mu's copy of this formula is NtasiDeriveWirelessReservation() in
+ * mu-j414s-windows-unified,
+ * Silicon/Apple/T602XFamilyPkg/Library/MemoryInitPeiLib/MemoryInitPeiLib.c:
+ *
+ *     PhysTop       = (SystemMemoryBase & ~(SIZE_4GB - 1)) + MemSizeActual;
+ *     CandidateBase = (PhysTop - RESERVATION_SIZE) & ~(PAGE_SIZE - 1);
+ *
+ * with SystemMemoryBase/SystemMemorySize taken verbatim from the boot_args
+ * m1n1 hands the guest (EarlySetup(),
+ * Silicon/Apple/AppleSiliconPkg/PrePi/AdtParser.c sets
+ * *SystemMemoryBase = BootArgs->phys_base and *SystemMemorySize =
+ * BootArgs->mem_size) and MemSizeActual read from the same struct.
+ *
+ * The two agree only because ALIGN_DOWN(x, 4 GiB) collapses m1n1's own
+ * phys_base and the hypervisor's rewritten guest phys_base (HV.load_raw()
+ * sets tba.phys_base = u.heap_top) onto the same ram_base.  That is a
+ * property of the current memory layout, not an invariant, so the host side
+ * (proxyclient/m1n1/wireless_handoff.py) computes the derivation from BOTH
+ * structs and refuses to launch if they ever disagree, and this function
+ * refuses any base that is not the canonical one.  A caller that derives the
+ * reservation any other way is rejected outright rather than silently
+ * installing a deny-all domain at an address Mu will never look at.
+ */
+static u64 wlan_canonical_reservation_base(void)
+{
+    u64 physical_top = wlan_physical_memory_top();
+
+    if (physical_top <= WLAN_PT_CARVEOUT_SIZE)
+        return 0;
+
+    return ALIGN_DOWN(physical_top - WLAN_PT_CARVEOUT_SIZE, WLAN_PT_ALIGNMENT);
+}
+
+static bool wlan_ranges_overlap(u64 a_base, u64 a_size, u64 b_base, u64 b_size)
+{
+    if (!a_size || !b_size)
+        return false;
+    return a_base < b_base + b_size && b_base < a_base + a_size;
+}
+
+/*
+ * Prove the agreed address is not already owned by firmware.
+ *
+ * This is the one check Mu structurally cannot perform (see the UNVERIFIED
+ * CAVEAT in NtasiDeriveWirelessReservation()): the TrustZone bounds live in
+ * privileged MCC registers and the firmware-owned DRAM windows live in the
+ * ADT's /defaults pmap-io-ranges, neither of which a guest can read.  m1n1
+ * can read both, so m1n1 is where the derived address gets validated.
+ *
+ * Two classes of claim matter, and both are fatal:
+ *
+ *   - MCC TZ carveouts.  mcc_unmap_carveouts() removes these from m1n1's own
+ *     page tables, so a memset() into one is a data abort at EL2 with no
+ *     console recovery -- exactly the silent-hang class this project keeps
+ *     eliminating.
+ *   - pmap-io-ranges entries.  Those windows stay mapped (some as Normal-NC),
+ *     so a write there succeeds and silently corrupts live firmware state.
+ *     Measured on J414s: eight such windows sit in the top 4 MiB of DRAM,
+ *     the highest ending at 0x103fffbc000, and one of them holds the disp0
+ *     DART's real-time L1 table.
+ *
+ * Fails closed when the evidence is missing: if MCC never enumerated a
+ * carveout, or /defaults has no pmap-io-ranges, this code cannot prove the
+ * range is free and must not write to it.
+ */
+static bool wlan_range_is_claimed(u64 base, u64 size)
+{
+    const u32 *ranges;
+    u32 length = 0;
+    int node;
+
+    if (mcc_carveout_count == 0) {
+        printf("wlan-handoff: no MCC carveouts enumerated; cannot prove %#llx+%#llx is free\n",
+               (unsigned long long)base, (unsigned long long)size);
+        return true;
+    }
+
+    for (size_t index = 0; index < mcc_carveout_count; index++) {
+        if (wlan_ranges_overlap(base, size, mcc_carveouts[index].base,
+                                mcc_carveouts[index].size)) {
+            printf("wlan-handoff: reservation %#llx+%#llx overlaps TZ carveout %#llx+%#llx\n",
+                   (unsigned long long)base, (unsigned long long)size,
+                   (unsigned long long)mcc_carveouts[index].base,
+                   (unsigned long long)mcc_carveouts[index].size);
+            return true;
+        }
+    }
+
+    node = adt_path_offset(adt, "/defaults");
+    if (node < 0) {
+        printf("wlan-handoff: no /defaults node; cannot prove %#llx+%#llx is free\n",
+               (unsigned long long)base, (unsigned long long)size);
+        return true;
+    }
+    ranges = adt_getprop(adt, node, "pmap-io-ranges", &length);
+    if (!ranges || length < 24) {
+        printf("wlan-handoff: no pmap-io-ranges; cannot prove %#llx+%#llx is free\n",
+               (unsigned long long)base, (unsigned long long)size);
+        return true;
+    }
+
+    /* Six u32 per entry: base_lo, base_hi, size_lo, size_hi, flags, unused. */
+    for (u32 entry = 0; (entry + 6) * 4 <= length; entry += 6) {
+        u64 range_base = ranges[entry] | ((u64)ranges[entry + 1] << 32);
+        u64 range_size = ranges[entry + 2] | ((u64)ranges[entry + 3] << 32);
+
+        if (wlan_ranges_overlap(base, size, range_base, range_size)) {
+            printf("wlan-handoff: reservation %#llx+%#llx overlaps firmware range %#llx+%#llx\n",
+                   (unsigned long long)base, (unsigned long long)size,
+                   (unsigned long long)range_base, (unsigned long long)range_size);
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static int wlan_validate_reservation(u64 base, u64 size)
 {
-    u64 ram_base = ALIGN_DOWN(cur_boot_args.phys_base, BIT(32));
-    u64 physical_top = ram_base + mem_size_actual;
+    u64 physical_top = wlan_physical_memory_top();
     u64 guest_top = cur_boot_args.phys_base + cur_boot_args.mem_size;
+    u64 canonical = wlan_canonical_reservation_base();
 
     if (size != WLAN_PT_CARVEOUT_SIZE || (base & (WLAN_PT_ALIGNMENT - 1)) ||
         base > ~0ULL - size)
@@ -119,6 +257,19 @@ static int wlan_validate_reservation(u64 base, u64 size)
      */
     if (base < guest_top + SZ_16K || base + size > physical_top)
         return WLAN_ERR_RESERVATION;
+
+    if (!canonical || base != canonical) {
+        printf("wlan-handoff: reservation %#llx is not the canonical derivation %#llx "
+               "(phys_base %#llx, mem_size_actual %#llx, phys_top %#llx); Mu would look "
+               "elsewhere\n",
+               (unsigned long long)base, (unsigned long long)canonical,
+               (unsigned long long)cur_boot_args.phys_base, (unsigned long long)mem_size_actual,
+               (unsigned long long)physical_top);
+        return WLAN_ERR_RESERVATION_NOT_CANONICAL;
+    }
+
+    if (wlan_range_is_claimed(base, size))
+        return WLAN_ERR_RESERVATION_CLAIMED;
 
     return WLAN_HANDOFF_OK;
 }
@@ -242,15 +393,64 @@ static u32 wlan_encode_ttbr(u64 physical)
            FIELD_PREP(WLAN_DART_TTBR_ADDR, physical >> WLAN_DART_TTBR_SHIFT);
 }
 
-static void wlan_build_tables(void)
+/*
+ * Push a just-written reservation range all the way out to DRAM.
+ *
+ * dma_wmb() ("dmb oshst") is an ORDERING barrier and nothing more: it never
+ * moves a dirty line out of the CPU's caches.  m1n1 maps this DRAM as
+ * MAIR_IDX_NORMAL write-back (mmu_add_default_mappings() identity-maps
+ * ram_base..ram_base+mem_size_actual), so every store below lands in the data
+ * cache and, with only a dmb, may stay there indefinitely.
+ *
+ * That is fatal for this specific consumer.  Mu validates the descriptor from
+ * MemoryInitPeiLib's NtasiValidateWirelessHandoffV2() -- which runs BEFORE
+ * ArmConfigureMmu(), i.e. with SCTLR_EL1.M clear, so all of its loads are
+ * Device-nGnRnE, bypass the data cache entirely and see raw DRAM.  Dirty lines
+ * in m1n1's cache are invisible to it: it reads zeroes and withholds wireless.
+ *
+ * Clean AND invalidate to the Point of Coherency (not just clean) is
+ * deliberate.  It leaves nothing cached, so the read-back verification and CRC
+ * computations that follow necessarily re-fetch from DRAM -- a successful
+ * validation then proves the bytes really landed there rather than proving
+ * m1n1 can read its own cache.
+ *
+ * The trailing "dsb sy" is required: CACHE_RANGE_OP() in src/memory.c issues
+ * the "dc civac" loop with no completion barrier of its own.
+ */
+static void wlan_publish_range(u64 address, size_t length)
 {
-    u64 *l1 = (u64 *)WLAN_PT_L1_PHYS;
-    u64 *msi_l2 = (u64 *)WLAN_PT_MSI_L2_PHYS;
+    sysop("dsb ish");
+    dc_civac_range((void *)address, length);
+    sysop("dsb sy");
+}
+
+static int wlan_build_tables(void)
+{
+    volatile u64 *l1 = (volatile u64 *)WLAN_PT_L1_PHYS;
+    volatile u64 *msi_l2 = (volatile u64 *)WLAN_PT_MSI_L2_PHYS;
+    u64 expected_l1 = wlan_encode_pte(WLAN_PT_MSI_L2_PHYS);
+    u64 expected_msi_l2 = wlan_encode_pte(WLAN_MSI_DOORBELL_PAGE);
 
     memset((void *)wlan_pt_carveout_phys, 0, WLAN_PT_CARVEOUT_SIZE);
-    msi_l2[WLAN_MSI_L2_INDEX] = wlan_encode_pte(WLAN_MSI_DOORBELL_PAGE);
-    l1[WLAN_MSI_L1_INDEX] = wlan_encode_pte(WLAN_PT_MSI_L2_PHYS);
-    dma_wmb();
+    msi_l2[WLAN_MSI_L2_INDEX] = expected_msi_l2;
+    l1[WLAN_MSI_L1_INDEX] = expected_l1;
+
+    /*
+     * The whole 64 KiB, not just the two live PTEs: the all-zero client L2
+     * page and the descriptor page's zero padding are both read back by
+     * AppleDart.sys, and the two table pages are CRC-covered in full.
+     */
+    wlan_publish_range(wlan_pt_carveout_phys, WLAN_PT_CARVEOUT_SIZE);
+
+    if (l1[WLAN_MSI_L1_INDEX] != expected_l1 || msi_l2[WLAN_MSI_L2_INDEX] != expected_msi_l2 ||
+        l1[0] != 0 || msi_l2[0] != 0) {
+        printf("wlan-handoff: table read-back from DRAM failed (l1[%d]=%#llx msi_l2[%d]=%#llx)\n",
+               WLAN_MSI_L1_INDEX, (unsigned long long)l1[WLAN_MSI_L1_INDEX], WLAN_MSI_L2_INDEX,
+               (unsigned long long)msi_l2[WLAN_MSI_L2_INDEX]);
+        return WLAN_ERR_TABLE_READBACK;
+    }
+
+    return WLAN_HANDOFF_OK;
 }
 
 static int wlan_publish_descriptor(u64 reservation_size)
@@ -265,14 +465,24 @@ static int wlan_publish_descriptor(u64 reservation_size)
         .reservation_base = wlan_pt_carveout_phys,
         .reservation_size = reservation_size,
         .guest_memory_top = cur_boot_args.phys_base + cur_boot_args.mem_size,
-        .physical_memory_top = ALIGN_DOWN(cur_boot_args.phys_base, BIT(32)) +
-                               mem_size_actual,
+        .physical_memory_top = wlan_physical_memory_top(),
         .dart_base = WLAN_DART0_BASE,
         .l1_physical = WLAN_PT_L1_PHYS,
         .msi_l2_physical = WLAN_PT_MSI_L2_PHYS,
         .descriptor_physical = WLAN_DESCRIPTOR_PHYS,
     };
 
+    /*
+     * CRC byte ranges, exactly as docs/apple-bcm-wireless-dart-handoff-abi-spec.md
+     * specifies and as Mu's NtasiValidateWirelessHandoffV2() recomputes them:
+     *   l1_crc32       reservation + 0x0000, 0x4000 bytes (the whole L1 page)
+     *   msi_l2_crc32   reservation + 0x4000, 0x4000 bytes (the whole MSI L2 page)
+     *   descriptor_crc32  all 96 descriptor bytes with descriptor_crc32 itself
+     *                     zeroed in place -- the field is not excluded from the
+     *                     length.
+     * Both table pages were already cleaned to DRAM by wlan_build_tables(), so
+     * these reads observe the same bytes Mu and Windows will.
+     */
     descriptor.l1_crc32 = wireless_handoff_v2_crc32(
         (const void *)WLAN_PT_L1_PHYS, WIRELESS_HANDOFF_V2_PAGE_SIZE);
     descriptor.msi_l2_crc32 = wireless_handoff_v2_crc32(
@@ -281,7 +491,13 @@ static int wlan_publish_descriptor(u64 reservation_size)
     descriptor.descriptor_crc32 = wireless_handoff_v2_crc32(
         &descriptor, sizeof(descriptor));
     memcpy((void *)WLAN_DESCRIPTOR_PHYS, &descriptor, sizeof(descriptor));
-    dma_wmb();
+    /*
+     * The whole descriptor page, so the CRC-covered struct and the zero
+     * padding behind it reach DRAM together.  The validation immediately below
+     * then reads the descriptor back out of DRAM, not out of the cache.
+     */
+    wlan_publish_range(wlan_pt_carveout_phys + WIRELESS_HANDOFF_V2_DESCRIPTOR_OFFSET,
+                       WIRELESS_HANDOFF_V2_PAGE_SIZE);
     return wireless_handoff_v2_descriptor_validate(
         (const void *)WLAN_DESCRIPTOR_PHYS,
         (const void *)wlan_pt_carveout_phys,
@@ -375,7 +591,10 @@ int wireless_handoff_init(u64 reservation_base, u64 reservation_size)
     if (status)
         return status;
 
-    wlan_build_tables();
+    status = wlan_build_tables();
+    if (status)
+        return status;
+
     wlan_wrote_dart = true;
     write32(wlan_dart_regs + WLAN_DART_TCR(WLAN_SID), 0);
     write32(wlan_dart_regs + WLAN_DART_TTBR(WLAN_SID), 0);
@@ -415,6 +634,11 @@ int wireless_handoff_init(u64 reservation_base, u64 reservation_size)
            (unsigned long long)WLAN_DESCRIPTOR_PHYS,
            (unsigned long long)wlan_pt_carveout_phys, (unsigned long long)reservation_size,
            (unsigned long long)WLAN_PT_L1_PHYS, (unsigned long long)WLAN_PT_MSI_L2_PHYS);
+    printf("wlan-handoff: canonical derivation confirmed (phys_top %#llx, guest_top %#llx); "
+           "Mu must derive %#llx\n",
+           (unsigned long long)wlan_physical_memory_top(),
+           (unsigned long long)(cur_boot_args.phys_base + cur_boot_args.mem_size),
+           (unsigned long long)wlan_canonical_reservation_base());
     return WLAN_HANDOFF_OK;
 
 fail:
