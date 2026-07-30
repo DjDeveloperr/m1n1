@@ -399,6 +399,138 @@ void pcie_perst_delays_from_adt(struct pcie_perst_delays *out, bool have_refclk_
         pcie_clamp_u32(config_us, PCIE_PERST_TO_CONFIG_MIN_US, PCIE_PERST_TO_CONFIG_MAX_US);
 }
 
+/*
+ * Power-rail ownership.
+ *
+ * A port's rail is never declared on the bridge itself.  It lives on whatever
+ * node claims that bridge via a `function-pcie_port_control*` property whose
+ * first argument is the bridge's own AAPL,phandle.  On J414s:
+ *
+ *   /arm-io/apcie/pci-bridge1/pcie-sdreader
+ *       function-pcie_port_control_sd -> args[0] = 101 = pci-bridge1
+ *       function-sd_pwr_en            -> SMC key "gP16", mode word 0
+ *   /amfm                                (top level, NOT under apcie)
+ *       function-pcie_port_control    -> args[0] = 98  = pci-bridge0
+ *       function-reg_on               -> SMC key "gP0d", mode word 0x800000
+ *
+ * Both verified live against the J414s ADT.  Note the WiFi/BT owner is not a
+ * descendant of the bridge at all, which is why a child-only search finds the
+ * SD rail and silently misses the wireless one.
+ */
+static const char *const pcie_port_control_props[] = {
+    "function-pcie_port_control",
+    "function-pcie_port_control_sd",
+};
+
+/* Rail property names, tried in order on a resolved owner node. */
+static const char *const pcie_port_rail_names[] = {
+    "reg_on",
+    "sd_pwr_en",
+    "pwr_en",
+};
+
+static bool pcie_node_controls_bridge(int node, u32 bridge_phandle)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(pcie_port_control_props); i++) {
+        struct apple_gpio_function fn;
+        const void *value;
+        u32 len = 0;
+
+        value = adt_getprop(adt, node, pcie_port_control_props[i], &len);
+        if (!value || !len)
+            continue;
+        if (apple_gpio_parse_function(value, len, &fn) < 0)
+            continue;
+        /* args[0] lands in fn.pin for this record shape. */
+        if (fn.pin == bridge_phandle)
+            return true;
+    }
+
+    return false;
+}
+
+static int pcie_find_rail_owner(int node, u32 bridge_phandle)
+{
+    int child_count, child;
+
+    if (bridge_phandle == 0)
+        return -1;
+
+    if (pcie_node_controls_bridge(node, bridge_phandle))
+        return node;
+
+    child_count = adt_get_child_count(adt, node);
+    child = adt_first_child_offset(adt, node);
+    while (child_count-- > 0 && child > 0) {
+        int found = pcie_find_rail_owner(child, bridge_phandle);
+
+        if (found >= 0)
+            return found;
+        child = adt_next_sibling_offset(adt, child);
+    }
+
+    return -1;
+}
+
+/*
+ * Raise a port's power rail, if it has one.  Returns true when a rail was
+ * actually driven, so the caller knows whether Tpvperl applies.
+ *
+ * Best-effort throughout: no owner, no rail, an unresolvable key or a dead SMC
+ * all log and continue.  A wrong or missing rail must degrade a device, never
+ * refuse the boot.
+ */
+static bool pcie_enable_port_rail(int bridge_offset, int port)
+{
+    u32 bridge_phandle = 0;
+    int owner;
+
+    if (ADT_GETPROP(adt, bridge_offset, "AAPL,phandle", &bridge_phandle) < 0)
+        return false;
+
+    owner = pcie_find_rail_owner(0, bridge_phandle);
+    if (owner < 0)
+        return false;
+
+    for (size_t i = 0; i < ARRAY_SIZE(pcie_port_rail_names); i++) {
+        struct apple_smc_rail rail = {0};
+        smc_dev_t *smc;
+        u32 value;
+
+        if (apple_smc_resolve_function(owner, pcie_port_rail_names[i], &rail) != 0 || !rail.valid)
+            continue;
+
+        smc = smc_init();
+        if (!smc) {
+            printf("pcie: Port %d rail %s: SMC unavailable\n", port, pcie_port_rail_names[i]);
+            return false;
+        }
+
+        /*
+         * CMD_OUTPUT | level, never the ADT's own mode word ORed with the
+         * level.  src/dcp.c does the latter and it happens to work for the
+         * HDMI rails because their mode word is 0x800000, but the SD rail's is
+         * 0 -- `mode | 1` would write a bare 0x1 (CMD_ACTION) and drive
+         * nothing.  CMD_OUTPUT is verified against SMCG.asl's published
+         * ntasp,smc-gpio-cmd-output and proven on hardware for "gP16".
+         */
+        value = APPLE_SMC_GPIO_CMD_OUTPUT | 1;
+        if (smc_write_u32(smc, rail.key, value) < 0) {
+            printf("pcie: Port %d rail %s write failed (key %#x)\n", port, pcie_port_rail_names[i],
+                   rail.key);
+            smc_shutdown(smc);
+            return false;
+        }
+
+        printf("pcie: Port %d rail %s enabled (SMC key %#x <- %#x)\n", port,
+               pcie_port_rail_names[i], rail.key, value);
+        smc_shutdown(smc);
+        return true;
+    }
+
+    return false;
+}
+
 static bool pcie_bringup_ops_valid(const struct pcie_port_bringup_ops *ops,
                                    const struct pcie_port_bringup *cfg)
 {
@@ -1241,45 +1373,13 @@ static int pcie_init_controller(int controller, const char *path, u32 allowed_po
          * dead SMC logs and continues.  A port whose link is already up is left
          * alone entirely -- never power-cycle a working device.
          */
-        if (!bringup.link_was_up) {
-            /*
-             * Bounded by adt_get_child_count(): a bare adt_next_sibling_offset()
-             * loop does NOT stop at the end of this node's children and walks on
-             * into unrelated subtrees, which made port 0 pick up the SD reader's
-             * rail from under pci-bridge1.  ADT_FOREACH_CHILD exists for exactly
-             * this reason; it reassigns its loop variable, so iterate by hand
-             * over a local rather than clobbering bridge_offset.
-             */
-            int child_count = adt_get_child_count(adt, bridge_offset);
-            int child = adt_first_child_offset(adt, bridge_offset);
-
-            while (child_count-- > 0 && child > 0) {
-                struct apple_smc_rail rail = {0};
-
-                if (apple_smc_resolve_function(child, "sd_pwr_en", &rail) == 0 && rail.valid) {
-                    smc_dev_t *smc = smc_init();
-
-                    if (!smc) {
-                        printf("pcie: Port %d power rail %.4s: SMC unavailable\n", port,
-                               (const char *)&rail.key);
-                    } else {
-                        u32 value = APPLE_SMC_GPIO_CMD_OUTPUT | 1;
-
-                        if (smc_write_u32(smc, rail.key, value) < 0)
-                            printf("pcie: Port %d power rail write failed (key %#x)\n", port,
-                                   rail.key);
-                        else
-                            printf("pcie: Port %d power rail enabled (SMC key %#x <- %#x)\n", port,
-                                   rail.key, value);
-                        smc_shutdown(smc);
-                        /* Tpvperl: power valid -> PERST# inactive. */
-                        udelay(PCIE_PWREN_TO_PERST_US);
-                    }
-                }
-
-                child = adt_next_sibling_offset(adt, child);
-            }
-        }
+        /*
+         * Raise this port's power rail while PERST# is still asserted, then let
+         * Tpvperl settle before it is released.  A port whose link is already
+         * up is left alone -- never power-cycle a working device.
+         */
+        if (!bringup.link_was_up && pcie_enable_port_rail(bridge_offset, port))
+            udelay(PCIE_PWREN_TO_PERST_US);
 
         /*
          * APPCLK on, PERST# asserted before the clocks, refclk request/ack,
