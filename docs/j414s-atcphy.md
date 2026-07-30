@@ -866,3 +866,35 @@ dump` (read-only) from the resident proxy after Windows is up.
 6. Revert path if 0x144 recurs: `disarm` + reboot restores today's
    behaviour exactly (nothing armed = boot chain unchanged); `power-off`
    + `usb3` re-apply is the in-session recovery.
+
+### 13.5 Launcher-path integration (the latch alone was not enough)
+
+Two follow-ups from the coordinator's session, recorded here:
+
+- **Tunables fully settled (grade A):** `atcphy_probe.py tunables` on the
+  real port 2 showed every blob present AND non-empty (e.g.
+  `USB_LN0/1_AUSPMA_RX_TOP` 228 B = 19 records, `RX_SHM` 120 B = 10,
+  `RX_EQ` 60 B = 5, `TX_TOP` 96 B = 8, `USB_ACIOPHY_TOP` 36 B = 3, plus
+  the full CIO and DP sets). The empty-blob caveat from 13.1 is dead:
+  the validated USB3 bring-up applied genuine calibration records.
+- **The Windows launcher reboots the target and RAM-chainloads a fresh
+  m1n1**, so a latch armed from a standalone proxy session is destroyed
+  before the boot that matters. And the launcher's debug module
+  (`apple_silicon_nt_drivers:tools/m1n1-windows-debug.py`) is loaded by
+  run_guest **after hv.init()** -- i.e. after usb_phy_handoff_host has
+  already parked the mux on DUMMY -- so even arming from that module
+  would miss the current boot's handoff. The module therefore now does a
+  **direct apply** in its load window (post-handoff, pre-hv.start():
+  dwc3 freshly reset, no guest driver bound -- the same conditions sec
+  6's gate requires), plus arms the latch belt-and-braces for any later
+  handoff re-run. Env-gated: `NTASI_ATCPHY_ARM_GUEST_USB3=1` (default
+  0; any other value refuses the launch; a missing driver or failed
+  apply hard-fails the launch rather than booting with an undefined
+  PIPE backend). Orientation fixed not-flipped, matching the validated
+  run.
+
+The in-m1n1 arm/re-apply latch (13.3) remains correct and useful for any
+path where m1n1 survives into hv_init with the latch set (e.g. a proxy
+session that arms and then starts a guest in the same instance); the
+launcher path simply cannot be that path, which is why both mechanisms
+exist.
