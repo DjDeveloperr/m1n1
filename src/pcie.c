@@ -1242,9 +1242,18 @@ static int pcie_init_controller(int controller, const char *path, u32 allowed_po
          * alone entirely -- never power-cycle a working device.
          */
         if (!bringup.link_was_up) {
+            /*
+             * Bounded by adt_get_child_count(): a bare adt_next_sibling_offset()
+             * loop does NOT stop at the end of this node's children and walks on
+             * into unrelated subtrees, which made port 0 pick up the SD reader's
+             * rail from under pci-bridge1.  ADT_FOREACH_CHILD exists for exactly
+             * this reason; it reassigns its loop variable, so iterate by hand
+             * over a local rather than clobbering bridge_offset.
+             */
+            int child_count = adt_get_child_count(adt, bridge_offset);
             int child = adt_first_child_offset(adt, bridge_offset);
 
-            while (child > 0) {
+            while (child_count-- > 0 && child > 0) {
                 struct apple_smc_rail rail = {0};
 
                 if (apple_smc_resolve_function(child, "sd_pwr_en", &rail) == 0 && rail.valid) {
