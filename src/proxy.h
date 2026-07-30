@@ -187,6 +187,12 @@ typedef enum {
     P_HV_MAP_TPM = 0x1400,
 
     P_CPUFREQ_INIT = 0x1300,
+
+    // Apple Type-C PHY (T6020); keep in sync with proxyclient/m1n1/atcphy.py
+    P_ATCPHY_APPLY_MODE = 0x1500,
+    P_ATCPHY_SET_ORIENTATION,
+    P_ATCPHY_POWER_OFF,
+    P_ATCPHY_GET_REG_BASE,
 } ProxyOp;
 
 #define S_OK     0

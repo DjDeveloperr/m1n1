@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 
 #include "proxy.h"
+#include "atcphy.h"
 #include "cpufreq.h"
 #include "dapf.h"
 #include "dart.h"
@@ -667,6 +668,24 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
 
         case P_CPUFREQ_INIT:
             reply->retval = cpufreq_init();
+            break;
+
+        case P_ATCPHY_APPLY_MODE:
+            reply->retval =
+                (u64)(s64)atcphy_apply_mode(request->args[0], (atcphy_mode_t)request->args[1],
+                                            request->args[2] != 0, request->args[3] != 0,
+                                            request->args[4] != 0,
+                                            (atcphy_dp_rate_t)request->args[5]);
+            break;
+        case P_ATCPHY_SET_ORIENTATION:
+            reply->retval =
+                (u64)(s64)atcphy_set_orientation(request->args[0], request->args[1] != 0);
+            break;
+        case P_ATCPHY_POWER_OFF:
+            reply->retval = (u64)(s64)atcphy_power_off(request->args[0]);
+            break;
+        case P_ATCPHY_GET_REG_BASE:
+            reply->retval = atcphy_reg_base(request->args[0], request->args[1]);
             break;
 
         default:

@@ -69,3 +69,8 @@ jobs:
         env:
           CC: cc
         run: sh tests/pcie/run-host-tests.sh
+
+      - name: Run T6020 ATCPHY host tests
+        env:
+          CC: cc
+        run: sh tests/atcphy/run-host-tests.sh
