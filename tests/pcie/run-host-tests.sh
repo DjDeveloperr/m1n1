@@ -30,6 +30,24 @@ ASAN_OPTIONS=detect_leaks=0 "$build_dir/test_t602x_bcm4388-sanitized"
 
 "$cc" $common_flags \
     -DPCIE_T602X_WIRELESS_HOST_TEST=1 \
+    -I"$repo_dir/src" \
+    "$repo_dir/src/pcie.c" \
+    "$repo_dir/tests/pcie/test_port_bringup.c" \
+    -o "$build_dir/test_port_bringup"
+"$build_dir/test_port_bringup"
+
+"$cc" $common_flags \
+    -DPCIE_T602X_WIRELESS_HOST_TEST=1 \
+    -fsanitize=address,undefined \
+    -fno-omit-frame-pointer \
+    -I"$repo_dir/src" \
+    "$repo_dir/src/pcie.c" \
+    "$repo_dir/tests/pcie/test_port_bringup.c" \
+    -o "$build_dir/test_port_bringup-sanitized"
+ASAN_OPTIONS=detect_leaks=0 "$build_dir/test_port_bringup-sanitized"
+
+"$cc" $common_flags \
+    -DPCIE_T602X_WIRELESS_HOST_TEST=1 \
     -DBCM4388_HANDOFF_HOST_TEST=1 \
     -I"$repo_dir/src" \
     "$repo_dir/src/pcie.c" \

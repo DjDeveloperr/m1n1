@@ -4,6 +4,7 @@
 
 #ifndef PCIE_T602X_WIRELESS_HOST_TEST
 #include "adt.h"
+#include "gpio.h"
 #include "platform_identity.h"
 #include "pmgr.h"
 #include "string.h"
@@ -361,6 +362,149 @@ int pcie_t602x_bcm4388_setup_port0(const struct pcie_t602x_mmio_ops *ops, void *
     return rollback_error ? rollback_error : ret;
 }
 
+static u32 pcie_clamp_u32(u32 value, u32 min, u32 max)
+{
+    if (value < min)
+        return min;
+    if (value > max)
+        return max;
+    return value;
+}
+
+void pcie_perst_delays_from_adt(struct pcie_perst_delays *out, bool have_refclk_to_perst,
+                                u32 refclk_to_perst, bool have_perst_to_config, u32 perst_to_config)
+{
+    u32 refclk_us = PCIE_PERST_REFCLK_TO_PERST_MIN_US;
+    u32 config_us = PCIE_PERST_TO_CONFIG_MIN_US;
+
+    if (!out)
+        return;
+
+    /* t-refclk-to-perst is microseconds; see the unit derivation in pcie.h. */
+    if (have_refclk_to_perst)
+        refclk_us = refclk_to_perst;
+
+    /* perst-to-config is milliseconds; guard the scale against overflow. */
+    if (have_perst_to_config) {
+        if (perst_to_config > PCIE_PERST_TO_CONFIG_MAX_US / 1000)
+            config_us = PCIE_PERST_TO_CONFIG_MAX_US;
+        else
+            config_us = perst_to_config * 1000;
+    }
+
+    out->refclk_to_perst_us = pcie_clamp_u32(refclk_us, PCIE_PERST_REFCLK_TO_PERST_MIN_US,
+                                             PCIE_PERST_REFCLK_TO_PERST_MAX_US);
+    out->perst_to_config_us =
+        pcie_clamp_u32(config_us, PCIE_PERST_TO_CONFIG_MIN_US, PCIE_PERST_TO_CONFIG_MAX_US);
+}
+
+static bool pcie_bringup_ops_valid(const struct pcie_port_bringup_ops *ops,
+                                   const struct pcie_port_bringup *cfg)
+{
+    if (!ops || !cfg)
+        return false;
+    if (!ops->read32 || !ops->write32 || !ops->set32 || !ops->clear32 || !ops->poll32 ||
+        !ops->delay_us)
+        return false;
+    if (cfg->have_perst_gpio && !ops->perst_set)
+        return false;
+    return true;
+}
+
+int pcie_port_release_perst(const struct pcie_port_bringup_ops *ops, void *context,
+                            const struct pcie_port_bringup *cfg)
+{
+    bool drive_perst;
+
+    if (!pcie_bringup_ops_valid(ops, cfg))
+        return PCIE_PORT_BRINGUP_ERR_INVALID_ARGUMENT;
+
+    /*
+     * Never reset a port whose link someone else already brought up, and never
+     * touch a pad we could not resolve.
+     */
+    drive_perst = cfg->have_perst_gpio && !cfg->link_was_up;
+
+    if (ops->set32(context, cfg->port_base + PCIE_PORT_APPCLK, PCIE_PORT_APPCLK_EN))
+        return PCIE_PORT_BRINGUP_ERR_APPCLK;
+
+    /*
+     * Assert PERST# before the clocks come up.  apple_pcie_setup_link() takes
+     * the pad as GPIOD_OUT_HIGH (logical asserted) for exactly this reason:
+     * "The Aquantia AQC113 10GB nic used desktop macs is sensitive to
+     * deasserting it without prior clock setup."
+     */
+    if (drive_perst && ops->perst_set(context, true))
+        return PCIE_PORT_BRINGUP_ERR_PERST_ASSERT;
+
+    if (cfg->port_phy_base) {
+        u64 lane_cfg = cfg->port_phy_base + PCIE_PHY_LANE_CFG;
+
+        if (ops->clear32(context, lane_cfg,
+                         PCIE_PHY_LANE_CFG_REFCLK0REQ | PCIE_PHY_LANE_CFG_REFCLK1REQ))
+            return PCIE_PORT_BRINGUP_ERR_PHY_REQ;
+
+        if (ops->set32(context, lane_cfg, PCIE_PHY_LANE_CFG_REFCLK0REQ))
+            return PCIE_PORT_BRINGUP_ERR_PHY_REQ;
+        if (ops->poll32(context, lane_cfg, PCIE_PHY_LANE_CFG_REFCLK0ACK,
+                        PCIE_PHY_LANE_CFG_REFCLK0ACK, cfg->phy_ack_timeout_us))
+            return PCIE_PORT_BRINGUP_ERR_PHY_CLK0_ACK;
+
+        if (ops->set32(context, lane_cfg, PCIE_PHY_LANE_CFG_REFCLK1REQ))
+            return PCIE_PORT_BRINGUP_ERR_PHY_REQ;
+        if (ops->poll32(context, lane_cfg, PCIE_PHY_LANE_CFG_REFCLK1ACK,
+                        PCIE_PHY_LANE_CFG_REFCLK1ACK, cfg->phy_ack_timeout_us))
+            return PCIE_PORT_BRINGUP_ERR_PHY_CLK1_ACK;
+
+        if (ops->clear32(context, lane_cfg, PCIE_PHY_LANE_CFG_UNK14))
+            return PCIE_PORT_BRINGUP_ERR_REFCLK_EN;
+        if (ops->set32(context, lane_cfg, PCIE_PHY_LANE_CFG_REFCLKEN0))
+            return PCIE_PORT_BRINGUP_ERR_REFCLK_EN;
+        if (ops->set32(context, lane_cfg, PCIE_PHY_LANE_CFG_REFCLKEN1))
+            return PCIE_PORT_BRINGUP_ERR_REFCLK_EN;
+    }
+
+    /* Tperst-clk: stable reference clock -> PERST# deassertion. */
+    ops->delay_us(context, cfg->delays.refclk_to_perst_us);
+
+    if (ops->set32(context, cfg->port_base + cfg->perst_reg, PCIE_PORT_PERST_OFF))
+        return PCIE_PORT_BRINGUP_ERR_PERST_RELEASE_REG;
+
+    if (drive_perst && ops->perst_set(context, false))
+        return PCIE_PORT_BRINGUP_ERR_PERST_RELEASE_GPIO;
+
+    return PCIE_PORT_BRINGUP_OK;
+}
+
+int pcie_port_start_link(const struct pcie_port_bringup_ops *ops, void *context,
+                         const struct pcie_port_bringup *cfg)
+{
+    u32 link_status = 0;
+
+    if (!pcie_bringup_ops_valid(ops, cfg))
+        return PCIE_PORT_BRINGUP_ERR_INVALID_ARGUMENT;
+
+    if (cfg->port_phy_base &&
+        ops->set32(context, cfg->port_phy_base + PCIE_PHY_LANE_CFG, PCIE_PHY_LANE_CFG_REFCLKCGEN))
+        return PCIE_PORT_BRINGUP_ERR_REFCLK_CGEN;
+
+    if (ops->read32(context, cfg->port_base + PCIE_PORT_LINKSTS, &link_status))
+        return PCIE_PORT_BRINGUP_ERR_LINK_DOWN;
+
+    /* Already trained: leave LTSSM alone, exactly as apple_pcie_setup_port() does. */
+    if (link_status & PCIE_PORT_LINKSTS_UP)
+        return PCIE_PORT_BRINGUP_OK;
+
+    if (ops->write32(context, cfg->port_base + PCIE_PORT_LTSSMCTL, PCIE_PORT_LTSSMCTL_START))
+        return PCIE_PORT_BRINGUP_ERR_LTSSM_START;
+
+    if (ops->poll32(context, cfg->port_base + PCIE_PORT_LINKSTS, PCIE_PORT_LINKSTS_UP,
+                    PCIE_PORT_LINKSTS_UP, cfg->link_up_timeout_us))
+        return PCIE_PORT_BRINGUP_ERR_LINK_DOWN;
+
+    return PCIE_PORT_BRINGUP_OK;
+}
+
 #ifndef PCIE_T602X_WIRELESS_HOST_TEST
 
 /*
@@ -555,12 +699,78 @@ struct state {
     u64 port_ltssm_base[8];
     u64 port_phy_base[8];
     u64 port_intr2axi_base[8];
+    struct apple_gpio_pin port_perst_gpio[8];
     const struct reg_info *pcie_regs;
     u32 initialized_port_mask;
     bool initialized;
 };
 
 static struct state controllers[NUM_CONTROLLERS];
+
+/*
+ * Hardware backing for the bring-up sequence.  `context` is the resolved
+ * PERST# pad; it is only dereferenced when the sequence was told the pad
+ * resolved (have_perst_gpio), and apple_gpio_set_output() rejects an
+ * unresolved pin anyway.
+ */
+static int pcie_hw_read32(void *context, u64 address, u32 *value)
+{
+    UNUSED(context);
+    *value = read32(address);
+    return 0;
+}
+
+static int pcie_hw_write32(void *context, u64 address, u32 value)
+{
+    UNUSED(context);
+    write32(address, value);
+    return 0;
+}
+
+static int pcie_hw_set32(void *context, u64 address, u32 set)
+{
+    UNUSED(context);
+    set32(address, set);
+    return 0;
+}
+
+static int pcie_hw_clear32(void *context, u64 address, u32 clear)
+{
+    UNUSED(context);
+    clear32(address, clear);
+    return 0;
+}
+
+static int pcie_hw_poll32(void *context, u64 address, u32 mask, u32 target, u32 timeout_us)
+{
+    UNUSED(context);
+    return poll32(address, mask, target, timeout_us);
+}
+
+static void pcie_hw_delay_us(void *context, u32 us)
+{
+    UNUSED(context);
+    udelay(us);
+}
+
+static int pcie_hw_perst_set(void *context, bool asserted)
+{
+    /*
+     * PERST# is active low (reset-gpios = <&pinctrl_ap N GPIO_ACTIVE_LOW>), so
+     * asserting reset drives the pad to 0 and releasing drives it to 1.
+     */
+    return apple_gpio_set_output((const struct apple_gpio_pin *)context, !asserted);
+}
+
+static const struct pcie_port_bringup_ops pcie_hw_bringup_ops = {
+    .read32 = pcie_hw_read32,
+    .write32 = pcie_hw_write32,
+    .set32 = pcie_hw_set32,
+    .clear32 = pcie_hw_clear32,
+    .poll32 = pcie_hw_poll32,
+    .delay_us = pcie_hw_delay_us,
+    .perst_set = pcie_hw_perst_set,
+};
 
 static int pcie_init_controller(int controller, const char *path, u32 allowed_port_mask,
                                 bool require_link_up)
@@ -575,6 +785,7 @@ static int pcie_init_controller(int controller, const char *path, u32 allowed_po
     state->initialized = false;
     state->initialized_port_mask = 0;
     state->num_phys = 1;
+    memset(state->port_perst_gpio, 0, sizeof(state->port_perst_gpio));
 
     adt_offset = adt_path_offset_trace(adt, path, adt_path);
     if (adt_offset < 0) {
@@ -889,6 +1100,86 @@ static int pcie_init_controller(int controller, const char *path, u32 allowed_po
             state->port_intr2axi_base[port] = 0;
         }
 
+        /*
+         * Everything below reprograms the port, so sample the link state first.
+         * A port that is already trained must not be reset out from under
+         * whoever owns it (apple_pcie_setup_port() guards its bring-up the same
+         * way), so this decides whether PERST# may be toggled at all.
+         */
+        struct pcie_port_bringup bringup = {
+            .port_base = state->port_base[port],
+            .port_phy_base = state->pcie_regs->type == APCIE_T602X ? state->port_phy_base[port] : 0,
+            .perst_reg =
+                state->pcie_regs->type == APCIE_T602X ? APCIE_T602X_PORT_RESET : APCIE_PORT_RESET,
+            .phy_ack_timeout_us = 50000,
+            .link_up_timeout_us = PCIE_PERST_LINK_UP_TIMEOUT_US,
+            .link_was_up =
+                (read32(state->port_base[port] + APCIE_PORT_LINKSTS) & APCIE_PORT_LINKSTS_UP) != 0,
+        };
+        struct apple_gpio_pin perst_gpio = {0};
+
+        /*
+         * PERST# is a GPIO on every Apple platform that declares it, and m1n1
+         * historically never drove it -- only the internal PERST register.  On
+         * J414s both ports leave the pad asserted (DATA=0, active low) out of
+         * iBoot, so the endpoint is held in reset and the link can never train.
+         *
+         * Resolution is entirely ADT-driven (function-perst -> phandle + pin),
+         * so nothing here is machine specific.  A port with no function-perst,
+         * an SMC-backed rail, or an unresolvable phandle simply keeps the old
+         * behaviour: the pad is left exactly as firmware set it.
+         */
+        if (apple_gpio_resolve_function(bridge_offset, "perst", &perst_gpio) == 0) {
+            bringup.have_perst_gpio = true;
+            state->port_perst_gpio[port] = perst_gpio;
+            printf("pcie: Port %d PERST# is GPIO pin %u at %#lx\n", port, perst_gpio.pin,
+                   perst_gpio.base);
+        } else {
+            printf("pcie: Port %d has no resolvable PERST# GPIO; leaving the pad alone\n", port);
+        }
+
+        u32 t_refclk_to_perst = 0, perst_to_config = 0;
+        bool have_refclk_to_perst =
+            ADT_GETPROP(adt, bridge_offset, "t-refclk-to-perst", &t_refclk_to_perst) >= 0;
+        bool have_perst_to_config =
+            ADT_GETPROP(adt, bridge_offset, "perst-to-config", &perst_to_config) >= 0;
+
+        pcie_perst_delays_from_adt(&bringup.delays, have_refclk_to_perst, t_refclk_to_perst,
+                                   have_perst_to_config, perst_to_config);
+
+        /*
+         * `manual-enable` marks a port that is under explicit software
+         * enable/disable control rather than being treated as always-on.  It
+         * is NOT a "skip this port" marker and it says nothing about whether
+         * firmware already brought the port up.
+         *
+         * Determined from AppleEmbeddedPCIE.kext: AppleEmbeddedPCIEPort::
+         * autoEnable() enables the port either way.  Without manual-enable it
+         * enables with flags 0x8 and returns true, so AppleEmbeddedPCIE::
+         * configure() adds the port to its wait-for-link-up mask; with
+         * manual-enable it enables with flags 0x8|0x2 and returns false, so
+         * macOS scans the port but does not block on its link.  The only
+         * property that actually defers a scan is the separate
+         * `manual-enable-defer-scan`, which no published Apple Silicon ADT
+         * carries.  Both J414s ports declare manual-enable, and both must be
+         * brought up -- skipping either is what would leave WiFi/BT and the SD
+         * card reader dead.
+         *
+         * m1n1's job is to bring hardware up, so the property changes no
+         * behaviour here; it is logged so the ownership is explicit, and
+         * `manual-enable-s2r` is noted only because it means PERST# for this
+         * port is re-driven across suspend/resume (IOPCIFamily
+         * IOPCIBridge.cpp), which is not something m1n1 participates in.
+         */
+        if (adt_getprop(adt, bridge_offset, "manual-enable", NULL))
+            printf("pcie: Port %d is manual-enable; m1n1 owns its bring-up\n", port);
+
+        if (bringup.link_was_up)
+            printf("pcie: Port %d link is already up; not resetting it\n", port);
+
+        printf("pcie: Port %d PERST# timing: refclk->perst %uus, perst->config %uus\n", port,
+               bringup.delays.refclk_to_perst_us, bringup.delays.perst_to_config_us);
+
         if (state->pcie_regs->type == APCIE_T602X) {
             set32(state->rc_base + 0x3c, 0x1);
 
@@ -928,34 +1219,16 @@ static int pcie_init_controller(int controller, const char *path, u32 allowed_po
             return -1;
         }
 
-        set32(state->port_base[port] + APCIE_PORT_APPCLK, APCIE_PORT_APPCLK_EN);
-
-        if (state->pcie_regs->type == APCIE_T602X) {
-            clear32(state->port_phy_base[port] + APCIE_PHY_CTRL,
-                    APCIE_PHY_CTRL_CLK0REQ | APCIE_PHY_CTRL_CLK1REQ);
-
-            set32(state->port_phy_base[port] + APCIE_PHY_CTRL, APCIE_PHY_CTRL_CLK0REQ);
-            if (poll32(state->port_phy_base[port] + APCIE_PHY_CTRL, APCIE_PHY_CTRL_CLK0ACK,
-                       APCIE_PHY_CTRL_CLK0ACK, 50000)) {
-                printf("pcie: Timeout enabling PHY CLK0\n");
-                return -1;
-            }
-
-            set32(state->port_phy_base[port] + APCIE_PHY_CTRL, APCIE_PHY_CTRL_CLK1REQ);
-            if (poll32(state->port_phy_base[port] + APCIE_PHY_CTRL, APCIE_PHY_CTRL_CLK1ACK,
-                       APCIE_PHY_CTRL_CLK1ACK, 50000)) {
-                printf("pcie: Timeout enabling PHY CLK1\n");
-                return -1;
-            }
-
-            clear32(state->port_phy_base[port] + APCIE_PHY_CTRL, 0x4000);
-            set32(state->port_phy_base[port] + APCIE_PHY_CTRL, 0x200);
-            set32(state->port_phy_base[port] + APCIE_PHY_CTRL, 0x400);
-
-            set32(state->port_base[port] + APCIE_T602X_PORT_RESET, APCIE_PORT_RESET_DIS);
-        } else {
-            /* PERSTN */
-            set32(state->port_base[port] + APCIE_PORT_RESET, APCIE_PORT_RESET_DIS);
+        /*
+         * APPCLK on, PERST# asserted before the clocks, refclk request/ack,
+         * Tperst-clk, then PERST# released -- apple_pcie_setup_link() order.
+         * The register pokes are byte-for-byte the ones m1n1 already issued
+         * here; the PERST# pad handling and the ADT-derived delay are new.
+         */
+        int bringup_ret = pcie_port_release_perst(&pcie_hw_bringup_ops, &perst_gpio, &bringup);
+        if (bringup_ret) {
+            printf("pcie: Port %d PERST# release failed (%d) on %s\n", port, bringup_ret, bridge);
+            return -1;
         }
 
         if (poll32(state->port_base[port] + APCIE_PORT_STATUS, APCIE_PORT_STATUS_RUN,
@@ -997,6 +1270,17 @@ static int pcie_init_controller(int controller, const char *path, u32 allowed_po
             set32(state->port_ltssm_base[port] + 0x20, 0x2);
             write32(state->port_ltssm_base[port] + 0x14, 0x1);
         }
+
+        /*
+         * perst-to-config: PCIe Base r5.0 6.6.1 requires 100ms between the last
+         * PERST# deassertion and the first configuration request.  The block
+         * above re-cycles the internal PERST register (m1n1 has always done
+         * that, Asahi does not), so the wait is taken here, after the final
+         * PERST transition and before the first config-space access below.  The
+         * endpoint's own PERST# pad was released earlier, so it gets at least
+         * this much settling time too.
+         */
+        udelay(bringup.delays.perst_to_config_us);
 
         /* Make Designware PCIe Core registers writable. */
         set32(config_base + DWC_DBI_RO_WR, DWC_DBI_RO_WR_EN);
@@ -1077,11 +1361,24 @@ static int pcie_init_controller(int controller, const char *path, u32 allowed_po
                         PCIE_T602X_MSIMAP_VALID | i);
         }
 
+        /*
+         * Enable refclk clock gating, start LTSSM and poll for the link with a
+         * bounded timeout -- the tail of apple_pcie_setup_port().  m1n1 used to
+         * read LINKSTS exactly once here, which can only ever observe a link
+         * that some earlier stage had already trained.
+         */
+        int link_ret = pcie_port_start_link(&pcie_hw_bringup_ops, &perst_gpio, &bringup);
         u32 link_status = read32(state->port_base[port] + APCIE_PORT_LINKSTS);
-        if (require_link_up && !(link_status & APCIE_PORT_LINKSTS_UP)) {
-            printf("pcie: Port %d link is not up (status %#x)\n", port, link_status);
-            return -1;
+
+        if (link_ret) {
+            printf("pcie: Port %d link did not come up within %uus (status %#x)\n", port,
+                   bringup.link_up_timeout_us, link_status);
+            if (require_link_up)
+                return -1;
+        } else {
+            printf("pcie: Port %d link up (status %#x)\n", port, link_status);
         }
+
         state->initialized_port_mask |= BIT(port);
     }
 
@@ -1137,6 +1434,14 @@ int pcie_shutdown(void)
         for (u32 port = 0; port < state->port_count; port++) {
             if ((state->initialized_port_mask & BIT(port)) == 0)
                 continue;
+            /*
+             * Put the endpoint back in reset before its clocks go away, so it
+             * is never left running unclocked.  Only pads m1n1 itself resolved
+             * and drove are touched.  The argument is the pad level, and the
+             * pad is active low, so driving it low asserts PERST#.
+             */
+            if (state->port_perst_gpio[port].valid)
+                apple_gpio_set_output(&state->port_perst_gpio[port], false);
             if (state->pcie_regs->type == APCIE_T602X)
                 clear32(state->port_base[port] + APCIE_T602X_PORT_RESET, APCIE_PORT_RESET_DIS);
             else

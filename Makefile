@@ -131,6 +131,7 @@ OBJECTS := \
 	exception.o exception_asm.o \
 	fb.o font.o font_retina.o \
 	firmware.o \
+	gpio.o \
 	gxf.o gxf_asm.o \
 	heapblock.o \
 	hv.o hv_vm.o hv_exc.o hv_vuart.o hv_wdt.o hv_asm.o hv_aic.o hv_virtio.o hv_tpm.o hv_psci.o hv_vgic.o \
