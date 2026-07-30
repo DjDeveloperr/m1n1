@@ -49,6 +49,16 @@ QUIET :=
 endif
 endif
 
+# Must be defined BEFORE BASE_CFLAGS: that is a `:=` (immediately expanded)
+# assignment, so an empty BUILD_DIR here turns its -I$(BUILD_DIR) into a bare
+# -I that swallows the following -fno-stack-protector as its argument. The
+# build/ directory then is not on the include path at all and every object
+# that includes the generated build_cfg.h fails with "file not found".
+# `make BUILD_DIR=... ` (how tools/build-j414s-windows-unified.py invokes it)
+# masked this, because a command-line assignment is in scope before the
+# makefile is read; a plain `make` from a clean tree did not.
+BUILD_DIR ?= build
+
 BASE_CFLAGS := -O2 -Wall -g -Wundef -Werror=strict-prototypes -fno-common -fno-PIE \
 	-Werror=implicit-function-declaration -Werror=implicit-int \
 	-Wsign-compare -Wunused-parameter -Wno-multichar \
@@ -181,7 +191,6 @@ FP_OBJECTS := \
 	math/powf.o \
 	math/powf_data.o
 
-BUILD_DIR ?= build
 BUILD_OBJS := $(patsubst %,$(BUILD_DIR)/%,$(OBJECTS))
 BUILD_FP_OBJS := $(patsubst %,$(BUILD_DIR)/%,$(FP_OBJECTS))
 BUILD_RUST_LIB := $(patsubst %,$(BUILD_DIR)/%,$(RUST_LIB))
