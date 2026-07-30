@@ -117,4 +117,34 @@ int atcphy_power_off(u32 idx);
  */
 u64 atcphy_reg_base(u32 idx, u32 block);
 
+/*
+ * Guest-handoff re-apply latch.
+ *
+ * Booting a guest through the hypervisor (hv_init, hv.c) calls
+ * usb_iodev_shutdown_except -> usb_phy_handoff_host, which re-parks the
+ * pipehandler PIPE mux on the DUMMY backend as the boot-chain default
+ * (usb.c) -- silently undoing any proxy-applied ATCPHY state. Arming a
+ * (mode, flipped) pair here makes usb_phy_handoff_host re-apply it via
+ * atcphy_apply_mode() immediately after its dummy parking.
+ *
+ * That call site is the ONE place in this tree that passes
+ * allow_pipe_switch=true, and it is safe by this project's own rule
+ * precisely because of when it runs: hv_init happens before the guest is
+ * entered, so dwc3 is freshly reset and NO guest xHCI driver is bound to
+ * the port yet. (docs/j414s-atcphy.md sec 6/12; the hardware session of
+ * 2026-07-30 validated the full USB3 apply path on port 2.)
+ *
+ * Fail-safe: nothing is armed by default, so the boot chain's behaviour
+ * is unchanged unless an operator explicitly arms a port over the proxy
+ * (P_ATCPHY_ARM_GUEST_MODE). Arming does not touch hardware by itself.
+ */
+void atcphy_arm_guest_mode(u32 idx, atcphy_mode_t mode, bool flipped, bool armed);
+
+/*
+ * Called by usb_phy_handoff_host after it parks the PIPE mux on DUMMY.
+ * Re-applies the armed mode for idx, or does nothing if not armed.
+ * Returns 0 (including the not-armed case), -1 on a failed re-apply.
+ */
+int atcphy_reapply_guest_mode(u32 idx);
+
 #endif

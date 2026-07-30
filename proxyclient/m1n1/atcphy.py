@@ -38,6 +38,7 @@ P_ATCPHY_APPLY_MODE = 0x1500
 P_ATCPHY_SET_ORIENTATION = 0x1501
 P_ATCPHY_POWER_OFF = 0x1502
 P_ATCPHY_GET_REG_BASE = 0x1503
+P_ATCPHY_ARM_GUEST_MODE = 0x1504
 
 
 class ATCPHYMode(IntEnum):
@@ -176,6 +177,58 @@ class ATCPHY:
             raise Exception(f"atcphy{self.port}: power_off failed")
         return ret
 
+    def arm_guest_mode(self, mode, flipped=False, armed=True):
+        """Arm a PHY mode to be re-applied by m1n1's guest-handoff path.
+
+        WHY THIS EXISTS: booting a guest through the hypervisor runs
+        hv_init -> usb_iodev_shutdown_except -> usb_phy_handoff_host,
+        which re-parks the PIPE mux on the DUMMY backend (usb.c) --
+        silently undoing any proxy-applied USB3 state. Arming makes the
+        handoff path re-apply (mode, flipped) right after its dummy
+        parking, i.e. at the last point before the guest owns the port
+        and while no guest xHCI driver is bound yet (the one window
+        where a PIPE-mux switch is safe by this project's own rule).
+
+        Fail-safe: nothing is armed by default; arming does not touch
+        the hardware until the handoff actually runs. armed=False
+        disarms.
+        """
+        ret = self.p.request(P_ATCPHY_ARM_GUEST_MODE, self.port, int(mode),
+                             int(bool(flipped)), int(bool(armed)), signed=True)
+        if ret < 0:
+            raise Exception(f"atcphy{self.port}: arm_guest_mode failed "
+                            "(old m1n1 without ATCPHY arm support?)")
+        return ret
+
+    def dump_tunables(self):
+        """List the ADT tunable_* properties on this port's atc-phy node.
+
+        Read-only (ADT parse only, no MMIO). Each tunable blob is a
+        sequence of 12-byte {offset:24,size:8,mask:32,value:32} RMW
+        records; the C driver validates and applies them during
+        apply_mode (global set always; USB3/DP/CIO lane sets by mode).
+        A present-but-empty blob is a valid no-op.
+        """
+        node = self.u.adt[f"/arm-io/atc-phy{self.port}"]
+        out = {}
+        for name in sorted(node._properties.keys()):
+            if not name.startswith("tunable"):
+                continue
+            val = node._properties[name]
+            nbytes = len(val) if isinstance(val, (bytes, bytearray)) else None
+            if nbytes is None:
+                out[name] = ("?", val)
+                print(f"  {name:32s} unparsed type {type(val).__name__}")
+            else:
+                recs = nbytes // 12
+                ok = "" if nbytes % 12 == 0 else "  (NOT a multiple of 12!)"
+                out[name] = (nbytes, recs)
+                print(f"  {name:32s} {nbytes:5d} bytes = {recs:3d} records{ok}")
+        if not out:
+            print(f"atcphy{self.port}: NO tunable_* properties found -- "
+                  "apply_mode would have failed closed; investigate")
+        return out
+
     # ---- read-only inspection (pure MMIO reads, no C driver involved) ----
 
     def state(self):
@@ -277,21 +330,81 @@ class ATCPHY:
 
 TPS_REG_STATUS = 0x1A
 
+# Hardware-measured corroboration anchors (grade A, 2026-07-29 session):
+# the right-side port's PD controller is hpm2 at I2C address 0x3b. If the
+# ADT decode below disagrees with this, the DECODE is wrong -- refuse to
+# talk to the bus rather than address a random device.
+HPM_KNOWN_ADDRS = {2: 0x3B}
+
+
+def _prop_to_int(val):
+    """ADT property value -> int, for untemplated little-endian props."""
+    if isinstance(val, int):
+        return val
+    if isinstance(val, (bytes, bytearray)):
+        if len(val) == 0:
+            raise ValueError("empty property")
+        return int.from_bytes(val, "little")
+    raise ValueError(f"unhandled ADT property type {type(val).__name__}")
+
 
 def _hpm_i2c_addr(u, hpm_index, i2c_path="/arm-io/i2c0"):
+    """Resolve an HPM's I2C bus address from the ADT.
+
+    The address lives in the hpm node's `hpm-iic-addr` property -- the
+    exact property m1n1's own working C driver reads (tps6598x_init,
+    src/tps6598x.c:36). The hpm nodes have NO `reg` property, and this
+    project's standing lesson is that raw ADT `reg` is not an address
+    anyway (the i2c0 raw-reg trap: bogus 0x19b040000 vs the real
+    0x39b040000 from get_reg(0)) -- so nothing here touches `reg`.
+    """
+    target = f"hpm{hpm_index}"
     node = u.adt[i2c_path]
+
+    hpm_node = None
+    # ADT layout: i2c0 -> hpmBusManagerX ("usbc,manager") -> hpmN. Walk one
+    # level of managers plus direct children, matching usb.c's discovery.
+    candidates = list(node)
     for mgr in node:
-        compat = getattr(mgr, "compatible", None)
-        compat0 = compat[0] if isinstance(compat, list) else compat
-        if compat0 != "usbc,manager":
-            continue
-        for child in mgr:
-            if child.name == f"hpm{hpm_index}":
-                reg = child.reg
-                first = reg[0] if isinstance(reg, (list, tuple)) else reg
-                addr = getattr(first, "addr", first)
-                return int(addr) & 0xFF
-    raise Exception(f"hpm{hpm_index} not found under {i2c_path}")
+        candidates.extend(list(mgr))
+    for child in candidates:
+        if child.name == target:
+            hpm_node = child
+            break
+    if hpm_node is None:
+        seen = sorted(c.name for c in candidates)
+        raise Exception(
+            f"{i2c_path}: no '{target}' node found (children seen: {seen})")
+
+    try:
+        raw = hpm_node.hpm_iic_addr  # ADT property "hpm-iic-addr"
+    except AttributeError:
+        props = sorted(hpm_node._properties.keys())
+        raise Exception(
+            f"{hpm_node._path}: no 'hpm-iic-addr' property (properties "
+            f"present: {props}) -- cannot determine the I2C address, "
+            f"refusing to guess")
+
+    try:
+        addr = _prop_to_int(raw)
+    except ValueError as e:
+        raise Exception(
+            f"{hpm_node._path}: cannot decode 'hpm-iic-addr' value "
+            f"{raw!r}: {e}")
+
+    if not 0x08 <= addr <= 0x77:
+        raise Exception(
+            f"{hpm_node._path}: decoded I2C address {addr:#x} is outside "
+            f"the valid 7-bit range 0x08-0x77 -- decode is wrong, refusing")
+
+    known = HPM_KNOWN_ADDRS.get(hpm_index)
+    if known is not None and addr != known:
+        raise Exception(
+            f"{hpm_node._path}: decoded I2C address {addr:#04x} contradicts "
+            f"the hardware-measured value {known:#04x} for hpm{hpm_index} -- "
+            f"decode is wrong, refusing to talk to the bus")
+
+    return addr
 
 
 def hpm_status(u, hpm_index, i2c_path="/arm-io/i2c0"):
@@ -307,6 +420,7 @@ def hpm_status(u, hpm_index, i2c_path="/arm-io/i2c0"):
     u.proxy.pmgr_adt_clocks_enable(i2c_path)
     i2c = I2C(u, i2c_path)
     addr = _hpm_i2c_addr(u, hpm_index, i2c_path)
+    print(f"hpm{hpm_index}: ADT-resolved I2C address {addr:#04x} on {i2c_path}")
 
     raw = i2c.read_reg(addr, TPS_REG_STATUS, 9)
     length = raw[0]

@@ -365,6 +365,16 @@ if (cfg->pipe_state == ATCPHY_PIPE_STATE_USB3 && !allow_pipe_switch) {
 wire up automatically -- hardcodes `ATCPHY_MODE_USB2`, whose `pipe_state`
 is always `DUMMY`, so the gate is structurally unreachable from it.
 
+> **[Update 2026-07-30, sec 13]: this paragraph's conditions were met and
+> one carefully-scoped exception now exists.** The full USB3 apply path
+> (including the pipehandler BIST switch) was validated on the real J414s
+> port 2 in a recoverable proxy-only session with no guest running, and
+> `atcphy_reapply_guest_mode()` -- reachable only if an operator explicitly
+> arms it over the proxy, and only from `usb_phy_handoff_host` (which runs
+> from `hv_init`, before the guest is entered, with dwc3 freshly reset and
+> no guest xHCI bound) -- passes `allow_pipe_switch=true`. The gate still
+> fail-closes every other path. See sec 13.3.
+
 Why this matters concretely: `pipehandler` is a *different* MMIO window
 from the dwc3 core/apple registers (sec 2.1's structural guarantee), so
 switching it is not literally "touching DWC3." But it reprograms the PIPE
@@ -729,3 +739,130 @@ no concurrently-edited file was modified.
 6. Only after 1-5 behave: consider wiring `atcphy_set_orientation(2, ...)`
    into the boot path ahead of a Windows boot, and only then re-litigate
    sec 8's "does this fix the measured CCS=0 bug" question on real data.
+
+---
+
+## 13. Session-3 (2026-07-30, same night): HARDWARE VALIDATION + the handoff clobber
+
+### 13.1 Hardware results (grade A, measured by the coordinator on the J414s)
+
+m1n1 built from `f0f84618`, chainloaded; port 2 (the broken right-side
+port), proxy-only session:
+
+- The Python-vs-C window cross-check passed.
+- Virgin state (first ever observation of this PHY's reset state):
+  `POWER_CTRL=0x4` (CLAMP_EN only, both sleep domains down, both resets
+  asserted), `POWER_STAT=0`, `MISC=0` (RESET_N never set), `CROSSBAR=0`,
+  `LANE_MODE=0`, pipehandler mux `0x22` (DUMMY/DUMMY). This **partially
+  answers sec 8.2's open question**: the core block idles fully clamped
+  and in reset -- the "one good attach" happened with the SS side
+  clamped, consistent with that attach being USB2-only at the PHY level.
+- `apply_mode(USB3, normal, allow_pipe_switch=true)` ran with **zero POLL
+  failures**: `POWER_STAT=0x3` (both domains acked their wake -- the
+  first hardware confirmation that the POWER_CTRL/STAT semantics
+  transcribed from atc.c are right on T6020), `MISC=0x1` (RESET_N),
+  `CROSSBAR=0x110` (USB3_DP + single_pma=8), `LANE_MODE=0x489`
+  (USB3/USB3/DP/DP), CIO3PLL clocks on, AUSPLL FSM `0x1fe000` landed,
+  and the PIPE mux read back `0x08` (USB3/USB3). **The right-side port's
+  USB3 path was physically connected for the first time on this
+  machine.** `cfg0=0x11833fef`/`sleep_ctrl=0x15570cff` also show the
+  tunable+override writes landed on real silicon.
+
+Two operator questions answered plainly:
+
+- **`pipe_lock_req`/`pipe_lock_ack` both 0 after bring-up is the expected
+  terminal state, not a skipped step.** The lock is transient: the host
+  BIST sequence takes the lock at its start (op cites atc.c:930-933) and
+  releases it as its final two ops (atc.c:947-949; upstream comment:
+  "Pipehandler was only locked when the BIST sequence was applied for
+  host mode"). Both the lock-acquire ACK poll and the release ACK-clear
+  poll are POLL ops -- a failure of either would have printed
+  `atcphy2: ... failed at op N (atc.c:...)`. No such print = the lock was
+  taken, the BIST ran under it, and it was cleanly released. 0/0 at the
+  end is success.
+- **Yes, the ADT `tunable_*` RMW records were applied in that run.**
+  `atcphy_apply_mode` applies the 10 global tunables fail-closed
+  *before* anything else (a required-but-missing property aborts with a
+  printf and the crossbar would never have been written), then the
+  USB3-lane set for lane 0 + DP-lane set for lane 1 (not-flipped). The
+  run completed through crossbar programming, therefore every required
+  tunable property existed and was applied. One residual caveat: a
+  present-but-*empty* blob validates as an intentional no-op (the t6020
+  fuse convention), so "applied" means "every record present in the ADT
+  was applied", not "every blob was non-empty" -- run
+  `atcphy_probe.py tunables` (new, read-only) to see the per-blob record
+  counts and settle that in one command.
+
+### 13.2 A real bug found on hardware: `_hpm_i2c_addr` read the wrong property
+
+`proxyclient/m1n1/atcphy.py` originally read the hpm node's `reg`
+property. **The hpm ADT nodes have no `reg` property at all** (hardware
+AttributeError), and this project's standing lesson is that raw ADT `reg`
+is not an address anyway. The correct source -- used by m1n1's own working
+C driver (`tps6598x_init`, src/tps6598x.c:36) -- is the hpm node's
+**`hpm-iic-addr`** property. Fixed: the helper now reads `hpm-iic-addr`,
+decodes it LE, validates the 7-bit range, fails with diagnostics naming
+the node and its actual properties, and **hard-refuses if hpm2 does not
+decode to the hardware-measured 0x3b** (corroboration anchor; a mismatch
+means the decode is wrong, not the hardware).
+
+### 13.3 The handoff clobber, and the arm/re-apply mechanism
+
+Code-anchored finding (grade A, this tree): booting a guest through the
+hypervisor runs `hv_init()` -> `usb_iodev_shutdown_except()` ->
+`usb_phy_handoff_host(i)` for every non-proxy port, and that function
+**re-parks the PIPE mux on DUMMY** (`usb.c`, "Leave SuperSpeed on the safe
+dummy backend") plus fully resets/re-latches the usb2 PHY. So:
+
+- **Proxy-applied USB3 state does NOT survive a hypervisor guest boot.**
+  Without a countermeasure, the planned "bring up PHY, re-enable XHC2,
+  boot Windows" experiment would silently re-test the dummy mux and
+  produce a false negative.
+- What handoff does NOT touch: the core window (crossbar, lane modes,
+  power domains, PLLs) survives; only the usb2phy + pipehandler windows
+  are rewritten.
+
+New mechanism (fail-safe, default off): `P_ATCPHY_ARM_GUEST_MODE`
+(`0x1504`) / `ATCPHY.arm_guest_mode()` / `atcphy_probe.py arm|disarm`
+latches a (mode, orientation) pair in m1n1; `usb_phy_handoff_host` calls
+`atcphy_reapply_guest_mode(idx)` right after its dummy parking, which
+re-runs the full `atcphy_apply_mode` (tunables included) at the one
+moment a PIPE switch is safe by this project's own rule: before the guest
+is entered, dwc3 freshly reset, no guest driver bound. Arming itself
+touches no hardware. If the re-apply fails, a loud console line says the
+SuperSpeed backend is undefined for that boot.
+
+Post-handoff persistence into the guest (analysis, [I] unless noted):
+xHCI `HCRST` and dwc3 `CSFTRST` live in the usb-drd core windows and do
+not touch the pipehandler mux or the PHY core window [B: they are
+different silicon blocks; the mux is only written via pipehandler MMIO].
+Windows performs no Apple-PMGR management, so the domain stays up.
+**The one unverified actor is Mu**: if Mu's own USB stack binds XHC2
+between handoff and Windows, what it does is unknown -- if the armed boot
+misbehaves, capture whether the mux still reads 0x08 from the proxy while
+Mu is up. The definitive empirical check either way: `atcphy_probe.py
+dump` (read-only) from the resident proxy after Windows is up.
+
+### 13.4 Recommended instrumentation for the XHC2 re-enable experiment
+
+1. Pre-boot, proxy-only: `hpm` (verify orientation with the fixed
+   helper), `tunables` (record counts on the armed port), `usb3
+   --allow-pipe-switch` + `dump` (known-good reference), `power-off`,
+   `dump` (baseline), then `arm`.
+2. Console: expect `USB2: releasing controller for guest` ->
+   `atcphy2: re-applying armed guest mode ...` -> either the success
+   printf or a named failing op. Absence of the re-applying line means
+   the handoff path didn't run for that port -- also informative.
+3. Keep the SS device plugged in the SAME orientation from arm through
+   Windows boot (there is no runtime re-trigger path; a flip after arm
+   puts USB3 on the wrong pins and the device will degrade to USB2).
+4. After Windows is up (or after a 0x144): `atcphy_probe.py dump` from
+   the resident proxy -- read-only, safe under a live guest -- to see
+   whether the mux/crossbar survived. This single read distinguishes
+   "Windows/Mu clobbered the PHY" from "PHY fine, xHCI still unhappy".
+5. If tracing is wanted: trace ONLY the atc-phy2 windows and usb-drd2
+   reg[3] (pipehandler) -- low-traffic; do NOT trace the xhci/dwc3 core
+   windows during a full Windows boot (hot path).
+6. Revert path if 0x144 recurs: `disarm` + reboot restores today's
+   behaviour exactly (nothing armed = boot chain unchanged); `power-off`
+   + `usb3` re-apply is the in-session recovery.

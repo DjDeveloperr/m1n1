@@ -9,12 +9,19 @@ provenance and the safety rules; the short version:
 
   dump           read-only, safe at any time (default action)
   hpm            read-only STATUS from the HPM PD controller (orientation)
+  tunables       read-only list of the port's ADT tunable_* blobs
   orient         programs USB2-mode crossbar/orientation; never touches the
                  PIPE mux; safe even while a guest OS owns the port
   usb3           FULL USB3 bring-up including the pipehandler PIPE-mux BIST
                  switch. Requires --allow-pipe-switch. NEVER do this while a
                  guest's xHCI driver is bound to this port (0x144 bugcheck
                  class risk); intended for proxy-only sessions.
+  arm            arm USB3 mode for re-apply at guest handoff: booting a
+                 guest re-parks the PIPE mux on DUMMY (usb_phy_handoff_host)
+                 and would silently undo a proxy-applied usb3; arming makes
+                 m1n1 re-apply USB3 right after that parking, before the
+                 guest owns the port. Does not touch hardware by itself.
+  disarm         cancel a previous arm
   off            atcphy_apply_mode(OFF): PHY stays powered, lanes parked
   power-off      upstream-faithful full power-down (recover-to-baseline)
 
@@ -39,7 +46,8 @@ sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 parser = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
 parser.add_argument("action", nargs="?", default="dump",
-                    choices=["dump", "hpm", "orient", "usb3", "off", "power-off"])
+                    choices=["dump", "hpm", "tunables", "orient", "usb3",
+                             "arm", "disarm", "off", "power-off"])
 parser.add_argument("--port", type=int, default=2,
                     help="ATC port index (default 2 = J414s right side)")
 parser.add_argument("--flipped", dest="flipped", action="store_true",
@@ -81,6 +89,21 @@ elif args.action == "hpm":
     print(f"hpm{args.port} STATUS byte0 = {b0:#04x}")
     for k, v in decoded.items():
         print(f"  {k:18s} = {v}")
+
+elif args.action == "tunables":
+    print(f"atcphy{args.port} ADT tunables:")
+    phy.dump_tunables()
+
+elif args.action == "arm":
+    flipped = resolve_orientation()
+    phy.arm_guest_mode(ATCPHYMode.USB3, flipped, armed=True)
+    print(f"atcphy{args.port}: USB3 (flipped={flipped}) armed for guest "
+          "handoff. Watch the m1n1 console for the 're-applying' line when "
+          "the guest boots; nothing is written to the PHY until then.")
+
+elif args.action == "disarm":
+    phy.arm_guest_mode(ATCPHYMode.USB3, False, armed=False)
+    print(f"atcphy{args.port}: guest mode disarmed")
 
 elif args.action == "orient":
     flipped = resolve_orientation()

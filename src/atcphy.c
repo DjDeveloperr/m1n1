@@ -421,3 +421,46 @@ u64 atcphy_reg_base(u32 idx, u32 block)
 
     return atcphy_block_base(&regs, (atcphy_block_t)block);
 }
+
+/* Guest-handoff re-apply latch; see atcphy.h for the design rationale. */
+#define ATCPHY_MAX_PORTS 4u
+
+static struct {
+    bool armed;
+    atcphy_mode_t mode;
+    bool flipped;
+} atcphy_guest_mode[ATCPHY_MAX_PORTS];
+
+void atcphy_arm_guest_mode(u32 idx, atcphy_mode_t mode, bool flipped, bool armed)
+{
+    if (idx >= ATCPHY_MAX_PORTS) {
+        printf("atcphy: arm_guest_mode: invalid port %u\n", idx);
+        return;
+    }
+
+    atcphy_guest_mode[idx].armed = armed;
+    atcphy_guest_mode[idx].mode = mode;
+    atcphy_guest_mode[idx].flipped = flipped;
+
+    if (armed)
+        printf("atcphy%u: ARMED guest mode %d (orientation=%s); it will be "
+               "re-applied at guest USB handoff\n",
+               idx, (int)mode, flipped ? "flipped" : "normal");
+    else
+        printf("atcphy%u: guest mode disarmed\n", idx);
+}
+
+int atcphy_reapply_guest_mode(u32 idx)
+{
+    if (idx >= ATCPHY_MAX_PORTS || !atcphy_guest_mode[idx].armed)
+        return 0;
+
+    printf("atcphy%u: re-applying armed guest mode %d (orientation=%s) after handoff\n", idx,
+           (int)atcphy_guest_mode[idx].mode, atcphy_guest_mode[idx].flipped ? "flipped" : "normal");
+
+    /* allow_pipe_switch=true is safe here and only here: the handoff path
+     * runs from hv_init, before the guest is entered, so no guest xHCI
+     * driver is bound to this port. See atcphy.h. */
+    return atcphy_apply_mode(idx, atcphy_guest_mode[idx].mode, atcphy_guest_mode[idx].flipped,
+                             true, false, ATCPHY_DP_RATE_RBR);
+}

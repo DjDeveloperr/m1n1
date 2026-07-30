@@ -687,6 +687,10 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
         case P_ATCPHY_GET_REG_BASE:
             reply->retval = atcphy_reg_base(request->args[0], request->args[1]);
             break;
+        case P_ATCPHY_ARM_GUEST_MODE:
+            atcphy_arm_guest_mode(request->args[0], (atcphy_mode_t)request->args[1],
+                                  request->args[2] != 0, request->args[3] != 0);
+            break;
 
         default:
             reply->status = S_BADCMD;

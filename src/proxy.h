@@ -193,6 +193,7 @@ typedef enum {
     P_ATCPHY_SET_ORIENTATION,
     P_ATCPHY_POWER_OFF,
     P_ATCPHY_GET_REG_BASE,
+    P_ATCPHY_ARM_GUEST_MODE,
 } ProxyOp;
 
 #define S_OK     0

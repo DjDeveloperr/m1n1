@@ -2,6 +2,7 @@
 
 #include "usb.h"
 #include "adt.h"
+#include "atcphy.h"
 #include "dart.h"
 #include "i2c.h"
 #include "iodev.h"
@@ -232,6 +233,18 @@ static int usb_phy_handoff_host(u32 idx)
 
     printf("USB%d: PHY handed to guest in host mode (SIG=%#x CTL=%#x)\n", idx,
            read32(regs.atc + USB2PHY_SIG), read32(regs.atc + USB2PHY_CTL));
+
+    /*
+     * If the operator armed an ATC PHY guest mode over the proxy
+     * (P_ATCPHY_ARM_GUEST_MODE), re-apply it now: the dummy parking above is
+     * the boot-chain default and this is the last point before the guest
+     * owns the port, with dwc3 freshly reset and no guest driver bound --
+     * the one window where a PIPE-mux switch is safe. No-op if not armed.
+     */
+    if (atcphy_reapply_guest_mode(idx) < 0)
+        printf("USB%d: armed ATCPHY guest mode re-apply FAILED; SuperSpeed is "
+               "on an undefined backend for this boot\n",
+               idx);
     return 0;
 }
 
