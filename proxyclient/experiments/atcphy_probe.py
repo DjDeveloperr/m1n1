@@ -50,6 +50,10 @@ parser.add_argument("--allow-pipe-switch", action="store_true",
                     help="required for 'usb3'; see safety note above")
 args = parser.parse_args()
 
+if args.action == "usb3" and not args.allow_pipe_switch:
+    parser.error("usb3 requires --allow-pipe-switch (read the safety note "
+                 "in --help first)")
+
 from m1n1.setup import *  # noqa: E402,F403
 from m1n1.atcphy import (  # noqa: E402
     ATCPHY, ATCPHYMode, hpm_status, hpm_orientation,
@@ -87,9 +91,6 @@ elif args.action == "orient":
     phy.dump()
 
 elif args.action == "usb3":
-    if not args.allow_pipe_switch:
-        parser.error("usb3 requires --allow-pipe-switch (read the safety "
-                     "note in --help first)")
     flipped = resolve_orientation()
     print("--- before ---")
     phy.dump()
