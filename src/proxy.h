@@ -194,6 +194,9 @@ typedef enum {
     P_ATCPHY_POWER_OFF,
     P_ATCPHY_GET_REG_BASE,
     P_ATCPHY_ARM_GUEST_MODE,
+
+    // J414s media profile; keep in sync with proxyclient/m1n1/media_handoff.py
+    P_MEDIA_HANDOFF_INIT = 0x1600,
 } ProxyOp;
 
 #define S_OK     0

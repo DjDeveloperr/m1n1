@@ -43,6 +43,14 @@ REQUIRED_SOURCE = {
         "src/bcm4388_handoff.c",
         "int bcm4388_legacy_dormant_handoff_install(",
     ),
+    "media_profile": (
+        "config.h",
+        "#define ENABLE_J414S_WINDOWS_MEDIA_HANDOFF",
+    ),
+    "media_profile_census_only": (
+        "src/media_handoff.c",
+        "int media_handoff_init(u32 flags)",
+    ),
     "gpu": ("src/kboot_gpu.c", "rust_fill_gpu_initdata"),
     "tpm": ("src/hv_tpm.c", "hv_map_tpm"),
     "sparse_identity": ("src/platform_identity.c", "platform_is_j414s"),
@@ -89,6 +97,16 @@ def validate(root: Path) -> tuple[str, dict[str, str], dict[str, object]]:
             continue
         if "bcm4388_legacy_dormant_handoff_install(" in source.read_text(encoding="utf-8"):
             raise SystemExit(f"dormant BCM4388 core acquired a runtime call site: {source}")
+
+    # Same rule for the media profile: compiling it must not be permission to
+    # read or write audio/camera hardware.  src/proxy.c dispatching the explicit
+    # host request is the only legal caller; anything in hv.c, main.c or kboot.c
+    # would make a plain boot touch these devices.
+    for source in (root / "src").glob("*.c"):
+        if source.name in ("media_handoff.c", "proxy.c"):
+            continue
+        if "media_handoff_init(" in source.read_text(encoding="utf-8"):
+            raise SystemExit(f"media handoff acquired an automatic call site: {source}")
 
     integration = run(
         root,
