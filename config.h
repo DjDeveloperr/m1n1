@@ -76,6 +76,15 @@
 // profile; compiling this capability never reserves or mutates wireless state.
 #define ENABLE_J414S_WINDOWS_WIRELESS_HANDOFF
 
+// Opt-in proxy operation for the J414s media profile (MCA/ADMAC audio, AOP PDM
+// microphones, ISP camera).  Like the wireless handoff above, compiling this
+// capability neither reads nor mutates any media device: media_handoff.c has no
+// automatic call site anywhere in m1n1, so a boot that never issues the
+// explicit P_MEDIA_HANDOFF_INIT proxy request behaves exactly as it does
+// today.  The operation itself defaults to a read-only census; each hardware
+// write it can perform needs its own flag bit on top.
+#define ENABLE_J414S_WINDOWS_MEDIA_HANDOFF
+
 #if defined(ENABLE_NATIVE_AIC_PASSTHROUGH) && !defined(ENABLE_VGIC_MODULE)
 #error "ENABLE_NATIVE_AIC_PASSTHROUGH requires ENABLE_VGIC_MODULE -- see config.h comment above"
 #endif

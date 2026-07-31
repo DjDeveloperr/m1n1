@@ -16,6 +16,7 @@
 #include "kboot.h"
 #include "malloc.h"
 #include "mcc.h"
+#include "media_handoff.h"
 #include "memory.h"
 #include "nvme.h"
 #include "pcie.h"
@@ -690,6 +691,10 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
         case P_ATCPHY_ARM_GUEST_MODE:
             atcphy_arm_guest_mode(request->args[0], (atcphy_mode_t)request->args[1],
                                   request->args[2] != 0, request->args[3] != 0);
+            break;
+
+        case P_MEDIA_HANDOFF_INIT:
+            reply->retval = media_handoff_init((u32)request->args[0]);
             break;
 
         default:

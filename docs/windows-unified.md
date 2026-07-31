@@ -17,8 +17,10 @@ One image contains the non-conflicting capabilities needed by every profile:
 - J414s MTP/DockChannel firmware, keyboard, trackpad, and backlight preboot;
 - PCIe initialization plus the guarded ANS and BCM4388 proxy helpers;
 - a dormant, versioned BCM4388 SID1 descriptor/rollback transaction core;
-- GPU DT/initdata/calibration production; and
-- an EL2 TPM 2.0 CRB with the host engine bridge.
+- GPU DT/initdata/calibration production;
+- an EL2 TPM 2.0 CRB with the host engine bridge; and
+- the J414s media-profile census (MCA/ADMAC audio, AOP microphones, ISP
+  camera), which has no automatic call site at all.
 
 Compiling a capability is not permission to mutate its device.  Baseline MTP
 and the non-proxy USB Type-C host policy are the only automatic J414s
@@ -84,6 +86,41 @@ firmware.
 TPM is attached only through `hv.attach_tpm(...)`; no attachment means no CRB
 mapping.  A refused or corrupt host store fails loud instead of presenting a
 TPM that can lose state.
+
+## Media profile
+
+`AppleMcaAudio`, `AppleAopAudio` and `AppleIsp` each own every mutation of their
+own device: MCA raises its own PMGR chain and installs its own translating
+`dart-sio` SID-2 domain, ISP raises `ps_isp_*` and *adopts* `dart-isp0`'s
+inherited page table, and AOP writes to no DART at all.  There is therefore no
+firmware handoff to perform and no descriptor to publish -- unlike wireless,
+nothing can DMA before its driver exists.
+
+What is missing is evidence.  Three of those drivers' load-bearing
+preconditions are only observable at EL2, before the guest exists, and are
+currently assumed.  `p.media_handoff_init(flags)` checks them:
+
+- the iBoot-placed ISP firmware carveout is proven to lie outside every byte
+  m1n1 or the guest can allocate (a refusal if it ever stops being true);
+- the AOP's DRAM segments are located against that same window and reported;
+- `dart-aop` streams 0 and 10 are read and evaluated against
+  `AppleAopAudio`'s exact `DVA == PA` precondition.
+
+Two flags add optional behaviour on top; `flags = 0` writes nothing anywhere.
+`MEDIA_HANDOFF_FLAG_PROBE_GATED_DARTS` extends the census to `dart-sio` and
+`dart-isp0`, whose PMGR gates must be raised first and are then deliberately
+left raised, because power-gating a DART discards the very translation
+`AppleIsp` adopts.  `MEDIA_HANDOFF_FLAG_MCA_CLOCK_MUXES` programs the six MCA
+clock muxes the way `clk_set_mca_muxes()` does on the kboot path this profile
+never takes; it selects an NCO source and cannot enable MCLK, raise a `ps_mcaN`,
+or reach an amplifier.
+
+Compiling this capability is not permission to use it, and the rule is enforced
+rather than documented: `tools/build-j414s-windows-unified.py` refuses an image
+in which `media_handoff_init(` appears anywhere outside `src/media_handoff.c`
+and the `src/proxy.c` dispatcher.  A boot that never issues the request behaves
+exactly as it does today.  The profile publishes no interrupt from m1n1's side
+and does not mask, retarget or software-trigger any AIC line.
 
 ## Build and seal
 

@@ -735,6 +735,9 @@ class M1N1Proxy(Reloadable):
 
     P_CPUFREQ_INIT = 0x1300
 
+    # J414s media profile; keep in sync with src/proxy.h
+    P_MEDIA_HANDOFF_INIT = 0x1600
+
     def __init__(self, iface, debug=False):
         self.debug = debug
         self.iface = iface
@@ -1272,6 +1275,15 @@ class M1N1Proxy(Reloadable):
 
     def cpufreq_init(self):
         return self.request(self.P_CPUFREQ_INIT)
+
+    def media_handoff_init(self, flags=0):
+        """J414s media profile census; see m1n1.media_handoff for the flags.
+
+        flags=0 (the default) performs no register write of any kind.  There is
+        no automatic call site for this operation anywhere in m1n1: a boot that
+        never calls it is unchanged.
+        """
+        return self.request(self.P_MEDIA_HANDOFF_INIT, flags, signed=True)
 
 __all__.extend(k for k, v in globals().items()
                if (callable(v) or isinstance(v, type)) and v.__module__ == __name__)
