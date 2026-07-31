@@ -4,7 +4,6 @@
 #include "assert.h"
 #include "cpu_regs.h"
 #include "exception.h"
-#include "gxf.h"
 #include "smp.h"
 #include "string.h"
 #include "uart.h"
@@ -749,32 +748,6 @@ void hv_add_time(s64 time)
 static void hv_carrier_observe_x18(struct exc_info *ctx)
 {
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
-    /*
-     * PERFORMANCE: this observation is a startup-carrier gate only, and it is
-     * expensive -- six hv_translate() calls, i.e. six AT s12e1{r,w} full
-     * two-stage table walks plus a PAR_EL1 save/restore and an in_gl12() probe
-     * each.  It is reached up to three times per EL2 exit (hv_exc_exit(), then
-     * hv_update_fiq(), then hv_carrier_drain_pending()), so it dominated the
-     * cost of every VM exit for the entire life of the guest.
-     *
-     * Every consumer of what it computes is confined to the pre-handoff
-     * carrier window:
-     *   - carrier_stack_ready / carrier_delivery_proven gate
-     *     hv_carrier_irq_pending(), which already returns false outright once
-     *     hv_native_aic_windows_ready() (see that function's first test);
-     *   - the only other reader is the deferred-carrier diagnostic in
-     *     hv_exc_irq(), which sits inside an explicit
-     *     "windows_active && !windows_ready" branch.
-     * APs started by Windows after the CONFIG handoff never take the carrier
-     * path at all (hv_native_aic_enter_cpu() computes startup_carrier == false
-     * once windows_aic_enabled is set), so they have no use for it either.
-     *
-     * Therefore stop paying for it the moment Windows owns AIC2.  Nothing
-     * observable changes before the handoff.
-     */
-    if (hv_native_aic_windows_ready())
-        return;
-
     if (ctx == NULL || !hv_native_aic_windows_active() ||
         (FIELD_GET(SPSR_M, ctx->spsr) >> 2) != 1)
         return;
@@ -1041,53 +1014,33 @@ static void hv_update_fiq(struct exc_info *ctx)
          * assert HCR.VI.  The HAL then takes an ordinary IRQ and reads the AIC
          * EVENT hook, which returns the native Apple source value 2 or 3.
          */
-        /*
-         * PERFORMANCE: reg_clr()/reg_set() are each a read-modify-write of the
-         * same implementation-defined register, so the original four call sites
-         * cost two reads and two writes on every single EL2 exit even in the
-         * overwhelmingly common case where neither timer changed state.  Fold
-         * them into one read and at most one write.
-         *
-         * This is safe because PSTATE.F is set for the whole of this exception
-         * (taking an exception to EL2 masks FIQ, and hv_exc_entry() only ever
-         * clears the SError mask), so no physical timer FIQ can be delivered
-         * between the P decision and the V decision either way.  The enables
-         * only have to be correct at the eret.
-         */
-        u64 tmr_ena = mrs(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2);
-        u64 new_tmr_ena = tmr_ena;
-
         if (mrs(CNTP_CTL_EL02) == (CNTx_CTL_ISTATUS | CNTx_CTL_ENABLE)) {
             fiq_pending = true;
-            new_tmr_ena &= ~VM_TMR_FIQ_ENA_ENA_P;
+            reg_clr(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_P);
             if (!PERCPU(timer_p_reflection_pending)) {
                 PERCPU(timer_p_fiq_count)++;
                 PERCPU(timer_p_reflection_pending) = true;
                 PERCPU(timer_p_event_unread) = true;
             }
         } else {
-            new_tmr_ena |= VM_TMR_FIQ_ENA_ENA_P;
+            reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_P);
             PERCPU(timer_p_reflection_pending) = false;
             PERCPU(timer_p_event_unread) = false;
         }
 
         if (mrs(CNTV_CTL_EL02) == (CNTx_CTL_ISTATUS | CNTx_CTL_ENABLE)) {
             fiq_pending = true;
-            new_tmr_ena &= ~VM_TMR_FIQ_ENA_ENA_V;
+            reg_clr(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_V);
             if (!PERCPU(timer_v_reflection_pending)) {
                 PERCPU(timer_v_fiq_count)++;
                 PERCPU(timer_v_reflection_pending) = true;
                 PERCPU(timer_v_event_unread) = true;
             }
         } else {
-            new_tmr_ena |= VM_TMR_FIQ_ENA_ENA_V;
+            reg_set(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENA_ENA_V);
             PERCPU(timer_v_reflection_pending) = false;
             PERCPU(timer_v_event_unread) = false;
         }
-
-        if (new_tmr_ena != tmr_ena)
-            msr(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, new_tmr_ena);
-
         hv_native_aic_doorbell_sync();
     } else if (hv_native_aic_windows_active()) {
         /*
@@ -1436,25 +1389,6 @@ static void hv_timer_reflect_guest_rearm(bool physical, bool control_write, u64 
     hv_write_hcr(mrs(HCR_EL2) & ~HCR_VI);
     hv_native_aic_doorbell_sync();
 }
-#endif
-
-/*
- * The PMUv3 emulation below is reached through HACR_EL2.TRAP_PMUV3, which the
- * host sets for the whole life of the guest (proxyclient/m1n1/hv/__init__.py).
- * Every one of its cases used to log unconditionally, i.e. a synchronous
- * console write -- over USB, from inside a guest trap handler, before
- * hv_exc_entry() has even taken the big hypervisor lock.  That is several
- * orders of magnitude more expensive than the trap it is describing, so any
- * Windows component that polls a PMUv3 register at runtime would fall off a
- * cliff.  Keep the trace, but behind a switch that is off by default.
- */
-// #define DEBUG_PMUV3_REDIRECT
-#ifdef DEBUG_PMUV3_REDIRECT
-#define pmuv3_printf(...) printf(__VA_ARGS__)
-#else
-#define pmuv3_printf(...)                                                                          \
-    do {                                                                                           \
-    } while (0)
 #endif
 
 #define SYSREG_MAP(sr, to)                                                                         \
@@ -1807,7 +1741,7 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                     calculated |= PMCR_FZO;
                 }
                 calculated |= ((BIT(6)) | (BIT(7)));
-                pmuv3_printf("HV PMUv3 Redirect: mrs x%ld, PMCR_EL0 = 0x%lx\n", rt, calculated);
+                printf("HV PMUv3 Redirect: mrs x%ld, PMCR_EL0 = 0x%lx\n", rt, calculated);
                 regs[rt] = calculated;
             }
             else {
@@ -1865,7 +1799,7 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                     msr(SYS_IMP_APL_PMCR0, pmcr0_value);
                     sysop("isb");
                 }
-                pmuv3_printf("HV PMUv3 Redirect (OK): msr PMCR_EL0, x%ld = 0x%lx\n", rt, regs[rt]);
+                printf("HV PMUv3 Redirect (OK): msr PMCR_EL0, x%ld = 0x%lx\n", rt, regs[rt]);
             }
             return true;
         SYSREG_MAP(SYS_PMCCNTR_EL0, SYS_IMP_APL_PMC0)
@@ -1888,7 +1822,7 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                 // (bit set to 1 in this case means disable filtering...not sure why it's backwards.)
                 //
                 calculated_value |= BIT(27);
-                pmuv3_printf("HV PMUv3 Redirect: mrs x%ld, PMCCFILTR_EL0 = 0x%lx\n", rt, calculated_value);
+                printf("HV PMUv3 Redirect: mrs x%ld, PMCCFILTR_EL0 = 0x%lx\n", rt, calculated_value);
                 regs[rt] = calculated_value;
             }
             else {
@@ -1912,7 +1846,7 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                 sysop("isb");
                 msr(SYS_IMP_APL_PMCR1, pmcr1_value);
                 sysop("isb");
-                pmuv3_printf("HV PMUv3 Redirect (OK): msr PMCCFILTR_EL0, x%ld = 0x%lx\n", rt, regs[rt]);
+                printf("HV PMUv3 Redirect (OK): msr PMCCFILTR_EL0, x%ld = 0x%lx\n", rt, regs[rt]);
             }
             return true;
         case SYSREG_ISS(SYS_PMCEID0_EL0):
@@ -1921,13 +1855,13 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
             //
             if(is_read) {
                 regs[rt] = 0;
-                pmuv3_printf("HV PMUv3 Redirect: mrs x%ld, PMCEID0_EL0 = 0x%lx\n", rt, regs[rt]);
+                printf("HV PMUv3 Redirect: mrs x%ld, PMCEID0_EL0 = 0x%lx\n", rt, regs[rt]);
             }
             else {
                 //
                 // Do nothing here.
                 //
-                pmuv3_printf("HV PMUv3 Redirect (skipped write): msr PMCEID0_EL0, x%ld = 0x%lx\n", rt, regs[rt]);
+                printf("HV PMUv3 Redirect (skipped write): msr PMCEID0_EL0, x%ld = 0x%lx\n", rt, regs[rt]);
             }
             return true;
         case SYSREG_ISS(SYS_PMCEID1_EL0):
@@ -1936,10 +1870,10 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
             //
             if(is_read) {
                 regs[rt] = 0;
-                pmuv3_printf("HV PMUv3 Redirect: mrs x%ld, PMCEID1_EL0 = 0x%lx\n", rt, regs[rt]);
+                printf("HV PMUv3 Redirect: mrs x%ld, PMCEID1_EL0 = 0x%lx\n", rt, regs[rt]);
             }
             else {
-                pmuv3_printf("HV PMUv3 Redirect (skipped write): msr PMCEID1_EL0, x%ld = 0x%lx\n", rt, regs[rt]);
+                printf("HV PMUv3 Redirect (skipped write): msr PMCEID1_EL0, x%ld = 0x%lx\n", rt, regs[rt]);
             }
             return true;
         case SYSREG_ISS(SYS_PMCNTENCLR_EL0):
@@ -1952,7 +1886,7 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                 if((pmcr0_value & BIT(0)) != 0) {
                     calculated_value |= BIT(31);
                 }
-                pmuv3_printf("HV PMUv3 Redirect: mrs x%ld, PMCNTENCLR_EL0 = 0x%lx\n", rt, calculated_value);
+                printf("HV PMUv3 Redirect: mrs x%ld, PMCNTENCLR_EL0 = 0x%lx\n", rt, calculated_value);
                 regs[rt] = calculated_value;
             }
             else {
@@ -1969,7 +1903,7 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                     sysop("isb");
                     msr(SYS_IMP_APL_PMCR0, pmcr0_value);
                     sysop("isb");
-                    pmuv3_printf("HV PMUv3 Redirect (OK): msr PMCNTENCLR_EL0, x%ld = 0x%lx\n", rt, regs[rt]);
+                    printf("HV PMUv3 Redirect (OK): msr PMCNTENCLR_EL0, x%ld = 0x%lx\n", rt, regs[rt]);
                 }
             }
             return true;
@@ -1983,7 +1917,7 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                 if((pmcr0_value & BIT(0)) != 0) {
                     calculated_value |= BIT(31);
                 }
-                pmuv3_printf("HV PMUv3 Redirect: mrs x%ld, PMCNTENSET_EL0 = 0x%lx\n", rt, calculated_value);
+                printf("HV PMUv3 Redirect: mrs x%ld, PMCNTENSET_EL0 = 0x%lx\n", rt, calculated_value);
                 regs[rt] = calculated_value;
             }
             else {
@@ -2000,7 +1934,7 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                     sysop("isb");
                     msr(SYS_IMP_APL_PMCR0, pmcr0_value);
                     sysop("isb");
-                    pmuv3_printf("HV PMUv3 Redirect (OK): msr PMCNTENSET_EL0, x%ld = 0x%lx\n", rt, regs[rt]);
+                    printf("HV PMUv3 Redirect (OK): msr PMCNTENSET_EL0, x%ld = 0x%lx\n", rt, regs[rt]);
                 }
             }
             return true;
@@ -2043,7 +1977,7 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                 if((pmcr0_value & BIT(12)) != 0) {
                     calculated_value |= BIT(31);
                 }
-                pmuv3_printf("HV PMUv3 Redirect: mrs x%ld, PMINTENCLR_EL1 = 0x%lx\n", rt, calculated_value);
+                printf("HV PMUv3 Redirect: mrs x%ld, PMINTENCLR_EL1 = 0x%lx\n", rt, calculated_value);
                 regs[rt] = calculated_value;
             }
             else {
@@ -2059,7 +1993,7 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                     sysop("isb");
                     msr(SYS_IMP_APL_PMCR0, pmcr0_value);
                     sysop("isb");
-                    pmuv3_printf("HV PMUv3 Redirect (OK): msr PMINTENCLR_EL1, x%ld = 0x%lx\n", rt, regs[rt]);
+                    printf("HV PMUv3 Redirect (OK): msr PMINTENCLR_EL1, x%ld = 0x%lx\n", rt, regs[rt]);
                 }
 
             }
@@ -2074,7 +2008,7 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                 if((pmcr0_value & BIT(12)) != 0) {
                     calculated_value |= BIT(31);
                 }
-                pmuv3_printf("HV PMUv3 Redirect: mrs x%ld, PMINTENSET_EL1 = 0x%lx\n", rt, calculated_value);
+                printf("HV PMUv3 Redirect: mrs x%ld, PMINTENSET_EL1 = 0x%lx\n", rt, calculated_value);
                 regs[rt] = calculated_value;
             }
             else {
@@ -2090,7 +2024,7 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                     sysop("isb");
                     msr(SYS_IMP_APL_PMCR0, pmcr0_value);
                     sysop("isb");
-                    pmuv3_printf("HV PMUv3 Redirect (OK): msr PMINTENSET_EL1, x%ld = 0x%lx\n", rt, regs[rt]);
+                    printf("HV PMUv3 Redirect (OK): msr PMINTENSET_EL1, x%ld = 0x%lx\n", rt, regs[rt]);
                 }
             }
             return true;
@@ -2100,10 +2034,10 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
             //
             if(is_read) {
                 regs[rt] = 0;
-                pmuv3_printf("HV PMUv3 Redirect: mrs x%ld, PMMIR_EL1 = 0x%lx\n", rt, regs[rt]);
+                printf("HV PMUv3 Redirect: mrs x%ld, PMMIR_EL1 = 0x%lx\n", rt, regs[rt]);
             }
             else {
-                pmuv3_printf("HV PMUv3 Redirect (skipped write): msr PMMIR_EL1, x%ld = 0x%lx\n", rt, regs[rt]);
+                printf("HV PMUv3 Redirect (skipped write): msr PMMIR_EL1, x%ld = 0x%lx\n", rt, regs[rt]);
             }
             return true;
         case SYSREG_ISS(SYS_PMOVSCLR_EL0):
@@ -2123,7 +2057,7 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                         calculated_value |= BIT(31);
                     }
                 }
-                pmuv3_printf("HV PMUv3 Redirect: mrs x%ld, PMOVSCLR_EL0 = 0x%lx\n", rt, calculated_value);
+                printf("HV PMUv3 Redirect: mrs x%ld, PMOVSCLR_EL0 = 0x%lx\n", rt, calculated_value);
                 regs[rt] = calculated_value;
             }
             else {
@@ -2149,7 +2083,7 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                         msr(SYS_IMP_APL_PMCR0, pmcr0_value);
                         sysop("isb");
                     }
-                pmuv3_printf("HV PMUv3 Redirect (OK): msr PMOVSCLR_EL0, x%ld = 0x%lx\n", rt, regs[rt]);
+                printf("HV PMUv3 Redirect (OK): msr PMOVSCLR_EL0, x%ld = 0x%lx\n", rt, regs[rt]);
                 }
             }
             return true;
@@ -2170,7 +2104,7 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
                         calculated_value |= BIT(31);
                     }
                 }
-                pmuv3_printf("HV PMUv3 Redirect: mrs x%ld, PMOVSSET_EL0 = 0x%lx\n", rt, calculated_value);
+                printf("HV PMUv3 Redirect: mrs x%ld, PMOVSSET_EL0 = 0x%lx\n", rt, calculated_value);
                 regs[rt] = calculated_value;
             }
             else {
@@ -2183,21 +2117,21 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
             //for now hardcode to set the cycle counter, this will very likely need to change
             if(is_read) {
                 regs[rt] = 31;
-                pmuv3_printf("HV PMUv3 Redirect: mrs x%ld, PMSELR_EL0 = 0x%lx\n", rt, regs[rt]);
+                printf("HV PMUv3 Redirect: mrs x%ld, PMSELR_EL0 = 0x%lx\n", rt, regs[rt]);
             }
             else {
-                pmuv3_printf("HV PMUv3 Redirect (skipped write): msr PMSELR_EL0, x%ld = 0x%lx\n", rt, regs[rt]);
+                printf("HV PMUv3 Redirect (skipped write): msr PMSELR_EL0, x%ld = 0x%lx\n", rt, regs[rt]);
             }
             return true;
         //SYSREG_MAP(SYS_PMSWINC_EL0, SYS_IMP_APL_PMC3)
         case SYSREG_ISS(SYS_PMUSERENR_EL0):
             if(is_read) {
                 regs[rt] = PERCPU(guest_pmuserenr);
-                pmuv3_printf("HV PMUv3 Redirect: mrs x%ld, PMUSERENR_EL0 = 0x%lx\n", rt, regs[rt]);
+                printf("HV PMUv3 Redirect: mrs x%ld, PMUSERENR_EL0 = 0x%lx\n", rt, regs[rt]);
             }
             else {
                 PERCPU(guest_pmuserenr) = regs[rt] & ~PMUSERENR_RESERVED;
-                pmuv3_printf("HV PMUv3 Redirect (OK): msr PMUSERENR_EL0, x%ld = 0x%lx\n",
+                printf("HV PMUv3 Redirect (OK): msr PMUSERENR_EL0, x%ld = 0x%lx\n",
                        rt, PERCPU(guest_pmuserenr));
             }
            return true;
@@ -2509,27 +2443,11 @@ static bool hv_handle_msr(struct exc_info *ctx, u64 iss)
 
 static void hv_get_context(struct exc_info *ctx)
 {
-    /*
-     * PERFORMANCE: hv_get_spsr()/elr()/esr()/far()/afsr1() each call in_gl12(),
-     * and in_gl12() calls gxf_enabled(), so the five accessors together cost
-     * five GXF_STATUS_EL1 reads plus ten SPRR_CONFIG_EL1/GXF_CONFIG_EL1 reads
-     * on top of the five values we actually want.  The guarded-mode state
-     * cannot change between them -- nothing here executes genter/gexit -- so
-     * resolve it once.  Identical semantics, one probe instead of five.
-     */
-    if (in_gl12()) {
-        ctx->spsr = mrs(SYS_IMP_APL_SPSR_GL1);
-        ctx->elr = mrs(SYS_IMP_APL_ELR_GL1);
-        ctx->esr = mrs(SYS_IMP_APL_ESR_GL1);
-        ctx->far = mrs(SYS_IMP_APL_FAR_GL1);
-        ctx->afsr1 = mrs(SYS_IMP_APL_AFSR1_GL1);
-    } else {
-        ctx->spsr = mrs(SPSR_EL2);
-        ctx->elr = mrs(ELR_EL2);
-        ctx->esr = mrs(ESR_EL2);
-        ctx->far = mrs(FAR_EL2);
-        ctx->afsr1 = mrs(AFSR1_EL2);
-    }
+    ctx->spsr = hv_get_spsr();
+    ctx->elr = hv_get_elr();
+    ctx->esr = hv_get_esr();
+    ctx->far = hv_get_far();
+    ctx->afsr1 = hv_get_afsr1();
     ctx->sp[0] = mrs(SP_EL0);
     ctx->sp[1] = mrs(SP_EL1);
     ctx->sp[2] = (u64)ctx;

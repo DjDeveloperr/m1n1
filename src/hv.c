@@ -506,22 +506,6 @@ void hv_pin_cpu(int cpu)
 
 void hv_write_hcr(u64 val)
 {
-    /*
-     * PERFORMANCE: when GXF is enabled, HCR_EL2 is a guarded register and every
-     * write has to cross into GL2 -- gxf_enabled() alone is three system
-     * register reads, and gl2_call() is a genter/gexit pair around a stack
-     * switch.  Several callers on the hot path (hv_timer_reflect_guest_rearm(),
-     * which runs on every trapped guest timer register write, and
-     * hv_native_aic_doorbell_sync()) recompute the same HCR value they already
-     * have and write it back unconditionally.  Writing HCR_EL2 with the value
-     * it already holds has no architectural effect, so elide it.
-     *
-     * The recursive call made by gl2_call() lands here again with the register
-     * still unequal to val, so it always reaches the msr.
-     */
-    if (mrs(HCR_EL2) == val)
-        return;
-
     if (gxf_enabled() && !in_gl12())
         gl2_call(hv_write_hcr, val, 0, 0, 0);
     else
