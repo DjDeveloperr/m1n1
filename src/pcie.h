@@ -34,6 +34,30 @@ typedef uint64_t u64;
 #define PCIE_T602X_MSIMAP_VALID              UINT32_C(0x80000000)
 #define PCIE_T602X_PORT_RID2SID_ENTRY_COUNT  32
 
+/*
+ * The 0xfffff000 doorbell is a property of the APCIE controller, not of the
+ * BCM4388: /arm-io/apcie carries `msi-address = 0xfffff000`, `#msi-vectors =
+ * 32` and `msi-vector-offset = 1672` for every port.  The BCM4388-flavoured
+ * spelling above predates the generic per-port path, so alias it rather than
+ * duplicating the literal.
+ */
+#define PCIE_T602X_MSI_DOORBELL_ADDRESS      PCIE_T602X_BCM4388_MSI_ADDRESS
+
+/*
+ * Port interrupt status, Linux pcie-apple.c PORT_INTSTAT (write-1-to-clear).
+ * Two of its bits are a free MSI-path diagnostic that costs nothing to arm:
+ * MSI_ERR is raised when the port cannot deliver an inbound MSI write, and
+ * MSI_BAD_DATA when the write's data payload falls outside the vector map
+ * programmed at PORT_MSIMAP.  Absolute addresses on J414s, derived from the
+ * per-port block stride (reg[8 + 5N]): port 0 = 0x594008100, port 1 =
+ * 0x595008100.  Both are readable from the m1n1 hypervisor while the guest
+ * runs, so a "Windows never gets an interrupt" report can be split into
+ * "the device never sent one" and "the port refused it" without a rebuild.
+ */
+#define PCIE_T602X_PORT_INTSTAT              UINT64_C(0x100)
+#define PCIE_T602X_PORT_INT_MSI_ERR          (UINT32_C(1) << 18)
+#define PCIE_T602X_PORT_INT_MSI_BAD_DATA     (UINT32_C(1) << 19)
+
 struct pcie_t602x_mmio_ops {
     int (*read32)(void *context, u64 address, u32 *value);
     int (*write32)(void *context, u64 address, u32 value);
@@ -318,6 +342,30 @@ int pcie_port_release_perst(const struct pcie_port_bringup_ops *ops, void *conte
  */
 int pcie_port_start_link(const struct pcie_port_bringup_ops *ops, void *context,
                          const struct pcie_port_bringup *cfg);
+
+enum pcie_port_msi_error {
+    PCIE_PORT_MSI_OK = 0,
+    PCIE_PORT_MSI_ERR_INVALID_ARGUMENT = -1,
+    PCIE_PORT_MSI_ERR_ADDRESS_WRITE = -2,
+    PCIE_PORT_MSI_ERR_MAP_WRITE = -3,
+    PCIE_PORT_MSI_ERR_ENABLE_WRITE = -4,
+    PCIE_PORT_MSI_ERR_ADDRESS_READBACK = -5,
+    PCIE_PORT_MSI_ERR_MAP_READBACK = -6,
+    PCIE_PORT_MSI_ERR_ENABLE_READBACK = -7,
+};
+
+/*
+ * Phase 3, mirroring the t602x branch of Linux's apple_pcie_port_setup_irq():
+ * point the port's MSI decoder at the 0xfffff000 doorbell, fill PORT_MSIMAP
+ * with the identity vector map, set PORT_MSICFG_EN, then clear the two MSI
+ * error bits in PORT_INTSTAT so anything latched afterwards belongs to the OS.
+ *
+ * Every write is read back.  PORT_MSICFG is read-modify-write so the L2MSINUM
+ * field the upstream T602x bring-up block leaves behind is preserved; that
+ * field is unused by the msimap-style decoder, and the existing BCM4388
+ * transaction has always written `prior | EN`.
+ */
+int pcie_port_program_msi(const struct pcie_port_bringup_ops *ops, void *context, u64 port_base);
 
 int pcie_init(void);
 /* Exact-J414s opt-in: initialize only APCIE port 0 and require link-up. */

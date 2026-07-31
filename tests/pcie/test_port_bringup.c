@@ -710,6 +710,244 @@ static void test_register_offsets(void)
               "PHY_LANE_CFG_REFCLKCGEN is BIT(30) | BIT(31)");
 }
 
+/* ---------------------------------------------------------------------------
+ * pcie_port_program_msi(): the port MSI decoder.
+ *
+ * Reference: the t602x branch of apple_pcie_port_setup_irq() in
+ * drivers/pci/controller/pcie-apple.c -- doorbell low, doorbell high, identity
+ * PORT_MSIMAP for every vector, then PORT_MSICFG_EN.  These tests pin that
+ * ordering, because enabling the decoder before the map is complete would
+ * deliver messages to the wrong AIC line rather than to none at all.
+ * ------------------------------------------------------------------------- */
+
+#define MSI_TRACE_MAX 160
+
+struct msi_event {
+    u64 address;
+    u32 value;
+    bool is_set;
+};
+
+struct msi_fake {
+    struct msi_event writes[MSI_TRACE_MAX];
+    unsigned write_count;
+    bool overflow;
+
+    u32 msi_config;
+    u32 msi_address_lo;
+    u32 msi_address_hi;
+    u32 msimap[PCIE_T602X_PORT_MSI_VECTOR_COUNT];
+    u32 intstat;
+
+    unsigned bad_accesses;
+
+    /* Fault injection: first access to this address fails / is corrupted. */
+    u64 fail_write_address;
+    u64 corrupt_read_address;
+    u32 corrupt_read_value;
+    bool corrupt_read_armed;
+};
+
+static struct msi_fake msi_fake;
+
+static u32 *msi_reg_of(u64 address)
+{
+    const u64 base = PORT0_BASE;
+    const u64 map_base = base + PCIE_T602X_PORT_MSIMAP_OFFSET;
+
+    if (address == base + PCIE_T602X_PORT_MSI_CONFIG_OFFSET)
+        return &msi_fake.msi_config;
+    if (address == base + PCIE_T602X_PORT_MSI_ADDRESS_LO)
+        return &msi_fake.msi_address_lo;
+    if (address == base + PCIE_T602X_PORT_MSI_ADDRESS_HI)
+        return &msi_fake.msi_address_hi;
+    if (address == base + PCIE_T602X_PORT_INTSTAT)
+        return &msi_fake.intstat;
+    if (address >= map_base && address < map_base + 4 * PCIE_T602X_PORT_MSI_VECTOR_COUNT &&
+        ((address - map_base) & 3) == 0)
+        return &msi_fake.msimap[(address - map_base) / 4];
+
+    msi_fake.bad_accesses++;
+    return NULL;
+}
+
+static void msi_record(u64 address, u32 value, bool is_set)
+{
+    if (msi_fake.write_count >= MSI_TRACE_MAX) {
+        msi_fake.overflow = true;
+        return;
+    }
+    msi_fake.writes[msi_fake.write_count++] =
+        (struct msi_event){.address = address, .value = value, .is_set = is_set};
+}
+
+static int msi_read32(void *context, u64 address, u32 *value)
+{
+    u32 *reg = msi_reg_of(address);
+
+    (void)context;
+    if (!reg)
+        return -1;
+    if (msi_fake.corrupt_read_armed && address == msi_fake.corrupt_read_address) {
+        msi_fake.corrupt_read_armed = false;
+        *value = msi_fake.corrupt_read_value;
+        return 0;
+    }
+    *value = *reg;
+    return 0;
+}
+
+static int msi_write32(void *context, u64 address, u32 value)
+{
+    u32 *reg = msi_reg_of(address);
+
+    (void)context;
+    if (!reg)
+        return -1;
+    if (msi_fake.fail_write_address && address == msi_fake.fail_write_address) {
+        msi_fake.fail_write_address = 0;
+        msi_record(address, value, false);
+        return -1;
+    }
+    msi_record(address, value, false);
+    *reg = value;
+    return 0;
+}
+
+static int msi_set32(void *context, u64 address, u32 set)
+{
+    u32 *reg = msi_reg_of(address);
+
+    (void)context;
+    if (!reg)
+        return -1;
+    if (msi_fake.fail_write_address && address == msi_fake.fail_write_address) {
+        msi_fake.fail_write_address = 0;
+        msi_record(address, set, true);
+        return -1;
+    }
+    msi_record(address, set, true);
+    *reg |= set;
+    return 0;
+}
+
+static const struct pcie_port_bringup_ops msi_ops = {
+    .read32 = msi_read32,
+    .write32 = msi_write32,
+    .set32 = msi_set32,
+};
+
+static void msi_reset(void)
+{
+    memset(&msi_fake, 0, sizeof(msi_fake));
+    /*
+     * The upstream T602x bring-up block leaves PORT_MSICFG = 0x100 and
+     * PORT_MSIADDR = 0 behind, which is the state this function must fix.
+     */
+    msi_fake.msi_config = UINT32_C(0x100);
+}
+
+static void test_msi_write_order_matches_linux(void)
+{
+    const u64 base = PORT0_BASE;
+    unsigned index = 0;
+    unsigned enable_index;
+
+    msi_reset();
+    check(pcie_port_program_msi(&msi_ops, NULL, base) == PCIE_PORT_MSI_OK,
+          "MSI programming succeeds");
+
+    check(msi_fake.writes[index].address == base + PCIE_T602X_PORT_MSI_ADDRESS_LO &&
+              msi_fake.writes[index].value == PCIE_T602X_MSI_DOORBELL_ADDRESS,
+          "doorbell low half is written first");
+    index++;
+    check(msi_fake.writes[index].address == base + PCIE_T602X_PORT_MSI_ADDRESS_HI &&
+              msi_fake.writes[index].value == 0,
+          "doorbell high half is written second and is zero");
+    index++;
+
+    for (u32 vector = 0; vector < PCIE_T602X_PORT_MSI_VECTOR_COUNT; vector++) {
+        check(msi_fake.writes[index].address ==
+                      base + PCIE_T602X_PORT_MSIMAP_OFFSET + 4 * vector &&
+                  msi_fake.writes[index].value == (PCIE_T602X_MSIMAP_VALID | vector),
+              "PORT_MSIMAP gets the identity vector map");
+        index++;
+    }
+
+    enable_index = index;
+    check(msi_fake.writes[index].address == base + PCIE_T602X_PORT_MSI_CONFIG_OFFSET &&
+              msi_fake.writes[index].value == PCIE_T602X_PORT_MSI_ENABLE &&
+              msi_fake.writes[index].is_set,
+          "PORT_MSICFG_EN is a read-modify-write set, after the whole map");
+    index++;
+    check(msi_fake.writes[index].address == base + PCIE_T602X_PORT_INTSTAT &&
+              msi_fake.writes[index].value ==
+                  (PCIE_T602X_PORT_INT_MSI_ERR | PCIE_T602X_PORT_INT_MSI_BAD_DATA),
+          "the two MSI error bits are cleared last");
+    index++;
+
+    check(index == msi_fake.write_count, "no extra writes");
+    check(enable_index == 2 + PCIE_T602X_PORT_MSI_VECTOR_COUNT,
+          "the decoder is enabled only after every map entry");
+    check(msi_fake.bad_accesses == 0, "no access outside the modelled registers");
+    check_u32(msi_fake.msi_config, UINT32_C(0x101),
+              "PORT_MSICFG keeps its prior bits and gains EN");
+    check_u32(msi_fake.msi_address_lo, PCIE_T602X_MSI_DOORBELL_ADDRESS, "doorbell low");
+    check_u32(msi_fake.msi_address_hi, 0, "doorbell high");
+    for (u32 vector = 0; vector < PCIE_T602X_PORT_MSI_VECTOR_COUNT; vector++)
+        check_u32(msi_fake.msimap[vector], PCIE_T602X_MSIMAP_VALID | vector, "map entry");
+}
+
+static void test_msi_failures_leave_the_decoder_disabled(void)
+{
+    const u64 base = PORT0_BASE;
+
+    msi_reset();
+    msi_fake.fail_write_address = base + PCIE_T602X_PORT_MSIMAP_OFFSET + 4 * 5;
+    check(pcie_port_program_msi(&msi_ops, NULL, base) == PCIE_PORT_MSI_ERR_MAP_WRITE,
+          "a failed map write is reported");
+    check_u32(msi_fake.msi_config & PCIE_T602X_PORT_MSI_ENABLE, 0,
+              "a failed map write never enables the decoder");
+
+    msi_reset();
+    msi_fake.corrupt_read_address = base + PCIE_T602X_PORT_MSI_ADDRESS_LO;
+    msi_fake.corrupt_read_value = UINT32_C(0xdeadbeef);
+    msi_fake.corrupt_read_armed = true;
+    check(pcie_port_program_msi(&msi_ops, NULL, base) == PCIE_PORT_MSI_ERR_ADDRESS_READBACK,
+          "a doorbell that does not read back is reported");
+    check_u32(msi_fake.msi_config & PCIE_T602X_PORT_MSI_ENABLE, 0,
+              "a bad doorbell readback never enables the decoder");
+
+    msi_reset();
+    msi_fake.corrupt_read_address = base + PCIE_T602X_PORT_MSIMAP_OFFSET + 4 * 17;
+    msi_fake.corrupt_read_value = PCIE_T602X_MSIMAP_VALID | UINT32_C(3);
+    msi_fake.corrupt_read_armed = true;
+    check(pcie_port_program_msi(&msi_ops, NULL, base) == PCIE_PORT_MSI_ERR_MAP_READBACK,
+          "a map entry that does not read back is reported");
+    check_u32(msi_fake.msi_config & PCIE_T602X_PORT_MSI_ENABLE, 0,
+              "a bad map readback never enables the decoder");
+
+    msi_reset();
+    msi_fake.fail_write_address = base + PCIE_T602X_PORT_MSI_CONFIG_OFFSET;
+    check(pcie_port_program_msi(&msi_ops, NULL, base) == PCIE_PORT_MSI_ERR_ENABLE_WRITE,
+          "a failed enable is reported");
+}
+
+static void test_msi_invalid_arguments(void)
+{
+    const struct pcie_port_bringup_ops no_set = {
+        .read32 = msi_read32,
+        .write32 = msi_write32,
+    };
+
+    msi_reset();
+    check(pcie_port_program_msi(NULL, NULL, PORT0_BASE) == PCIE_PORT_MSI_ERR_INVALID_ARGUMENT,
+          "NULL ops is rejected");
+    check(pcie_port_program_msi(&no_set, NULL, PORT0_BASE) == PCIE_PORT_MSI_ERR_INVALID_ARGUMENT,
+          "ops without set32 is rejected");
+    check(msi_fake.write_count == 0, "a rejected call writes nothing");
+}
+
 int main(void)
 {
     test_register_offsets();
@@ -722,8 +960,12 @@ int main(void)
     test_link_down_is_reported();
     test_faults_are_propagated();
     test_invalid_arguments();
+    test_msi_write_order_matches_linux();
+    test_msi_failures_leave_the_decoder_disabled();
+    test_msi_invalid_arguments();
 
     check(!fake.overflow, "the trace buffer did not overflow");
+    check(!msi_fake.overflow, "the MSI trace buffer did not overflow");
 
     if (failures) {
         fprintf(stderr, "pcie-bringup: %d failure(s)\n", failures);

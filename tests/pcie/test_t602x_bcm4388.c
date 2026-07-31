@@ -230,6 +230,65 @@ static void test_active_msi_decoder_rejection_has_zero_writes(void)
     CHECK(mock.rid2sid[1] == 0);
 }
 
+static void seed_m1n1_programmed_msi(struct mock_mmio *mock)
+{
+    mock->msi_config = UINT32_C(0x101);
+    mock->msi_address_lo = PCIE_T602X_BCM4388_MSI_ADDRESS;
+    mock->msi_address_hi = 0;
+    for (u32 vector = 0; vector < PCIE_T602X_PORT_MSI_VECTOR_COUNT; vector++)
+        mock->msimap[vector] = PCIE_T602X_MSIMAP_VALID | vector;
+}
+
+/*
+ * pcie_init_controller() activates the decoder during port bring-up, so by the
+ * time the wireless handoff runs the port legitimately has MSI enabled with
+ * m1n1's own configuration.  That exact state must be adoptable; the
+ * transaction still disables, re-routes and re-enables, so its atomicity is
+ * unchanged.
+ */
+static void test_accepts_decoder_m1n1_itself_programmed(void)
+{
+    const u64 config = PCIE_T602X_BCM4388_PORT0_BASE + PCIE_T602X_PORT_MSI_CONFIG_OFFSET;
+    struct mock_mmio mock = {0};
+
+    seed_m1n1_programmed_msi(&mock);
+
+    CHECK(pcie_t602x_bcm4388_setup_port0(&mock_ops, &mock) == PCIE_T602X_BCM4388_OK);
+    check_write(&mock, 0, config, UINT32_C(0x100), true);
+    CHECK(mock.msi_config == UINT32_C(0x101));
+    CHECK(mock.msi_address_lo == PCIE_T602X_BCM4388_MSI_ADDRESS);
+    CHECK(mock.msi_address_hi == 0);
+    CHECK(mock.rid2sid[0] == PCIE_T602X_BCM4388_WIFI_RID2SID);
+    CHECK(mock.rid2sid[1] == PCIE_T602X_BCM4388_BLUETOOTH_RID2SID);
+    CHECK(mock.bad_accesses == 0);
+}
+
+/* One byte off anywhere in the decoder means somebody else owns it. */
+static void test_rejects_foreign_decoder_that_only_looks_like_ours(void)
+{
+    struct mock_mmio wrong_map = {0};
+    struct mock_mmio wrong_doorbell = {0};
+    struct mock_mmio wrong_high_half = {0};
+
+    seed_m1n1_programmed_msi(&wrong_map);
+    wrong_map.msimap[7] = PCIE_T602X_MSIMAP_VALID | UINT32_C(9);
+    CHECK(pcie_t602x_bcm4388_setup_port0(&mock_ops, &wrong_map) ==
+          PCIE_T602X_BCM4388_ERR_MSI_NOT_QUIESCED);
+    CHECK(wrong_map.write_count == 0);
+
+    seed_m1n1_programmed_msi(&wrong_doorbell);
+    wrong_doorbell.msi_address_lo = UINT32_C(0xffffe000);
+    CHECK(pcie_t602x_bcm4388_setup_port0(&mock_ops, &wrong_doorbell) ==
+          PCIE_T602X_BCM4388_ERR_MSI_NOT_QUIESCED);
+    CHECK(wrong_doorbell.write_count == 0);
+
+    seed_m1n1_programmed_msi(&wrong_high_half);
+    wrong_high_half.msi_address_hi = UINT32_C(1);
+    CHECK(pcie_t602x_bcm4388_setup_port0(&mock_ops, &wrong_high_half) ==
+          PCIE_T602X_BCM4388_ERR_MSI_NOT_QUIESCED);
+    CHECK(wrong_high_half.write_count == 0);
+}
+
 static void test_slot1_failure_rolls_back_slot0(void)
 {
     const u64 rid_base = PCIE_T602X_BCM4388_PORT0_BASE + PCIE_T602X_PORT_RID2SID_OFFSET;
@@ -401,6 +460,8 @@ int main(void)
     test_preserves_disabled_msi_geometry();
     test_occupied_rid_rejection_has_zero_writes();
     test_active_msi_decoder_rejection_has_zero_writes();
+    test_accepts_decoder_m1n1_itself_programmed();
+    test_rejects_foreign_decoder_that_only_looks_like_ours();
     test_slot1_failure_rolls_back_slot0();
     test_slot1_readback_mismatch_rolls_back_both_slots();
     test_msi_read_failure_leaves_decoder_disabled();
