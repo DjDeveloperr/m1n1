@@ -153,6 +153,48 @@ static int pcie_t602x_bcm4388_force_msi_disabled(const struct pcie_t602x_mmio_op
     return value == disabled_config ? 0 : -1;
 }
 
+/*
+ * Is the port-0 MSI decoder in exactly the state m1n1 itself programs?
+ *
+ * pcie_init_controller() now activates every T602x port's decoder during
+ * bring-up (doorbell, identity PORT_MSIMAP, PORT_MSICFG_EN), mirroring Linux's
+ * apple_pcie_port_setup_irq().  A transaction that runs afterwards therefore
+ * legitimately finds MSI already enabled -- by us, on the same boot, a few
+ * milliseconds earlier.
+ *
+ * Sets *is_ours only when the doorbell and all 32 map entries read back
+ * byte-for-byte as pcie_port_program_msi() writes them.  Any other
+ * enabled configuration still belongs to some other owner, so the fail-closed
+ * guard below keeps rejecting it.
+ */
+static int pcie_t602x_bcm4388_msi_is_ours(const struct pcie_t602x_mmio_ops *ops, void *context,
+                                          bool *is_ours)
+{
+    const u64 base = PCIE_T602X_BCM4388_PORT0_BASE;
+    u32 value;
+
+    *is_ours = false;
+
+    if (ops->read32(context, base + PCIE_T602X_PORT_MSI_ADDRESS_LO, &value))
+        return PCIE_T602X_BCM4388_ERR_MSI_PREFLIGHT_READ;
+    if (value != PCIE_T602X_MSI_DOORBELL_ADDRESS)
+        return PCIE_T602X_BCM4388_OK;
+    if (ops->read32(context, base + PCIE_T602X_PORT_MSI_ADDRESS_HI, &value))
+        return PCIE_T602X_BCM4388_ERR_MSI_PREFLIGHT_READ;
+    if (value != 0)
+        return PCIE_T602X_BCM4388_OK;
+
+    for (u32 vector = 0; vector < PCIE_T602X_PORT_MSI_VECTOR_COUNT; vector++) {
+        if (ops->read32(context, base + PCIE_T602X_PORT_MSIMAP_OFFSET + 4 * vector, &value))
+            return PCIE_T602X_BCM4388_ERR_MSI_PREFLIGHT_READ;
+        if (value != (PCIE_T602X_MSIMAP_VALID | vector))
+            return PCIE_T602X_BCM4388_OK;
+    }
+
+    *is_ours = true;
+    return PCIE_T602X_BCM4388_OK;
+}
+
 static int pcie_t602x_bcm4388_require_msi_quiesced(const struct pcie_t602x_mmio_ops *ops,
                                                    void *context, u32 *prior_config)
 {
@@ -160,8 +202,15 @@ static int pcie_t602x_bcm4388_require_msi_quiesced(const struct pcie_t602x_mmio_
 
     if (ops->read32(context, address, prior_config))
         return PCIE_T602X_BCM4388_ERR_MSI_PREFLIGHT_READ;
-    if ((*prior_config & PCIE_T602X_PORT_MSI_ENABLE) != 0)
-        return PCIE_T602X_BCM4388_ERR_MSI_NOT_QUIESCED;
+    if ((*prior_config & PCIE_T602X_PORT_MSI_ENABLE) != 0) {
+        bool is_ours;
+        int ret = pcie_t602x_bcm4388_msi_is_ours(ops, context, &is_ours);
+
+        if (ret)
+            return ret;
+        if (!is_ours)
+            return PCIE_T602X_BCM4388_ERR_MSI_NOT_QUIESCED;
+    }
 
     return PCIE_T602X_BCM4388_OK;
 }
@@ -539,6 +588,16 @@ static int pcie_find_rail_owner(int bridge_offset, u32 bridge_phandle)
  * pcie_init_wireless() opts in, because wireless/SD bring-up cannot proceed
  * without power and the SID-1 handoff cannot read endpoint config space
  * without routing.  Flip the default only once MSI delivery works.
+ *
+ * Status of that precondition: pcie_t602x_enable_port_msi() now activates the
+ * root ports' MSI decoders on every T602x port this file brings up, which is
+ * the firmware half of "MSI delivery works" and was previously missing
+ * outright.  The Windows half is still unproven on hardware -- the endpoint
+ * INFs opt in via MSISupported and the HAL publishes AIC lines 1672..1703 as
+ * an InterruptLineMsi/V2m bank, but no interrupt has ever been observed
+ * arriving.  Do NOT flip this default on that basis alone; re-measure the
+ * 0x144/0x7b bugchecks first, now that both this and the bus-number routing
+ * fix are in.
  */
 static bool pcie_wireless_profile = false;
 
@@ -753,6 +812,65 @@ int pcie_port_start_link(const struct pcie_port_bringup_ops *ops, void *context,
         return PCIE_PORT_BRINGUP_ERR_LINK_DOWN;
 
     return PCIE_PORT_BRINGUP_OK;
+}
+
+int pcie_port_program_msi(const struct pcie_port_bringup_ops *ops, void *context, u64 port_base)
+{
+    u32 value;
+
+    if (!ops || !ops->read32 || !ops->write32 || !ops->set32)
+        return PCIE_PORT_MSI_ERR_INVALID_ARGUMENT;
+
+    if (ops->write32(context, port_base + PCIE_T602X_PORT_MSI_ADDRESS_LO,
+                     PCIE_T602X_MSI_DOORBELL_ADDRESS) ||
+        ops->write32(context, port_base + PCIE_T602X_PORT_MSI_ADDRESS_HI, 0))
+        return PCIE_PORT_MSI_ERR_ADDRESS_WRITE;
+
+    for (u32 vector = 0; vector < PCIE_T602X_PORT_MSI_VECTOR_COUNT; vector++) {
+        if (ops->write32(context, port_base + PCIE_T602X_PORT_MSIMAP_OFFSET + 4 * vector,
+                         PCIE_T602X_MSIMAP_VALID | vector))
+            return PCIE_PORT_MSI_ERR_MAP_WRITE;
+    }
+
+    if (ops->read32(context, port_base + PCIE_T602X_PORT_MSI_ADDRESS_LO, &value))
+        return PCIE_PORT_MSI_ERR_ADDRESS_READBACK;
+    if (value != PCIE_T602X_MSI_DOORBELL_ADDRESS)
+        return PCIE_PORT_MSI_ERR_ADDRESS_READBACK;
+    if (ops->read32(context, port_base + PCIE_T602X_PORT_MSI_ADDRESS_HI, &value))
+        return PCIE_PORT_MSI_ERR_ADDRESS_READBACK;
+    if (value != 0)
+        return PCIE_PORT_MSI_ERR_ADDRESS_READBACK;
+
+    for (u32 vector = 0; vector < PCIE_T602X_PORT_MSI_VECTOR_COUNT; vector++) {
+        if (ops->read32(context, port_base + PCIE_T602X_PORT_MSIMAP_OFFSET + 4 * vector, &value))
+            return PCIE_PORT_MSI_ERR_MAP_READBACK;
+        if (value != (PCIE_T602X_MSIMAP_VALID | vector))
+            return PCIE_PORT_MSI_ERR_MAP_READBACK;
+    }
+
+    /*
+     * The decoder is enabled last, after the doorbell and the whole map read
+     * back correct: an enabled decoder pointed at a half-written map would
+     * deliver MSIs to the wrong AIC line rather than to none at all.
+     */
+    if (ops->set32(context, port_base + PCIE_T602X_PORT_MSI_CONFIG_OFFSET,
+                   PCIE_T602X_PORT_MSI_ENABLE))
+        return PCIE_PORT_MSI_ERR_ENABLE_WRITE;
+    if (ops->read32(context, port_base + PCIE_T602X_PORT_MSI_CONFIG_OFFSET, &value))
+        return PCIE_PORT_MSI_ERR_ENABLE_READBACK;
+    if ((value & PCIE_T602X_PORT_MSI_ENABLE) == 0)
+        return PCIE_PORT_MSI_ERR_ENABLE_READBACK;
+
+    /*
+     * Arm the free diagnostic: PORT_INTSTAT is write-1-to-clear, so clearing
+     * MSI_ERR/MSI_BAD_DATA here means any later read attributes them to the
+     * operating system's own MSI traffic rather than to bring-up.  A failure
+     * to clear them is not worth failing the port over.
+     */
+    (void)ops->write32(context, port_base + PCIE_T602X_PORT_INTSTAT,
+                       PCIE_T602X_PORT_INT_MSI_ERR | PCIE_T602X_PORT_INT_MSI_BAD_DATA);
+
+    return PCIE_PORT_MSI_OK;
 }
 
 #ifndef PCIE_T602X_WIRELESS_HOST_TEST
@@ -1021,6 +1139,56 @@ static const struct pcie_port_bringup_ops pcie_hw_bringup_ops = {
     .delay_us = pcie_hw_delay_us,
     .perst_set = pcie_hw_perst_set,
 };
+
+/*
+ * Activate a T602x root port's MSI decoder.
+ *
+ * This is the tail of Linux's apple_pcie_port_setup_irq() for the t602x
+ * variant (drivers/pci/controller/pcie-apple.c), which is the only published
+ * description of the sequence:
+ *
+ *     writel(lower_32_bits(DOORBELL_ADDR), base + PORT_T602X_MSIADDR);
+ *     writel(upper_32_bits(DOORBELL_ADDR), base + PORT_T602X_MSIADDR_HI);
+ *     for (i = 0; i < nvecs; i++)
+ *         writel(FIELD_PREP(PORT_MSIMAP_TARGET, i) | PORT_MSIMAP_ENABLE,
+ *                base + PORT_T602X_MSIMAP + 4 * i);
+ *     writel(PORT_MSICFG_EN, base + PORT_MSICFG);
+ *
+ * m1n1 previously wrote only the map.  The upstream T602x bring-up block
+ * earlier in this function writes PORT_MSICFG = 0x100 and PORT_MSIADDR = 0, so
+ * without this the port ends bring-up with the decoder pointed at address 0
+ * and PORT_MSICFG_EN clear: every inbound MSI is dropped.  Under Linux that is
+ * invisible because pcie-apple.c programs it; Windows has no equivalent, since
+ * the doorbell lives in the root complex rather than in anything ACPI
+ * describes, so m1n1 is the only layer that can do it.  Mu is not an option --
+ * AppleSiliconPciPlatformDxe is deliberately out of its firmware volume and it
+ * performs no PCIe port bring-up at all.
+ *
+ * PORT_MSICFG is left read-modify-write rather than assigned, so whatever the
+ * upstream sequence put in the L2MSINUM field survives; the field is unused on
+ * the msimap-style decoder and the existing BCM4388 transaction has always
+ * written `prior | EN`.
+ *
+ * Best-effort: a port whose decoder does not read back is logged and left
+ * alone.  MSI that does not work must degrade a device, never refuse the boot.
+ * The write/read-back sequence itself lives in pcie_port_program_msi() so the
+ * host tests can pin it; this wrapper only reports.
+ */
+static void pcie_t602x_enable_port_msi(u64 port_base, u32 port)
+{
+    int ret = pcie_port_program_msi(&pcie_hw_bringup_ops, NULL, port_base);
+
+    if (ret) {
+        printf("pcie: Port %d MSI decoder did not take (%d); MSI will not be delivered\n", port,
+               ret);
+        return;
+    }
+
+    printf("pcie: Port %d MSI enabled (doorbell %#x, %d vectors, cfg %#x, intstat %#x)\n", port,
+           PCIE_T602X_MSI_DOORBELL_ADDRESS, PCIE_T602X_PORT_MSI_VECTOR_COUNT,
+           read32(port_base + PCIE_T602X_PORT_MSI_CONFIG_OFFSET),
+           read32(port_base + PCIE_T602X_PORT_INTSTAT));
+}
 
 static int pcie_init_controller(int controller, const char *path, u32 allowed_port_mask,
                                 bool require_link_up)
@@ -1635,9 +1803,7 @@ static int pcie_init_controller(int controller, const char *path, u32 allowed_po
                 write32(state->port_intr2axi_base[port] + 0x80, 0x1);
 
             clear32(state->rc_base + 0x3c, 0x1);
-            for (int i = 0; i < 32; i++)
-                write32(state->port_base[port] + PCIE_T602X_PORT_MSIMAP_OFFSET + 4 * i,
-                        PCIE_T602X_MSIMAP_VALID | i);
+            pcie_t602x_enable_port_msi(state->port_base[port], port);
         }
 
         /*
