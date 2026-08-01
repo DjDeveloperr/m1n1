@@ -776,7 +776,13 @@ class ADTNode:
     def walk_tree(self):
         yield self
         for child in self:
-            yield from child
+            # `yield from child` iterates the child, which yields ITS children
+            # and stops -- so a root walk returned only the root plus its
+            # grandchildren, silently skipping every other level. On a J414s
+            # capture that is 174 of 347 nodes, including /arm-io/spi2/mesa
+            # (which trace_mesa.py looks for by walking the tree) and all of
+            # /device-tree/chosen. Recurse properly.
+            yield from child.walk_tree()
 
     def build_addr_lookup(self):
         lookup = AddrLookup()

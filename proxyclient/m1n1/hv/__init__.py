@@ -1435,6 +1435,34 @@ class HV(Reloadable):
         dev.hv = self
         self.virtio_devs[base] = dev
 
+    def attach_tpm(self, base=None):
+        """Map an emulated TPM 2.0 CRB and reserve its window.
+
+        No ADT node is created, deliberately. Unlike virtio -- which Linux
+        must discover through the device tree -- the TPM is found by Windows
+        purely through ACPI: the TPM2 table's AddressOfControlArea and the
+        MSFT0101 device's _CRS. Mu is told the base out of band, so inventing
+        an ADT node here would describe the device to an OS that never looks.
+
+        Returns the base so the caller can hand it to the firmware builder;
+        the control area Mu must publish is base + 0x40, NOT base.
+        """
+        if base is None:
+            base = self.alloc_mmio_base(self.adt, 0x1000)
+
+        if base & 0xfff:
+            raise ValueError(f"TPM base 0x{base:x} is not locality-aligned")
+
+        print(f"Adding TPM CRB @ 0x{base:x} (control area 0x{base + 0x40:x})")
+        if self.p.hv_map_tpm(base) < 0:
+            raise Exception("hv_map_tpm failed")
+
+        # RESERVED, not a tracer: the EL2 hook owns every access in this page,
+        # and a tracer would fight it for the same faults.
+        self.add_tracer(irange(base, 0x1000), "TPM", TraceMode.RESERVED)
+        self.tpm_base = base
+        return base
+
     def handle_virtio(self, reason, code, info):
         ctx = self.iface.readstruct(info, ExcInfo)
         self.virtio_ctx = info = self.iface.readstruct(ctx.data, VirtioExcInfo)

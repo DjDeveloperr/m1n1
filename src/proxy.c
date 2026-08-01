@@ -10,6 +10,7 @@
 #include "gxf.h"
 #include "heapblock.h"
 #include "hv.h"
+#include "hv_tpm.h"
 #include "iodev.h"
 #include "kboot.h"
 #include "malloc.h"
@@ -491,6 +492,9 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             break;
         case P_HV_MAP_VUART:
             hv_map_vuart(request->args[0], request->args[1], request->args[2]);
+            break;
+        case P_HV_MAP_TPM:
+            reply->retval = hv_map_tpm(request->args[0], NULL, NULL);
             break;
         case P_HV_MAP_VIRTIO:
             hv_map_virtio(request->args[0], (void *)request->args[1]);

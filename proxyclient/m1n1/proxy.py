@@ -729,6 +729,8 @@ class M1N1Proxy(Reloadable):
     P_DAPF_INIT_ALL = 0x1200
     P_DAPF_INIT = 0x1201
 
+    P_HV_MAP_TPM = 0x1400
+
     P_CPUFREQ_INIT = 0x1300
 
     def __init__(self, iface, debug=False):
@@ -1168,6 +1170,8 @@ class M1N1Proxy(Reloadable):
         return self.request(self.P_HV_PIN_CPU, cpu)
     def hv_write_hcr(self, hcr):
         return self.request(self.P_HV_WRITE_HCR, hcr)
+    def hv_map_tpm(self, base):
+        return self.request(self.P_HV_MAP_TPM, base)
     def hv_map_virtio(self, base, config):
         return self.request(self.P_HV_MAP_VIRTIO, base, config)
     def virtio_put_buffer(self, base, qu, idx, length):
