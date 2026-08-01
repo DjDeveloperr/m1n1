@@ -2,6 +2,7 @@
 
 #include "hv_tpm.h"
 #include "hv.h"
+#include "sep.h"
 #include "malloc.h"
 #include "string.h"
 #include "utils.h"
@@ -393,6 +394,21 @@ static bool handle_tpm(struct exc_info *ctx, u64 addr, u64 *val, bool write, int
     return true;
 }
 
+
+size_t hv_tpm_get_entropy(void *buffer, size_t len)
+{
+    if (!buffer || !len)
+        return 0;
+
+    /*
+     * sep_get_random() calls sep_init() itself and yields four bytes per ASC
+     * round trip, returning short on any failure. A short read is reported as
+     * such rather than topped up: a TPM handed predictable bytes is worse than
+     * a TPM that admits it has no entropy.
+     */
+    return sep_get_random(buffer, len);
+}
+
 int hv_map_tpm(u64 base, hv_tpm_backend_t *backend, void *cookie)
 {
     struct tpm_dev *dev;
@@ -422,6 +438,24 @@ int hv_map_tpm(u64 base, hv_tpm_backend_t *backend, void *cookie)
 
     printf("tpm: CRB at 0x%lx, control area 0x%lx%s\n", base, base + TPM_CTRL_REQ,
            backend ? "" : " (no engine: commands answer TPM_RC_FAILURE)");
+
+
+    /*
+     * Probe the SEP boot ROM once, here, where the result is visible on the
+     * console next to the CRB address. This is the cheapest confirmation that
+     * the entropy path works at all, and it costs eight ASC round trips.
+     * Failure is not fatal: the host-side engine has its own RNG, and an
+     * in-tree engine can refuse to start on its own terms.
+     */
+    {
+        u8 probe_bytes[32];
+        size_t got = hv_tpm_get_entropy(probe_bytes, sizeof(probe_bytes));
+
+        printf("tpm: SEP boot-ROM entropy %s (%zu/%zu bytes)\n",
+               got == sizeof(probe_bytes) ? "available" : "UNAVAILABLE", got,
+               sizeof(probe_bytes));
+        memset(probe_bytes, 0, sizeof(probe_bytes));
+    }
 
     return hv_map_hook(base, handle_tpm, TPM_LOCALITY_SIZE);
 }

@@ -67,6 +67,28 @@ struct hv_tpm_exc_info {
  * TEE ACPI Profile 4.6.3 requires Error, Cancel and Start to be clear when
  * firmware hands off after ExitBootServices. Call before entering the guest.
  */
+/*
+ * Hardware entropy from the SEP boot ROM.
+ *
+ * This is the ONLY use of the Secure Enclave sanctioned anywhere in this
+ * design, and the boundary is deliberate. `sep_get_random()` talks to the SEP
+ * *boot ROM* endpoint (SEP_EP_ROM 0xff, SEP_MSG_GETRAND 16) and needs no SEPOS
+ * boot, no SBIO, no Catacomb and no xART -- m1n1 already uses it to seed
+ * Linux's KASLR. Everything else about the SEP is unreachable from a non-macOS
+ * OS: SEPOS has never been booted on any T602x, xART's anti-replay epoch chain
+ * is anchored in a macOS filesystem store, and SKS unlock tokens are minted
+ * from a macOS credential.
+ *
+ * So: entropy, yes. Key wrapping, NV storage, attestation -- no. Do not extend
+ * this to reach for them; the TPM's keys and NV live elsewhere by necessity,
+ * and pretending otherwise would misrepresent the security model.
+ *
+ * Returns the number of bytes actually obtained, which may be short (0 if the
+ * SEP does not answer). Callers must treat a short read as failure rather than
+ * padding it out with anything weaker.
+ */
+size_t hv_tpm_get_entropy(void *buffer, size_t len);
+
 void hv_tpm_prepare_for_guest(void);
 
 #endif

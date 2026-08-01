@@ -493,6 +493,13 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
         case P_HV_MAP_VUART:
             hv_map_vuart(request->args[0], request->args[1], request->args[2]);
             break;
+        case P_HV_TPM_GET_RANDOM:
+            /* args: buffer, length. Returns bytes actually obtained, which the
+             * caller MUST check -- a short read means the SEP did not answer,
+             * not that the remainder is zero. */
+            reply->retval =
+                hv_tpm_get_entropy((void *)request->args[0], request->args[1]);
+            break;
         case P_HV_MAP_TPM:
             /*
              * args[1] selects the backend: 0 = none (every command answers
