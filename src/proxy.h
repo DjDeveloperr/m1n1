@@ -197,6 +197,9 @@ typedef enum {
 
     // J414s media profile; keep in sync with proxyclient/m1n1/media_handoff.py
     P_MEDIA_HANDOFF_INIT = 0x1600,
+
+    // Bulk host<->guest channel; keep in sync with proxyclient/m1n1/hv/xfer.py
+    P_HV_MAP_XFER = 0x1700,
 } ProxyOp;
 
 #define S_OK     0

@@ -12,6 +12,7 @@
 #include "heapblock.h"
 #include "hv.h"
 #include "hv_tpm.h"
+#include "hv_xfer.h"
 #include "iodev.h"
 #include "kboot.h"
 #include "malloc.h"
@@ -514,6 +515,15 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
                 reply->retval = hv_map_tpm_proxy(request->args[0]);
             else
                 reply->retval = -1;
+            break;
+        case P_HV_MAP_XFER:
+            /*
+             * args: doorbell base, window physical base, window size. The
+             * window is allocated by the host out of the proxy heap, which
+             * sits below the guest's boot_args phys_base and is therefore
+             * invisible to the guest's memory map -- see hv_map_xfer().
+             */
+            reply->retval = hv_map_xfer(request->args[0], request->args[1], request->args[2]);
             break;
         case P_HV_MAP_VIRTIO:
             hv_map_virtio(request->args[0], (void *)request->args[1]);

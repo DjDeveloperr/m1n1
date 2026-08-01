@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-import io, sys, traceback, struct, array, bisect, os, plistlib, signal, runpy, platform
+import io, sys, time, traceback, struct, array, bisect, os, plistlib, signal, runpy, platform
 from construct import *
 
 from ..asm import ARMAsm
@@ -17,6 +17,10 @@ from .virtutils import *
 from .virtio import *
 from .tpm import TpmExcInfo, TpmHostDevice, load_tpm_host
 from .tpm import TPM_STATUS_OK, TPM_STATUS_DECLINED
+from .xfer import (XferExcInfo, XferHostDevice, ProxyTransport,
+                   HV_XFER_REGS_SIZE, HV_XFER_PAGE_SIZE, HV_XFER_NAME_SIZE,
+                   ST_OK as XFER_ST_OK, ST_NODEV as XFER_ST_NODEV,
+                   ST_INVAL as XFER_ST_INVAL, CMD_GET as XFER_CMD_GET)
 
 __all__ = ["HV"]
 
@@ -123,6 +127,12 @@ class HV(Reloadable):
         self.tpm_dev = None
         self.tpm_profile = None
         self.tpm_engine = None
+        self.xfer_dev = None
+        self.xfer_transport = None
+        self.xfer_base = None
+        self.xfer_win = None
+        self.xfer_win_size = 0
+        self.xfer_hvcall_id = None
 
     def _reloadme(self):
         super()._reloadme()
@@ -1561,6 +1571,263 @@ class HV(Reloadable):
         self.iface.writemem(ctx.data, TpmExcInfo.build(tinfo))
         self.p.exit(EXC_RET.HANDLED)
 
+    # ------------------------------------------------------------------
+    # Bulk host<->guest channel (src/hv_xfer.c, .xfer)
+    # ------------------------------------------------------------------
+
+    def _xfer_dram_range(self):
+        """The physical DRAM window a bulk transfer may legally touch.
+
+        Matches wlan/hv_xfer's C-side derivation: ram_base is boot_args
+        phys_base rounded down to 4 GiB, and mem_size_actual is the whole of
+        physical memory, not the reduced size handed to the guest.
+        """
+        ram_base = self.u.ba.phys_base & ~0xffffffff
+        return ram_base, ram_base + self.u.ba.mem_size_actual
+
+    def xfer_translate(self, ipa, size):
+        """Translate a guest window to a physical range, or return None.
+
+        Mirrors xfer_validate_window() in src/hv_xfer.c exactly: 16 KiB
+        aligned, stage-2 mapped as plain HW pages, physically contiguous, and
+        entirely inside DRAM. The DRAM check is the one that matters -- /arm-io
+        is mapped HW too, so contiguity alone would happily let a guest aim a
+        bulk write at an MMIO aperture.
+        """
+        if size <= 0 or size % HV_XFER_PAGE_SIZE or ipa % HV_XFER_PAGE_SIZE:
+            return None
+
+        first = None
+        for off in range(0, size, HV_XFER_PAGE_SIZE):
+            pte = self.p.hv_pt_walk(ipa + off)
+            if not pte or not (pte & self.PTE_VALID):
+                return None
+            pa = pte & 0x3ffffffffc000  # GENMASK(49, 14)
+            if first is None:
+                first = pa
+            elif pa != first + off:
+                return None
+
+        lo, hi = self._xfer_dram_range()
+        if first < lo or first + size > hi:
+            return None
+        return first
+
+    def attach_xfer(self, base=None, size=1 << 20, engine=None, inbox=None,
+                    publish=None, compress=True, verbose=True):
+        """Map the bulk channel: a hooked doorbell page plus a shared window.
+
+        The window is allocated out of the proxy heap, which lives below the
+        guest's boot_args phys_base and is therefore absent from the guest's
+        memory map -- Windows will never allocate it, so nothing can clobber
+        it. It is then mapped into the guest identity (IPA == PA) as a plain
+        HW stage-2 mapping, so guest accesses to it never trap.
+
+        Returns the doorbell base. Raises on refusal; the caller is expected to
+        treat "no bulk channel" as non-fatal, because the vUART is untouched
+        either way.
+        """
+        if size <= 0 or size % HV_XFER_PAGE_SIZE:
+            raise ValueError(f"xfer window size {size:#x} is not a multiple of "
+                             f"{HV_XFER_PAGE_SIZE:#x}")
+
+        if base is None:
+            env = os.environ.get("M1N1_HV_XFER_BASE")
+            base = int(env, 0) if env else alloc_mmio_base(self.adt, HV_XFER_REGS_SIZE)
+        if base is None:
+            raise Exception("no free MMIO window for the xfer doorbell")
+        if base % HV_XFER_REGS_SIZE:
+            raise ValueError(f"xfer doorbell base {base:#x} is not 16 KiB aligned")
+
+        win = self.u.heap.memalign(HV_XFER_PAGE_SIZE, size)
+
+        if self.p.hv_map_xfer(base, win, size) < 0:
+            raise Exception(f"hv_map_xfer({base:#x}, {win:#x}, {size:#x}) failed")
+
+        # RESERVED, not a tracer: the EL2 hook owns every access to the
+        # doorbell, and the window must keep the HW mapping hv_map_xfer() just
+        # made. RESERVED is the highest TraceMode, so it wins over the "HW"
+        # tracer that already covers /arm-io and pt_update() leaves both alone.
+        self.add_tracer(irange(base, HV_XFER_REGS_SIZE), "HVXFER", TraceMode.RESERVED)
+        self.add_tracer(irange(win, size), "HVXFER-WIN", TraceMode.RESERVED)
+
+        if engine is None:
+            engine = XferHostDevice(inbox=inbox, compress=compress, verbose=verbose)
+        elif inbox is not None:
+            engine.set_inbox(inbox)
+
+        if publish:
+            for item in publish:
+                engine.publish_file(item)
+
+        self.xfer_dev = engine
+        self.xfer_transport = ProxyTransport(self.iface, self.p, self.u,
+                                             compress=compress)
+        self.xfer_base = base
+        self.xfer_win = win
+        self.xfer_win_size = size
+
+        print(f"Adding bulk xfer channel @ {base:#x} "
+              f"(window {win:#x}+{size:#x}, {size >> 10} KiB)")
+        return base
+
+    def handle_xfer(self, reason, code, info):
+        """One HV_XFER event per doorbell command (mirrors handle_tpm).
+
+        The guest's vCPU is parked inside hv_exc_proxy() until this returns, so
+        the answer is synchronous from its point of view. Every path writes an
+        explicit status back: EL2 poisons the field with -ENODEV, and anything
+        but 0 makes the guest see a failed command rather than stale window
+        bytes or a hang.
+        """
+        ctx = self.iface.readstruct(info, ExcInfo)
+        xinfo = self.iface.readstruct(ctx.data, XferExcInfo)
+
+        if self.xfer_dev is None:
+            status, result = XFER_ST_NODEV, 0
+        else:
+            status, result = self.xfer_dev.dispatch(
+                self.xfer_transport, xinfo.cmd, xinfo.tag, xinfo.off,
+                xinfo.length, xinfo.win_phys, xinfo.win_size, xinfo.name_phys)
+
+        xinfo.status = status
+        xinfo.result = result
+        self.iface.writemem(ctx.data, XferExcInfo.build(xinfo))
+        self.p.exit(EXC_RET.HANDLED)
+
+    def enable_xfer_hvcall(self, callid=0x58464552, engine=None, inbox=None,
+                           publish=None, compress=True, verbose=True):
+        """Expose the same engine through the existing BRK #0x4242 hypercall.
+
+        This front end needs NO m1n1 firmware change at all -- BRK from EL1
+        already traps to EL2 (MDCR_EL2.TDE) and lands in handle_brk(). It
+        exists so the whole data path can be proven on the next boot, before
+        anyone rebuilds and repins m1n1 for the MMIO device, and so a guest
+        that cannot conveniently map MMIO still has a way in.
+
+        Guest ABI (AArch64, EL1):
+
+            x0 = 0x58464552 ('XFER')      call id, required by the BRK ABI
+            x1 = command                  CMD_PING/OPEN/GET/PUT/CLOSE
+            x2 = window guest-physical base   (16 KiB aligned)
+            x3 = window size                  (16 KiB multiple)
+            x4 = offset into the window
+            x5 = length
+            x6 = tag (bit 31 set = guest->host stream)
+            x7 = guest-physical address of a 64-byte NUL-padded name, or 0
+            brk #0x4242
+          returns
+            x0 = status (0 = ok, negative = failure)
+            x1 = bytes actually moved
+
+        Unlike the MMIO device there is no discovery register here: if this is
+        not enabled on the host side, the BRK falls through to EL1 and Windows
+        sees a debug break. The guest must therefore only issue it when the
+        operator has explicitly turned the channel on for that boot.
+        """
+        if engine is None:
+            engine = self.xfer_dev
+        if engine is None:
+            engine = XferHostDevice(inbox=inbox, compress=compress, verbose=verbose)
+        elif inbox is not None:
+            engine.set_inbox(inbox)
+
+        if publish:
+            for item in publish:
+                engine.publish_file(item)
+
+        self.xfer_dev = engine
+        if self.xfer_transport is None:
+            self.xfer_transport = ProxyTransport(self.iface, self.p, self.u,
+                                                 compress=compress)
+
+        def handler(ctx):
+            cmd = ctx.regs[1] & 0xffffffff
+            win_ipa = ctx.regs[2]
+            win_size = ctx.regs[3]
+            off = ctx.regs[4] & 0xffffffff
+            length = ctx.regs[5] & 0xffffffff
+            tag = ctx.regs[6] & 0xffffffff
+            name_ipa = ctx.regs[7]
+
+            win_pa = self.xfer_translate(win_ipa, win_size)
+            if win_pa is None:
+                ctx.regs[0] = XFER_ST_INVAL & 0xffffffffffffffff
+                ctx.regs[1] = 0
+                return True
+
+            name_pa = 0
+            if name_ipa:
+                page = name_ipa & ~(HV_XFER_PAGE_SIZE - 1)
+                page_pa = self.xfer_translate(page, HV_XFER_PAGE_SIZE)
+                if page_pa is None or \
+                        (name_ipa & (HV_XFER_PAGE_SIZE - 1)) + HV_XFER_NAME_SIZE > HV_XFER_PAGE_SIZE:
+                    ctx.regs[0] = XFER_ST_INVAL & 0xffffffffffffffff
+                    ctx.regs[1] = 0
+                    return True
+                name_pa = page_pa + (name_ipa & (HV_XFER_PAGE_SIZE - 1))
+
+            status, result = self.xfer_dev.dispatch(
+                self.xfer_transport, cmd, tag, off, length, win_pa, win_size,
+                name_pa)
+
+            # Same invariant as xfer_window_sync() in src/hv_xfer.c: after any
+            # command that touched the window, EL2 holds no cache lines for
+            # the touched range. Always AFTER the access, never before.
+            touched = result if cmd == XFER_CMD_GET else length
+            if status == XFER_ST_OK and touched and off < win_size:
+                self.p.dc_civac(win_pa + off, min(touched, win_size - off))
+
+            ctx.regs[0] = status & 0xffffffffffffffff
+            ctx.regs[1] = result
+            return True
+
+        self.add_hvcall(callid, handler)
+        self.xfer_hvcall_id = callid
+        print(f"Bulk xfer hypercall enabled: BRK #0x4242 with x0={callid:#x}")
+        return callid
+
+    def xfer_selftest(self, size=None, rounds=3, pattern=None):
+        """Measure the bulk path end to end with no guest involvement.
+
+        This is the smallest possible first hardware test: it exercises exactly
+        the transport a GET/PUT uses (REQ_MEMWRITE and REQ_MEMREAD into the
+        shared window) and verifies the bytes, but touches no guest state and
+        needs no guest driver. Run it from the hypervisor shell.
+        """
+        if self.xfer_win is None:
+            raise Exception("no xfer channel attached; call attach_xfer() first")
+        if size is None:
+            size = self.xfer_win_size
+        if size > self.xfer_win_size:
+            raise ValueError(f"size {size:#x} exceeds the window "
+                             f"({self.xfer_win_size:#x})")
+
+        if pattern is None:
+            pattern = bytes((i * 7 + 13) & 0xff for i in range(size))
+
+        # Uncompressible, so this measures the wire and not gzip.
+        raw = ProxyTransport(self.iface, self.p, self.u, compress=False)
+
+        for i in range(rounds):
+            t0 = time.time()
+            raw.writemem(self.xfer_win, pattern)
+            t1 = time.time()
+            self.p.dc_civac(self.xfer_win, size)
+            got = raw.readmem(self.xfer_win, size)
+            t2 = time.time()
+
+            if got != pattern:
+                bad = next(j for j in range(size) if got[j] != pattern[j])
+                raise Exception(f"xfer selftest MISMATCH at offset {bad:#x}: "
+                                f"got {got[bad]:#04x}, want {pattern[bad]:#04x}")
+
+            print(f"xfer selftest {i + 1}/{rounds}: "
+                  f"write {size / (t1 - t0) / 1024:.1f} KiB/s, "
+                  f"read {size / (t2 - t1) / 1024:.1f} KiB/s, verified")
+
+        return True
+
     def handle_virtio(self, reason, code, info):
         ctx = self.iface.readstruct(info, ExcInfo)
         self.virtio_ctx = info = self.iface.readstruct(ctx.data, VirtioExcInfo)
@@ -1889,6 +2156,12 @@ class HV(Reloadable):
         self.iface.set_handler(START.HV, HV_EVENT.CPU_SWITCH, self.handle_exception)
         self.iface.set_handler(START.HV, HV_EVENT.VIRTIO, self.handle_virtio)
         self.iface.set_handler(START.HV, HV_EVENT.TPM, self.handle_tpm)
+        # Registered unconditionally, even with no channel attached. An
+        # HV_XFER event with no handler would leave the target sitting in
+        # uartproxy_run() forever with the guest parked; answering -ENODEV
+        # costs nothing and can only ever be reached by a guest that went
+        # looking for a device that is not there.
+        self.iface.set_handler(START.HV, HV_EVENT.XFER, self.handle_xfer)
         self.iface.set_handler(START.HV, HV_EVENT.PANIC, self.handle_bark)
         self.iface.set_event_handler(EVENT.MMIOTRACE, self.handle_mmiotrace)
         self.iface.set_event_handler(EVENT.IRQTRACE, self.handle_irqtrace)

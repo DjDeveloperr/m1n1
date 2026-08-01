@@ -738,6 +738,9 @@ class M1N1Proxy(Reloadable):
     # J414s media profile; keep in sync with src/proxy.h
     P_MEDIA_HANDOFF_INIT = 0x1600
 
+    # Bulk host<->guest channel; keep in sync with src/proxy.h
+    P_HV_MAP_XFER = 0x1700
+
     def __init__(self, iface, debug=False):
         self.debug = debug
         self.iface = iface
@@ -1182,6 +1185,13 @@ class M1N1Proxy(Reloadable):
         # engine: 0 = no backend (TPM_RC_FAILURE device), 1 = host engine
         # over the proxy (one HV_TPM event per command).
         return self.request(self.P_HV_MAP_TPM, base, engine)
+    def hv_map_xfer(self, base, win, win_size):
+        # base: doorbell page (16 KiB, hooked). win/win_size: the shared
+        # window, allocated out of the proxy heap so the guest's memory map
+        # never covers it. Returns 0, or negative if EL2 refused.
+        # signed=True: the C side answers -1 on refusal, and the default
+        # unsigned unpack would turn that into a very large positive number.
+        return self.request(self.P_HV_MAP_XFER, base, win, win_size, signed=True)
     def hv_map_virtio(self, base, config):
         return self.request(self.P_HV_MAP_VIRTIO, base, config)
     def virtio_put_buffer(self, base, qu, idx, length):
