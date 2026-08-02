@@ -702,6 +702,23 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             atcphy_arm_guest_mode(request->args[0], (atcphy_mode_t)request->args[1],
                                   request->args[2] != 0, request->args[3] != 0);
             break;
+        case P_ATCPHY_READ_ORIENTATION: {
+            /* See the ABI comment on P_ATCPHY_READ_ORIENTATION in proxy.h.
+             * The decode stays here in C so the client cannot drift from
+             * the STATUS bit definitions it is decoding. */
+            u32 status = 0;
+            int orientation = usb_hpm_read_orientation((u32)request->args[0], &status);
+            if (orientation < 0) {
+                reply->retval = ~0ULL;
+            } else {
+                reply->retval = (u64)status | BIT(32);
+                if (orientation != USB_HPM_ORIENTATION_NO_PLUG)
+                    reply->retval |= BIT(33);
+                if (orientation == USB_HPM_ORIENTATION_FLIPPED)
+                    reply->retval |= BIT(34);
+            }
+            break;
+        }
 
         case P_MEDIA_HANDOFF_INIT:
             reply->retval = media_handoff_init((u32)request->args[0]);

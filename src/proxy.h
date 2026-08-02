@@ -194,6 +194,24 @@ typedef enum {
     P_ATCPHY_POWER_OFF,
     P_ATCPHY_GET_REG_BASE,
     P_ATCPHY_ARM_GUEST_MODE,
+    /*
+     * P_ATCPHY_READ_ORIENTATION(port) -> packed u64. Read-only: it issues a
+     * single SMBus read of the port's CD3217 STATUS register and never
+     * writes to the PD controller. ABI (keep in sync with
+     * proxyclient/m1n1/atcphy.py and with the launcher's local copy in
+     * apple_silicon_nt_drivers/tools/m1n1-windows-debug.py):
+     *
+     *   0xFFFFFFFFFFFFFFFF  read failed; the caller must NOT infer an
+     *                       orientation from this
+     *   otherwise           bit 32 set (marks a valid reply)
+     *                       bit 33 = plug present
+     *                       bit 34 = plug upside down (flipped)
+     *                       bits 31:0 = raw STATUS dword, for the log
+     *
+     * The all-ones failure code is chosen so that it can never collide with
+     * a valid reply (bit 32 set implies bits 63:35 clear).
+     */
+    P_ATCPHY_READ_ORIENTATION,
 
     // J414s media profile; keep in sync with proxyclient/m1n1/media_handoff.py
     P_MEDIA_HANDOFF_INIT = 0x1600,

@@ -159,6 +159,46 @@ int tps6598x_restore_irqs(tps6598x_dev_t *dev, tps6598x_irq_state_t *state)
     return 0;
 }
 
+u8 tps6598x_i2c_addr(const tps6598x_dev_t *dev)
+{
+    if (!dev)
+        return 0;
+    return dev->addr;
+}
+
+int tps6598x_read_status(tps6598x_dev_t *dev, u32 *status)
+{
+    /*
+     * STATUS is 8 bytes on this family, so ask for exactly that: a
+     * length-matched SMBus block read is what every other read in this
+     * file does, and it keeps i2c_smbus_read() from logging a
+     * length-mismatch note on every call. Short replies are tolerated
+     * because only byte 0 carries the bits anyone here cares about --
+     * a wrong register number would show up as a nonsense decode, not as
+     * a silent success.
+     */
+    u8 buf[8] = {0};
+
+    if (!dev || !status)
+        return -1;
+
+    int ret = i2c_smbus_read(dev->i2c, dev->addr, TPS6598X_REG_STATUS, buf, sizeof(buf));
+    if (ret < 1) {
+        printf("tps6598x: STATUS read from addr %#x failed (ret=%d)\n", dev->addr, ret);
+        return -1;
+    }
+    if (ret != (int)sizeof(buf))
+        printf("tps6598x: addr %#x returned %d STATUS bytes, expected %zu (using byte 0)\n",
+               dev->addr, ret, sizeof(buf));
+
+    u32 value = 0;
+    for (int i = 0; i < ret && i < 4; i++)
+        value |= (u32)buf[i] << (8 * i);
+
+    *status = value;
+    return 0;
+}
+
 int tps6598x_powerup(tps6598x_dev_t *dev)
 {
     u8 power_state;

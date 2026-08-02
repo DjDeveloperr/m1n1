@@ -39,6 +39,16 @@ P_ATCPHY_SET_ORIENTATION = 0x1501
 P_ATCPHY_POWER_OFF = 0x1502
 P_ATCPHY_GET_REG_BASE = 0x1503
 P_ATCPHY_ARM_GUEST_MODE = 0x1504
+P_ATCPHY_READ_ORIENTATION = 0x1505
+
+# P_ATCPHY_READ_ORIENTATION reply ABI -- keep in sync with the comment on the
+# opcode in src/proxy.h.  All-ones means "the read failed"; it cannot collide
+# with a valid reply because a valid reply always has bit 32 set and bits
+# 63:35 clear.
+ATCPHY_ORIENTATION_READ_FAILED = 0xFFFFFFFFFFFFFFFF
+ATCPHY_ORIENTATION_VALID = 1 << 32
+ATCPHY_ORIENTATION_PLUG_PRESENT = 1 << 33
+ATCPHY_ORIENTATION_FLIPPED = 1 << 34
 
 
 class ATCPHYMode(IntEnum):
@@ -199,6 +209,39 @@ class ATCPHY:
             raise Exception(f"atcphy{self.port}: arm_guest_mode failed "
                             "(old m1n1 without ATCPHY arm support?)")
         return ret
+
+    def read_orientation(self):
+        """Read this port's true cable orientation from its CD3217.
+
+        Returns (plug_present, flipped, raw_status).
+
+        Read-only: the C side issues one SMBus read of STATUS (0x1a) and
+        never writes to the PD controller -- this machine's CD3217 rejects
+        System Configuration writes and refused an earlier PortInfo
+        rewrite, so the whole path is deliberately interrogative.
+
+        Raises on a failed read rather than returning a default. There is
+        no safe default: a wrong orientation puts the SuperSpeed pairs on
+        the partner's transmit pins, the link never trains, and the device
+        silently falls back to USB2 -- which looks exactly like a broken
+        port. A caller that wants to proceed anyway must say so explicitly.
+
+        Note this is the C-side (in-m1n1) path. hpm_status()/
+        hpm_orientation() at the bottom of this module do the same read
+        from Python; they are kept because they need no new m1n1 build,
+        and because two independent decodes of the same register is how
+        this project catches a bad transcription.
+        """
+        raw = self.p.request(P_ATCPHY_READ_ORIENTATION, self.port)
+        if raw == ATCPHY_ORIENTATION_READ_FAILED or not (
+                raw & ATCPHY_ORIENTATION_VALID):
+            raise Exception(
+                f"atcphy{self.port}: orientation read failed (see the m1n1 "
+                "console for which step refused). Do NOT guess an "
+                "orientation from this.")
+        return (bool(raw & ATCPHY_ORIENTATION_PLUG_PRESENT),
+                bool(raw & ATCPHY_ORIENTATION_FLIPPED),
+                raw & 0xFFFFFFFF)
 
     def dump_tunables(self):
         """List the ADT tunable_* properties on this port's atc-phy node.

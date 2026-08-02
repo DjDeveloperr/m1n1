@@ -575,6 +575,192 @@ void usb_hpm_handoff_host(iodev_id_t keep)
     usb_i2c_handoff_host("/arm-io/i2c0", keep);
 }
 
+/*
+ * Cable orientation, read out of a port's CD3217 ("hpm") USB-PD controller.
+ *
+ * WHY THIS EXISTS.  The ATC PHY has to know which way round the plug is
+ * *before* it programs the SuperSpeed lanes.  A flipped cable selects a
+ * completely different mode-table entry -- different ACIOPHY_CROSSBAR
+ * protocol, mirrored ACIOPHY_LANE_MODE fields, ATCPHY_MISC.LANE_SWAP set,
+ * and the USB3 vs DP calibration blobs applied to the other physical lane
+ * (Asahi atc.c:686-701, :868-875, :877-918, :1176-1179).  Get it wrong and
+ * our SuperSpeed transmit pair lands on the partner's transmit pins:
+ * receiver detection finds no far-end Rx termination, the link never
+ * trains, and the device silently drops to USB2 -- which is
+ * indistinguishable from a broken port.  Linux never guesses this; it
+ * reads it (tipd/core.c:768-772) and pushes it to the PHY through
+ * typec_switch_set.  Until this function existed, m1n1's callers passed a
+ * hardcoded "not flipped", i.e. a coin flip.
+ *
+ * READ-ONLY BY CONSTRUCTION.  Exactly one SMBus read of STATUS (0x1a), no
+ * writes, no commands.  In particular this deliberately does NOT go
+ * through hpm_init(): that calls tps6598x_powerup(), which can issue an
+ * "SSPS" command, and a command is a write.  The CD3217 on this machine
+ * rejects System Configuration writes and refused an earlier PortInfo
+ * rewrite, and the same i2c0 bus carries the PD controller behind the
+ * proxy's own console port -- so this path stays strictly interrogative.
+ *
+ * The read is bounded: i2c_smbus_read() times out on a stuck controller
+ * rather than spinning, and this touches no MMIO outside the already-live
+ * i2c block, so it cannot raise the synchronous external abort that an
+ * access to an unpowered region would.
+ */
+
+/*
+ * Hardware anchor, grade A: measured on this J414s on 2026-07-29 and
+ * recorded in proxyclient/m1n1/atcphy.py:333-337 -- the right-side port's
+ * PD controller is hpm2 at I2C address 0x3b.  If the ADT decode disagrees
+ * then the DECODE is wrong, and probing a random address on a bus that
+ * also carries the proxy console's PD controller is not an acceptable way
+ * to discover that.  Refuse instead.  0 means "no anchor known".
+ */
+static u8 usb_hpm_anchor_addr(u32 idx)
+{
+    if (!adt_is_compatible(adt, 0, "J414sAP"))
+        return 0;
+    if (idx == 2)
+        return 0x3b;
+    return 0;
+}
+
+static int usb_i2c_read_orientation(const char *i2c_path, u32 want_idx, u32 *status_out)
+{
+    char hpm_path[MAX_HPM_PATH_LEN];
+
+    int node = adt_path_offset(adt, i2c_path);
+    if (node < 0)
+        return -1;
+
+    node = adt_first_child_offset(adt, node);
+    if (node < 0 || !adt_is_compatible(adt, node, "usbc,manager"))
+        return -1;
+
+    const char *hpm_mngr_name = adt_get_name(adt, node);
+    if (!hpm_mngr_name || strnlen(hpm_mngr_name, 16) >= 16)
+        return -1;
+
+    int ret = -1;
+    i2c_dev_t *i2c = NULL;
+
+    ADT_FOREACH_CHILD(adt, node)
+    {
+        const char *name = adt_get_name(adt, node);
+        if (!name || strnlen(name, 16) >= 16)
+            continue;
+
+        /*
+         * Resolve the port the same way usb_i2c_handoff_host() does, via
+         * rid/port-number/port-location rather than the node name. That
+         * path carries its own corroboration -- it insists rid 2 is the
+         * node whose port-location string is literally "right" -- so a
+         * mismatched ADT cannot quietly hand us the wrong port's
+         * orientation.
+         */
+        u32 rid_size = 0;
+        u32 port_number_size = 0;
+        u32 port_location_size = 0;
+        const u32 *rid = adt_getprop(adt, node, "rid", &rid_size);
+        const u32 *port_number = adt_getprop(adt, node, "port-number", &port_number_size);
+        const char *port_location = adt_getprop(adt, node, "port-location", &port_location_size);
+        if (!rid || rid_size != sizeof(*rid) || !port_number ||
+            port_number_size != sizeof(*port_number) || !port_location || !port_location_size)
+            continue; // not a port node
+
+        u32 idx;
+        if (tps6598x_host_port_resolve(*rid, *port_number, port_location, port_location_size,
+                                       J414S_USB_CONTROLLER_COUNT, &idx) < 0)
+            continue;
+        if (idx != want_idx)
+            continue;
+
+        snprintf(hpm_path, sizeof(hpm_path), "%s/%s/%s", i2c_path, hpm_mngr_name, name);
+
+        i2c = i2c_init_allow_powered(i2c_path);
+        if (!i2c) {
+            printf("usb: orientation read: i2c init failed for %s\n", i2c_path);
+            return -1;
+        }
+
+        /* tps6598x_init() only parses the ADT and allocates; it touches no bus. */
+        tps6598x_dev_t *tps = tps6598x_init(hpm_path, i2c);
+        if (!tps) {
+            printf("usb: orientation read: cannot resolve %s\n", hpm_path);
+            break;
+        }
+
+        u8 addr = tps6598x_i2c_addr(tps);
+        u8 anchor = usb_hpm_anchor_addr(idx);
+        if (addr < 0x08 || addr > 0x77) {
+            printf("usb: orientation read: %s decoded I2C address %#x outside the valid 7-bit "
+                   "range -- decode is wrong, refusing to talk to the bus\n",
+                   hpm_path, addr);
+            tps6598x_shutdown(tps);
+            break;
+        }
+        if (anchor && addr != anchor) {
+            printf("usb: orientation read: %s decoded I2C address %#x contradicts the "
+                   "hardware-measured %#x for port %u -- decode is wrong, refusing\n",
+                   hpm_path, addr, anchor, idx);
+            tps6598x_shutdown(tps);
+            break;
+        }
+
+        u32 status = 0;
+        if (tps6598x_read_status(tps, &status) < 0) {
+            printf("usb: orientation read: STATUS read failed for %s (addr %#x)\n", hpm_path, addr);
+            tps6598x_shutdown(tps);
+            break;
+        }
+        tps6598x_shutdown(tps);
+
+        bool plug = !!(status & TPS6598X_STATUS_PLUG_PRESENT);
+        bool flipped = !!(status & TPS6598X_STATUS_PLUG_UPSIDE_DOWN);
+
+        printf("usb: port %u orientation: %s addr %#x STATUS=%#010x plug_present=%d "
+               "flipped=%d (data_role=%s, vconn=%d)\n",
+               idx, name, addr, status, plug, flipped,
+               (status & TPS6598X_STATUS_DATAROLE) ? "host" : "device",
+               !!(status & TPS6598X_STATUS_VCONN));
+
+        if (status_out)
+            *status_out = status;
+
+        if (!plug)
+            ret = USB_HPM_ORIENTATION_NO_PLUG;
+        else
+            ret = flipped ? USB_HPM_ORIENTATION_FLIPPED : USB_HPM_ORIENTATION_NORMAL;
+        break;
+    }
+
+    if (i2c)
+        i2c_shutdown(i2c);
+
+    return ret;
+}
+
+int usb_hpm_read_orientation(u32 idx, u32 *status_out)
+{
+    if (idx >= USB_IODEV_COUNT) {
+        printf("usb: orientation read: port index %u out of range\n", idx);
+        return USB_HPM_ORIENTATION_UNREADABLE;
+    }
+
+    int ret = -1;
+    if (adt_is_compatible(adt, 0, "J180dAP"))
+        ret = usb_i2c_read_orientation("/arm-io/i2c3", idx, status_out);
+    if (ret < 0)
+        ret = usb_i2c_read_orientation("/arm-io/i2c0", idx, status_out);
+
+    if (ret < 0) {
+        printf("usb: orientation read: no readable HPM found for port %u -- the caller MUST NOT "
+               "guess an orientation from this\n",
+               idx);
+        return USB_HPM_ORIENTATION_UNREADABLE;
+    }
+
+    return ret;
+}
+
 void usb_iodev_init(void)
 {
     for (int i = 0; i < USB_IODEV_COUNT; i++) {
