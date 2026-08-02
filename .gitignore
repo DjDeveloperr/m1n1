@@ -15,4 +15,5 @@ __pycache__
 /m1n1-*\.tar\.gz
 /rust-fatfs-*\.tar\.gz
 .vscode/
+/.venv/
 null.d
