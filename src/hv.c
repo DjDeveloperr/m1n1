@@ -37,6 +37,19 @@ static bool hv_has_ecv;
 static bool hv_should_exit[MAX_CPUS];
 bool hv_started_cpus[MAX_CPUS];
 u64 hv_cpus_in_guest;
+/*
+ * Set for the duration of hv_rendezvous().  hv_cpus_in_guest is cleared ONLY by
+ * hv_exc_entry(), and hv_exc_sync()'s fast path -- the one that handles an
+ * Apple IMPDEF MSR trap and returns straight to the guest -- deliberately skips
+ * it.  A CPU taking those traps back to back therefore stays marked "in guest"
+ * no matter how many it services, and a rendezvous requested by any other core
+ * can never complete.  Measured on the J414s: CPU 0 runs the pure-AIC software
+ * timer reflection, its breadcrumbs read `Sa#sSa#s` (two full fast-path turns,
+ * no slow-path entry) while every other CPU ends in `F`, and the HV panics with
+ * "Failed to rendezvous, missing CPUs: 0x1".  The fast path consults this flag
+ * so it can take the slow round trip exactly when one is outstanding.
+ */
+u64 hv_rendezvous_pending;
 u64 hv_saved_sp[MAX_CPUS];
 
 struct hv_secondary_info_t {
@@ -471,6 +484,15 @@ void hv_rendezvous(void)
     if (!__atomic_load_n(&hv_cpus_in_guest, __ATOMIC_ACQUIRE))
         return;
 
+    /*
+     * Publish BEFORE the IPIs.  A CPU already inside the sync fast path will
+     * not take the IPI until it next opens an FIQ window, and if it is
+     * servicing a dense stream of IMPDEF MSR traps that window may never come.
+     * The flag lets that CPU notice the rendezvous from inside the fast path
+     * itself rather than depending on interrupt delivery.
+     */
+    __atomic_store_n(&hv_rendezvous_pending, 1, __ATOMIC_RELEASE);
+
     /* IPI all CPUs. This might result in spurious IPIs to the guest... */
     for (int i = 0; i < MAX_CPUS; i++) {
         if (i != smp_id() && hv_started_cpus[i]) {
@@ -479,10 +501,13 @@ void hv_rendezvous(void)
     }
 
     while (timeout--) {
-        if (!__atomic_load_n(&hv_cpus_in_guest, __ATOMIC_ACQUIRE))
+        if (!__atomic_load_n(&hv_cpus_in_guest, __ATOMIC_ACQUIRE)) {
+            __atomic_store_n(&hv_rendezvous_pending, 0, __ATOMIC_RELEASE);
             return;
+        }
     }
 
+    __atomic_store_n(&hv_rendezvous_pending, 0, __ATOMIC_RELEASE);
     hv_panic("HV: Failed to rendezvous, missing CPUs: 0x%lx (current: %d)\n",
              __atomic_load_n(&hv_cpus_in_guest, __ATOMIC_ACQUIRE), smp_id());
 }

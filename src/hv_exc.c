@@ -222,6 +222,7 @@ void hv_exit_guest(void) __attribute__((noreturn));
 static u64 stolen_time = 0;
 static u64 exc_entry_time;
 extern u64 hv_cpus_in_guest;
+extern u64 hv_rendezvous_pending;
 extern int hv_pinned_cpu;
 extern int hv_want_cpu;
 
@@ -2535,6 +2536,26 @@ void hv_exc_sync(struct exc_info *ctx)
         ctx->elr += 4;
         hv_set_elr(ctx->elr);
         hv_update_fiq(ctx);
+        /*
+         * This return path is invisible to hv_rendezvous(): hv_cpus_in_guest is
+         * cleared only by hv_exc_entry() below, which we are about to skip.  A
+         * CPU servicing Apple IMPDEF MSR traps back to back therefore stays
+         * marked "in guest" indefinitely and any other core's rendezvous spins
+         * out and panics the whole hypervisor -- measured repeatedly on the
+         * J414s, always naming CPU 0, which carries the pure-AIC software timer
+         * reflection and so takes those traps continuously.
+         *
+         * Take the slow round trip only while a rendezvous is outstanding.
+         * hv_exc_entry() clears the bit BEFORE it blocks on bhl, so the waiting
+         * CPU is released immediately and we then queue on the lock exactly
+         * like a CPU that arrived via the FIQ slow path.  When no rendezvous is
+         * pending this costs one relaxed load and the fast path is unchanged.
+         */
+        if (__atomic_load_n(&hv_rendezvous_pending, __ATOMIC_ACQUIRE)) {
+            hv_exc_entry();
+            hv_exc_exit(ctx);
+            return;
+        }
         hv_wdt_breadcrumb('s');
         return;
     }
