@@ -684,7 +684,8 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
         case P_ATCPHY_APPLY_MODE:
             reply->retval =
                 (u64)(s64)atcphy_apply_mode(request->args[0], (atcphy_mode_t)request->args[1],
-                                            request->args[2] != 0, request->args[3] != 0,
+                                            request->args[2] != 0,
+                                            (atcphy_pipe_policy_t)request->args[3],
                                             request->args[4] != 0,
                                             (atcphy_dp_rate_t)request->args[5]);
             break;
@@ -699,8 +700,11 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
             reply->retval = atcphy_reg_base(request->args[0], request->args[1]);
             break;
         case P_ATCPHY_ARM_GUEST_MODE:
+            /* args[4] is the pipe policy; absent (0) from an old client means
+             * REFUSE, so a stale client cannot silently get a mux switch. */
             atcphy_arm_guest_mode(request->args[0], (atcphy_mode_t)request->args[1],
-                                  request->args[2] != 0, request->args[3] != 0);
+                                  request->args[2] != 0, request->args[3] != 0,
+                                  (atcphy_pipe_policy_t)request->args[4]);
             break;
         case P_ATCPHY_READ_ORIENTATION: {
             /* See the ABI comment on P_ATCPHY_READ_ORIENTATION in proxy.h.

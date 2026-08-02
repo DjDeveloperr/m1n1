@@ -60,17 +60,51 @@ int atcphy_get_regs(u32 idx, atcphy_regs_t *regs);
 int atcphy_set_orientation(u32 idx, bool flipped);
 
 /*
+ * What atcphy_apply_mode() is allowed to do to the pipehandler PIPE mux when
+ * the requested mode's pipe_state is ATCPHY_PIPE_STATE_USB3.
+ *
+ * The numeric values are ABI: they are what the proxy passes through as
+ * P_ATCPHY_APPLY_MODE arg[3], and REFUSE/SWITCH are exactly the old
+ * allow_pipe_switch=false/true, so old callers keep their meaning.
+ */
+typedef enum {
+    /* Old allow_pipe_switch=false: refuse the mode outright. */
+    ATCPHY_PIPE_POLICY_REFUSE = 0,
+    /* Old allow_pipe_switch=true: configure the PHY and switch the mux. */
+    ATCPHY_PIPE_POLICY_SWITCH = 1,
+    /*
+     * Configure the PHY fully, then leave the PIPE mux parked on DUMMY for
+     * someone downstream to switch.
+     *
+     * This exists because of an ordering rule we cannot satisfy from m1n1
+     * alone. Asahi's dwc3-apple.c:29 requires the PIPE switch to happen
+     * AFTER dwc3 core init, and Mu's AppleUsbTypeCBringupDxe runs a full
+     * DWC3 soft reset -- including a 100 ms GUSB3PIPECTL.PHYSOFTRST -- long
+     * after m1n1 is gone. Switching the mux here therefore hands Mu a live
+     * USB3 PIPE and lets it reset it, which no Asahi path ever does.
+     *
+     * Under DEFER, m1n1 does the half only it can do (the ATC PHY itself:
+     * power, tunables, PLLs, lanes, crossbar, PHY_RESET_N) and Mu does the
+     * half that must come after its own core init (CIO regs, SUSPHY, the
+     * mux switch). Mu detects the handoff by reading ATCPHY_POWER_CTRL:
+     * a PHY that is powered and out of reset with the mux still on DUMMY is
+     * one that was configured here and is waiting to be finished.
+     *
+     * If nothing downstream finishes the switch the port simply stays
+     * USB2-only, which is the same behaviour as not arming at all.
+     */
+    ATCPHY_PIPE_POLICY_DEFER = 2,
+} atcphy_pipe_policy_t;
+
+/*
  * General entry point covering the full mode table (see atcphy_core.h sec
- * 3). USB3/USB3_DP require allow_pipe_switch=true because their pipe_state
- * is ATCPHY_PIPE_STATE_USB3: applying them reprograms the pipehandler PIPE
- * mux DWC3 depends on for SuperSpeed. Calling this with a non-DUMMY mode
- * while a guest's xHCI has already enumerated the port on the dummy
- * backend is UNTESTED and matches exactly the kind of live PIPE-topology
- * change flagged as dangerous in docs/j414s-atcphy.md sec 8/10 (the
- * project brief's own "0x144 BUGCODE_USB3_DRIVER" concern). No caller in
- * this tree passes allow_pipe_switch=true; it exists so the sequence is
- * compiled and host-test-covered without being reachable from any
- * automatic path.
+ * 3). USB3/USB3_DP have pipe_state ATCPHY_PIPE_STATE_USB3, so applying them
+ * reprograms the pipehandler PIPE mux DWC3 depends on for SuperSpeed and
+ * they are gated on pipe_policy. Calling this with ATCPHY_PIPE_POLICY_SWITCH
+ * while a guest's xHCI has already enumerated the port on the dummy backend
+ * is UNTESTED and matches exactly the kind of live PIPE-topology change
+ * flagged as dangerous in docs/j414s-atcphy.md sec 8/10 (the project brief's
+ * own "0x144 BUGCODE_USB3_DRIVER" concern).
  *
  * If dp_rate_valid, additionally programs the AUSPLL for dp_rate after the
  * lane config (meaningful only for ATCPHY_MODE_DP / ATCPHY_MODE_USB3_DP).
@@ -80,8 +114,9 @@ int atcphy_set_orientation(u32 idx, bool flipped);
  *
  * Returns 0 on success, -1 on failure (a diagnostic is printed).
  */
-int atcphy_apply_mode(u32 idx, atcphy_mode_t mode, bool flipped, bool allow_pipe_switch,
-                      bool dp_rate_valid, atcphy_dp_rate_t dp_rate);
+int atcphy_apply_mode(u32 idx, atcphy_mode_t mode, bool flipped,
+                      atcphy_pipe_policy_t pipe_policy, bool dp_rate_valid,
+                      atcphy_dp_rate_t dp_rate);
 
 /*
  * Upstream-faithful full power-down: usb2 PHY off (atcphy_usb2_power_off,
@@ -127,18 +162,24 @@ u64 atcphy_reg_base(u32 idx, u32 block);
  * (mode, flipped) pair here makes usb_phy_handoff_host re-apply it via
  * atcphy_apply_mode() immediately after its dummy parking.
  *
- * That call site is the ONE place in this tree that passes
- * allow_pipe_switch=true, and it is safe by this project's own rule
+ * That call site is the ONE place in this tree that may pass
+ * ATCPHY_PIPE_POLICY_SWITCH, and it is safe by this project's own rule
  * precisely because of when it runs: hv_init happens before the guest is
  * entered, so dwc3 is freshly reset and NO guest xHCI driver is bound to
  * the port yet. (docs/j414s-atcphy.md sec 6/12; the hardware session of
  * 2026-07-30 validated the full USB3 apply path on port 2.)
  *
+ * pipe_policy selects what happens to the mux at that handoff.
+ * ATCPHY_PIPE_POLICY_DEFER is the one to use when Mu will finish the
+ * switch after its own dwc3 core init -- see the enum for why that
+ * ordering matters.
+ *
  * Fail-safe: nothing is armed by default, so the boot chain's behaviour
  * is unchanged unless an operator explicitly arms a port over the proxy
  * (P_ATCPHY_ARM_GUEST_MODE). Arming does not touch hardware by itself.
  */
-void atcphy_arm_guest_mode(u32 idx, atcphy_mode_t mode, bool flipped, bool armed);
+void atcphy_arm_guest_mode(u32 idx, atcphy_mode_t mode, bool flipped, bool armed,
+                           atcphy_pipe_policy_t pipe_policy);
 
 /*
  * Called by usb_phy_handoff_host after it parks the PIPE mux on DUMMY.

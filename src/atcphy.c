@@ -210,8 +210,9 @@ static int atcphy_apply_tunables_for(u32 idx, int atc_node, const atcphy_regs_t 
     return 0;
 }
 
-int atcphy_apply_mode(u32 idx, atcphy_mode_t mode, bool flipped, bool allow_pipe_switch,
-                      bool dp_rate_valid, atcphy_dp_rate_t dp_rate)
+int atcphy_apply_mode(u32 idx, atcphy_mode_t mode, bool flipped,
+                      atcphy_pipe_policy_t pipe_policy, bool dp_rate_valid,
+                      atcphy_dp_rate_t dp_rate)
 {
     const atcphy_mode_config_t *cfg = atcphy_mode_config(mode, flipped);
     if (!cfg) {
@@ -219,9 +220,10 @@ int atcphy_apply_mode(u32 idx, atcphy_mode_t mode, bool flipped, bool allow_pipe
         return -1;
     }
 
-    if (cfg->pipe_state == ATCPHY_PIPE_STATE_USB3 && !allow_pipe_switch) {
-        printf("atcphy%u: mode %d needs a pipehandler PIPE-mux switch; refusing without "
-               "allow_pipe_switch=true (this would reprogram the interface a running guest's "
+    if (cfg->pipe_state == ATCPHY_PIPE_STATE_USB3 &&
+        pipe_policy == ATCPHY_PIPE_POLICY_REFUSE) {
+        printf("atcphy%u: mode %d needs a pipehandler PIPE-mux switch; refusing under "
+               "ATCPHY_PIPE_POLICY_REFUSE (this would reprogram the interface a running guest's "
                "xHCI/dwc3 driver depends on -- see docs/j414s-atcphy.md sec 8/10)\n",
                idx, (int)mode);
         return -1;
@@ -326,6 +328,24 @@ int atcphy_apply_mode(u32 idx, atcphy_mode_t mode, bool flipped, bool allow_pipe
                 return -1;
             break;
         case ATCPHY_PIPE_STATE_USB3:
+            if (pipe_policy == ATCPHY_PIPE_POLICY_DEFER) {
+                /*
+                 * The PHY above is fully configured and out of reset; only the
+                 * mux is left alone, still parked on DUMMY by our caller.
+                 * Whoever runs next (Mu's AppleUsbTypeCBringupDxe) is expected
+                 * to finish this after its own dwc3 core init -- see the
+                 * ATCPHY_PIPE_POLICY_DEFER comment in atcphy.h for the
+                 * ordering rule that forces the split.
+                 *
+                 * Not finishing it is a safe outcome, not a broken one: the
+                 * port stays USB2-only.
+                 */
+                printf("atcphy%u: PHY configured, PIPE mux left on DUMMY (deferred switch); "
+                       "SuperSpeed comes up only if the next stage finishes it after dwc3 "
+                       "core init\n",
+                       idx);
+                break;
+            }
             /* atcphy_pipehandler_check, atc.c:956-973: if a previous attempt
              * left the lock held, release it before starting a new one. */
             if (read32(regs.pipehandler + ATCPHY_PIPEHANDLER_LOCK_ACK) &
@@ -375,7 +395,8 @@ int atcphy_apply_mode(u32 idx, atcphy_mode_t mode, bool flipped, bool allow_pipe
 
 int atcphy_set_orientation(u32 idx, bool flipped)
 {
-    return atcphy_apply_mode(idx, ATCPHY_MODE_USB2, flipped, false, false, ATCPHY_DP_RATE_RBR);
+    return atcphy_apply_mode(idx, ATCPHY_MODE_USB2, flipped, ATCPHY_PIPE_POLICY_REFUSE, false,
+                             ATCPHY_DP_RATE_RBR);
 }
 
 int atcphy_power_off(u32 idx)
@@ -429,9 +450,11 @@ static struct {
     bool armed;
     atcphy_mode_t mode;
     bool flipped;
+    atcphy_pipe_policy_t pipe_policy;
 } atcphy_guest_mode[ATCPHY_MAX_PORTS];
 
-void atcphy_arm_guest_mode(u32 idx, atcphy_mode_t mode, bool flipped, bool armed)
+void atcphy_arm_guest_mode(u32 idx, atcphy_mode_t mode, bool flipped, bool armed,
+                           atcphy_pipe_policy_t pipe_policy)
 {
     if (idx >= ATCPHY_MAX_PORTS) {
         printf("atcphy: arm_guest_mode: invalid port %u\n", idx);
@@ -441,11 +464,15 @@ void atcphy_arm_guest_mode(u32 idx, atcphy_mode_t mode, bool flipped, bool armed
     atcphy_guest_mode[idx].armed = armed;
     atcphy_guest_mode[idx].mode = mode;
     atcphy_guest_mode[idx].flipped = flipped;
+    atcphy_guest_mode[idx].pipe_policy = pipe_policy;
 
     if (armed)
-        printf("atcphy%u: ARMED guest mode %d (orientation=%s); it will be "
+        printf("atcphy%u: ARMED guest mode %d (orientation=%s, pipe_policy=%s); it will be "
                "re-applied at guest USB handoff\n",
-               idx, (int)mode, flipped ? "flipped" : "normal");
+               idx, (int)mode, flipped ? "flipped" : "normal",
+               pipe_policy == ATCPHY_PIPE_POLICY_DEFER
+                   ? "DEFER (Mu finishes the mux switch)"
+                   : (pipe_policy == ATCPHY_PIPE_POLICY_SWITCH ? "SWITCH" : "REFUSE"));
     else
         printf("atcphy%u: guest mode disarmed\n", idx);
 }
@@ -458,9 +485,10 @@ int atcphy_reapply_guest_mode(u32 idx)
     printf("atcphy%u: re-applying armed guest mode %d (orientation=%s) after handoff\n", idx,
            (int)atcphy_guest_mode[idx].mode, atcphy_guest_mode[idx].flipped ? "flipped" : "normal");
 
-    /* allow_pipe_switch=true is safe here and only here: the handoff path
+    /* ATCPHY_PIPE_POLICY_SWITCH is safe here and only here: the handoff path
      * runs from hv_init, before the guest is entered, so no guest xHCI
-     * driver is bound to this port. See atcphy.h. */
+     * driver is bound to this port. DEFER stops one step short of the mux
+     * and leaves it to Mu, which is the correct order. See atcphy.h. */
     return atcphy_apply_mode(idx, atcphy_guest_mode[idx].mode, atcphy_guest_mode[idx].flipped,
-                             true, false, ATCPHY_DP_RATE_RBR);
+                             atcphy_guest_mode[idx].pipe_policy, false, ATCPHY_DP_RATE_RBR);
 }
