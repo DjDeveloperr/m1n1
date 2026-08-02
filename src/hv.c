@@ -477,15 +477,74 @@ void hv_exit_cpu(int cpu)
     hv_should_exit[cpu] = true;
 }
 
+/*
+ * Rendezvous budget.
+ *
+ * The old budget was 1,000,000 iterations of a bare acquire load.  That is not
+ * a duration: once every other CPU is parked on bhl the line stays clean in
+ * this CPU's cache and the loop retires in a couple of cycles per iteration,
+ * so the real budget was somewhere around 0.3-1 ms.  Nothing about the system
+ * guarantees a collection inside that window:
+ *
+ *  - The only lever on a CPU that is running guest code is the IPI, and on
+ *    this SoC that is an Apple Fast IPI delivered as an FIQ.  It is latched in
+ *    IPI_SR_EL1 so it cannot be lost, but it is not taken while the target is
+ *    already at EL2 (exception entry masks DAIF and hv_exc_entry() only clears
+ *    the SError bit).  Every microsecond the target spends inside EL2 is a
+ *    microsecond the requester spends spinning.
+ *  - Several EL2 entries return to the guest without ever calling
+ *    hv_exc_entry(), so they hold the CPU's hv_cpus_in_guest bit for their
+ *    whole duration -- and some of them printf() to the console, which at UART
+ *    speeds is milliseconds per line.  See the enumeration above
+ *    hv_rendezvous_quiesce() in hv_exc.c.
+ *  - The self-collection fallback cannot help: hv_exc_fiq()'s fast path re-arms
+ *    a non-interruptible CPU with hv_secondary_tick_interval, which is one full
+ *    second when ECV is available (HV_SLOW_TICK_RATE in this file).  That is
+ *    three orders of magnitude past the old budget.
+ *
+ * So make the budget an actual duration, re-arm the IPI at a fixed cadence
+ * inside it rather than exactly once, and -- most importantly -- do not kill
+ * the machine when it expires.
+ *
+ * Measured on the J414s: roughly half of all Windows boots were lost to "HV:
+ * Failed to rendezvous".  Before 575ca6c9 it always named CPU 0; afterwards it
+ * named a different CPU each time (0x40/CPU 6 in one capture, whose breadcrumb
+ * trail `57*89+xs` shows it had *completed* a slow-path MMIO emulation and
+ * returned to the guest).  The rendezvous is a time-coherence measure for the
+ * proxy -- it exists so every CPU re-enters the guest with the same
+ * CNTVOFF_EL2/stolen_time -- not a safety property.  A CPU that misses one
+ * picks up the current stolen_time at its next real hv_exc_exit() anyway.
+ * Trading a transient timebase skew on one core against destroying the boot is
+ * not a close call.
+ *
+ * Escalate only on evidence of a genuine hang: a CPU that is wedged (a stalled
+ * MMIO access, a core that never took the FIQ) will miss every rendezvous, so
+ * count consecutive misses and panic once the count is unambiguous.  That is
+ * ~1.3s of accumulated stall, which no transient can produce.
+ */
+#define HV_RENDEZVOUS_TIMEOUT_US    20000
+#define HV_RENDEZVOUS_IPI_PERIOD_US   250
+#define HV_RENDEZVOUS_MAX_MISSES       64
+
+/*
+ * Every hv_rendezvous() caller holds bhl (_hv_exc_proxy(), and hv_switch_cpu()
+ * from the proxy request handler, which runs inside uartproxy_run()), so this
+ * needs no atomics.
+ */
+static u32 hv_rendezvous_misses;
+
+static u64 hv_usecs_to_ticks(u32 usecs)
+{
+    return (mrs(CNTFRQ_EL0) * (u64)usecs) / 1000000;
+}
+
 void hv_rendezvous(void)
 {
-    int timeout = 1000000;
-
     if (!__atomic_load_n(&hv_cpus_in_guest, __ATOMIC_ACQUIRE))
         return;
 
     /*
-     * Publish BEFORE the IPIs.  A CPU already inside the sync fast path will
+     * Publish BEFORE the IPIs.  A CPU already inside one of the fast paths will
      * not take the IPI until it next opens an FIQ window, and if it is
      * servicing a dense stream of IMPDEF MSR traps that window may never come.
      * The flag lets that CPU notice the rendezvous from inside the fast path
@@ -493,23 +552,59 @@ void hv_rendezvous(void)
      */
     __atomic_store_n(&hv_rendezvous_pending, 1, __ATOMIC_RELEASE);
 
-    /* IPI all CPUs. This might result in spurious IPIs to the guest... */
-    for (int i = 0; i < MAX_CPUS; i++) {
-        if (i != smp_id() && hv_started_cpus[i]) {
-            smp_send_ipi(i);
-        }
-    }
+    u64 ipi_period = hv_usecs_to_ticks(HV_RENDEZVOUS_IPI_PERIOD_US);
+    u64 now = mrs(CNTPCT_EL0);
+    u64 deadline = now + hv_usecs_to_ticks(HV_RENDEZVOUS_TIMEOUT_US);
+    u64 next_ipi = now; /* fire the first round immediately */
+    u64 missing;
 
-    while (timeout--) {
-        if (!__atomic_load_n(&hv_cpus_in_guest, __ATOMIC_ACQUIRE)) {
+    for (;;) {
+        missing = __atomic_load_n(&hv_cpus_in_guest, __ATOMIC_ACQUIRE);
+        if (!missing) {
             __atomic_store_n(&hv_rendezvous_pending, 0, __ATOMIC_RELEASE);
+            hv_rendezvous_misses = 0;
             return;
         }
+
+        now = mrs(CNTPCT_EL0);
+
+        if ((s64)(now - next_ipi) >= 0) {
+            /*
+             * Re-IPI on a cadence, not just once.  A CPU that was at EL2 with
+             * FIQs masked when the first IPI landed does take it on its next
+             * eret, so the retry is usually redundant -- but it costs nothing
+             * here and it is the only recovery if an edge is ever dropped.
+             * Poke only the CPUs still marked in-guest: one that has already
+             * left is parked on bhl or legitimately back in the guest, and a
+             * spurious IPI there is a cost paid by the guest.
+             */
+            for (int i = 0; i < MAX_CPUS; i++) {
+                if (i != smp_id() && hv_started_cpus[i] && (missing & BIT(i))) {
+                    smp_send_ipi(i);
+                }
+            }
+            next_ipi = now + ipi_period;
+        }
+
+        if ((s64)(now - deadline) >= 0)
+            break;
     }
 
     __atomic_store_n(&hv_rendezvous_pending, 0, __ATOMIC_RELEASE);
-    hv_panic("HV: Failed to rendezvous, missing CPUs: 0x%lx (current: %d)\n",
-             __atomic_load_n(&hv_cpus_in_guest, __ATOMIC_ACQUIRE), smp_id());
+
+    if (++hv_rendezvous_misses >= HV_RENDEZVOUS_MAX_MISSES)
+        hv_panic("HV: %u consecutive failed rendezvous, missing CPUs: 0x%lx (current: %d)\n",
+                 hv_rendezvous_misses, missing, smp_id());
+
+    /*
+     * Loud, but not fatal.  The missing CPU keeps running the guest with a
+     * stale CNTVOFF_EL2 until its next hv_exc_exit(); the proxy transaction we
+     * are about to run proceeds without it.
+     */
+    printf("HV: rendezvous incomplete after %d us (miss %u of %d), missing CPUs: 0x%lx "
+           "(current: %d); continuing\n",
+           HV_RENDEZVOUS_TIMEOUT_US, hv_rendezvous_misses, HV_RENDEZVOUS_MAX_MISSES, missing,
+           smp_id());
 }
 
 bool hv_switch_cpu(int cpu)

@@ -2458,6 +2458,77 @@ static void hv_get_context(struct exc_info *ctx)
     sysop("isb");
 }
 
+/*
+ * True while another CPU is inside hv_rendezvous() waiting for this one.
+ *
+ * This is consulted from the hottest paths in the hypervisor, so it must stay
+ * exactly one acquire load and nothing else.
+ */
+static inline bool hv_rendezvous_requested(void)
+{
+    return __atomic_load_n(&hv_rendezvous_pending, __ATOMIC_ACQUIRE) != 0;
+}
+
+/*
+ * EXHAUSTIVE list of return-to-guest paths in this file that never call
+ * hv_exc_entry(), and therefore hold this CPU's hv_cpus_in_guest bit for their
+ * whole duration -- they are invisible to hv_rendezvous() by construction:
+ *
+ *   hv_exc_sync()  the `if (handled)` fast path -- breadcrumbs '#' then 's'.
+ *                  Handled below by taking the full round trip when a
+ *                  rendezvous is outstanding (added in 575ca6c9).
+ *   hv_exc_fiq()   the non-interruptible-CPU fast path (the `smp_id() !=
+ *                  interruptible_cpu` early return).  Handled by falling
+ *                  through to the slow path when a rendezvous is outstanding.
+ *                  Note it re-arms with hv_secondary_tick_interval
+ *                  (one second under ECV), so a CPU that hides here will not
+ *                  re-enter EL2 on its own inside any sane rendezvous budget.
+ *   hv_exc_irq()   FIVE separate returns, and under ENABLE_VGIC_MODULE the
+ *                  function never calls hv_exc_entry() on ANY path:
+ *                    - native-AIC, carrier IAR still outstanding (clears
+ *                      IMO|VI and returns)
+ *                    - native-AIC, general (hv_native_aic_enter_cpu() and
+ *                      return)
+ *                    - stale startup timer-reflector SW IRQ discard -- which
+ *                      printf()s first
+ *                    - maintenance-IRQ / list-register drain
+ *                    - the implicit return after the vGIC injection tail
+ *                  None of them emitted a breadcrumb before this change, so a
+ *                  CPU looping in here was indistinguishable from a CPU taking
+ *                  no traps at all.  Two of these paths (and hv_update_fiq(),
+ *                  which they call) can printf(), and a console line at UART
+ *                  speeds is milliseconds -- far past the old ~0.3-1 ms
+ *                  rendezvous budget, with FIQs masked the whole time.
+ *
+ * (hv_exc_serr() and hv_exc_sync()'s slow path always take the round trip.)
+ *
+ * hv_exc_irq() cannot simply call hv_exc_entry()/hv_exc_exit(): hv_exc_exit()
+ * republishes SPSR/ELR/SP and re-runs hv_update_fiq(), and hv_update_fiq() does
+ * NOT consult native_irq_rearm_deferred[] -- it re-asserts HCR.IMO|VI whenever
+ * a native wake is pending.  Doing that from inside hv_exc_irq()'s handshake
+ * recreates exactly the bounce-back-to-EL2 livelock those paths are written to
+ * avoid.
+ *
+ * So do only what the rendezvous actually needs, and touch nothing else: leave
+ * the in-guest set, park on bhl until the requesting CPU is finished, rejoin.
+ * The bit is cleared BEFORE bhl is taken -- the same ordering hv_exc_entry()
+ * relies on, and the reason a waiter is released while this CPU queues on the
+ * lock rather than deadlocking against it.
+ *
+ * The cost of not using the full round trip is that this CPU does not pick up
+ * the new CNTVOFF_EL2/stolen_time here.  That self-corrects at its next real
+ * hv_exc_exit(); a transient timebase skew is a far smaller problem than the
+ * one being fixed.
+ */
+static void hv_rendezvous_quiesce(void)
+{
+    __atomic_and_fetch(&hv_cpus_in_guest, ~BIT(smp_id()), __ATOMIC_ACQUIRE);
+    spin_lock(&bhl);
+    spin_unlock(&bhl);
+    hv_maybe_exit();
+    __atomic_or_fetch(&hv_cpus_in_guest, BIT(smp_id()), __ATOMIC_ACQUIRE);
+}
+
 static void hv_exc_entry(void)
 {
     // Enable SErrors in the HV, but only if not already pending
@@ -2535,27 +2606,34 @@ void hv_exc_sync(struct exc_info *ctx)
         hv_wdt_breadcrumb('#');
         ctx->elr += 4;
         hv_set_elr(ctx->elr);
-        hv_update_fiq(ctx);
         /*
          * This return path is invisible to hv_rendezvous(): hv_cpus_in_guest is
          * cleared only by hv_exc_entry() below, which we are about to skip.  A
          * CPU servicing Apple IMPDEF MSR traps back to back therefore stays
          * marked "in guest" indefinitely and any other core's rendezvous spins
-         * out and panics the whole hypervisor -- measured repeatedly on the
-         * J414s, always naming CPU 0, which carries the pure-AIC software timer
-         * reflection and so takes those traps continuously.
+         * out -- measured repeatedly on the J414s, at first always naming CPU 0,
+         * which carries the pure-AIC software timer reflection and so takes
+         * those traps continuously.  Both arms of the `handled` switch are
+         * implicated: a later capture caught CPU 5 stuck here on the plain
+         * ESR_EC_MSR arm (breadcrumbs `sSm#sSm#`), not just ESR_EC_IMPDEF.
          *
          * Take the slow round trip only while a rendezvous is outstanding.
          * hv_exc_entry() clears the bit BEFORE it blocks on bhl, so the waiting
          * CPU is released immediately and we then queue on the lock exactly
          * like a CPU that arrived via the FIQ slow path.  When no rendezvous is
-         * pending this costs one relaxed load and the fast path is unchanged.
+         * pending this costs one acquire load and the fast path is unchanged.
+         *
+         * Check before hv_update_fiq(): hv_exc_exit() runs it for us, and the
+         * slow path below already relies on that single call, so this keeps the
+         * two paths byte-for-byte equivalent in what they do to FIQ state
+         * instead of running the level maintenance twice.
          */
-        if (__atomic_load_n(&hv_rendezvous_pending, __ATOMIC_ACQUIRE)) {
+        if (hv_rendezvous_requested()) {
             hv_exc_entry();
             hv_exc_exit(ctx);
             return;
         }
+        hv_update_fiq(ctx);
         hv_wdt_breadcrumb('s');
         return;
     }
@@ -2599,6 +2677,34 @@ void hv_exc_sync(struct exc_info *ctx)
 
 void hv_exc_irq(struct exc_info *ctx)
 {
+    /*
+     * Breadcrumb every entry.  Under ENABLE_VGIC_MODULE this vector used to
+     * emit nothing at all on any path, which made a CPU spinning in here
+     * indistinguishable from a CPU taking no traps whatsoever -- and both leave
+     * hv_cpus_in_guest set, so both look identical to hv_rendezvous().  That
+     * ambiguity is precisely what could not be resolved from the J414s capture
+     * where CPU 6's trail was frozen at `57*89+xs`.  One breadcrumb per entry
+     * makes the next capture decisive: a trail ending in 'I', or alternating
+     * with 'I', means the CPU was in this vector rather than out in the guest.
+     */
+    hv_wdt_breadcrumb('I');
+
+    /*
+     * Answer an outstanding rendezvous before touching any AIC, carrier or HCR
+     * state.  Every exit from this function returns to the guest without
+     * hv_exc_entry() (see hv_rendezvous_quiesce() for the full enumeration and
+     * for why the full round trip is not safe here), and two of those paths
+     * printf(), which at console speeds outlasts any sane rendezvous budget
+     * with FIQs masked the whole time.
+     *
+     * Doing it at the top, before any mutation, is what makes this safe: no
+     * native-AIC handshake state has been read or written yet, and the physical
+     * source is still level-asserted and untouched, so the vector simply
+     * resumes normally once the requesting CPU releases bhl.
+     */
+    if (hv_rendezvous_requested())
+        hv_rendezvous_quiesce();
+
     hv_carrier_observe_x18(ctx);
 #ifdef ENABLE_VGIC_MODULE
 #ifdef ENABLE_NATIVE_AIC_PASSTHROUGH
@@ -2792,7 +2898,7 @@ void hv_exc_irq(struct exc_info *ctx)
         virq_queue_push(&PERCPU(irq_queue), &pending);
     }
 #else
-    hv_wdt_breadcrumb('I');
+    /* The 'I' breadcrumb is now emitted at function entry, for every build. */
     hv_get_context(ctx);
     hv_exc_entry();
     hv_exc_proxy(ctx, START_EXCEPTION_LOWER, EXC_IRQ, NULL);
@@ -2851,7 +2957,23 @@ void hv_exc_fiq(struct exc_info *ctx)
         hv_guest_ipi_retry_tick();
 #endif
 
-    if (smp_id() != interruptible_cpu && !(mrs(ISR_EL1) & 0x40) && hv_want_cpu == -1) {
+    /*
+     * The fast path below is the second half of the same hole 575ca6c9 closed in
+     * hv_exc_sync(): it returns straight to the guest without hv_exc_entry(), so
+     * this CPU stays marked in-guest no matter how many FIQs it retires here.
+     * It is worse than the sync one in two ways -- it emits no breadcrumb, and
+     * it re-arms with hv_secondary_tick_interval, which is a full second under
+     * ECV, so a CPU that hides here has no self-collection fallback at all.
+     *
+     * When a rendezvous is outstanding, do not take it: fall through to the slow
+     * path, which is the existing, well-understood collection path and leaves an
+     * 'F' in the trail.  That is deliberately preferred over bolting an
+     * entry/exit pair on here -- it adds no new code path, avoids running
+     * hv_update_fiq() twice, and the extra work is only ever paid while another
+     * CPU is already stopped waiting for us.  Cost when idle: one acquire load.
+     */
+    if (smp_id() != interruptible_cpu && !(mrs(ISR_EL1) & 0x40) && hv_want_cpu == -1 &&
+        !hv_rendezvous_requested()) {
         // Non-interruptible CPU and it was just a timer tick (or spurious), so just update FIQs
         hv_get_context(ctx);
         hv_update_fiq(ctx);
