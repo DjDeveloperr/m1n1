@@ -96,8 +96,41 @@ static void hv_configure_guest_wfi_mode(void)
            FIELD_GET(CYC_OVRD_WFI_MODE_MASK, value), smp_id(), value);
 }
 
+/*
+ * research/native-el2 DIAGNOSTIC ONLY -- see
+ * apple_silicon_nt_drivers/docs/native-el2-windows-feasibility.md, "Experiment E1".
+ *
+ * Reads four architectural ID registers and decodes the four fields that decide
+ * whether a native-EL2 / Hyper-V design is even possible on this silicon.  Pure
+ * MRS reads of RO registers: no hardware state is changed, nothing is written,
+ * and removing this function restores byte-identical behaviour.
+ *
+ *   ID_AA64MMFR2_EL1.NV      (27:24)  0 = none, 1 = FEAT_NV, 2 = FEAT_NV2
+ *   ID_AA64MMFR4_EL1.NV_frac (27:24)  1 = FEAT_NV2 only, when MMFR2.NV == 0
+ *   ID_AA64PFR0_EL1.GIC      (27:24)  0 = no GICv3 sysreg CPU interface
+ *   ID_AA64MMFR1_EL1.VH      (11:8)   1 = FEAT_VHE
+ *   ID_AA64PFR0_EL1.EL2/EL3  (11:8)/(15:12)
+ */
+static void hv_el2_research_dump_id_regs(void)
+{
+    u64 pfr0 = mrs(ID_AA64PFR0_EL1);
+    u64 mmfr1 = mrs(SYS_ID_AA64MMFR1_EL1);
+    u64 mmfr2 = mrs(SYS_ID_AA64MMFR2_EL1);
+    u64 mmfr4 = mrs(SYS_ID_AA64MMFR4_EL1);
+
+    printf("EL2RESEARCH: ID_AA64PFR0_EL1  = 0x%016lx\n", pfr0);
+    printf("EL2RESEARCH: ID_AA64MMFR1_EL1 = 0x%016lx\n", mmfr1);
+    printf("EL2RESEARCH: ID_AA64MMFR2_EL1 = 0x%016lx\n", mmfr2);
+    printf("EL2RESEARCH: ID_AA64MMFR4_EL1 = 0x%016lx\n", mmfr4);
+    printf("EL2RESEARCH: NV=%lu NV_frac=%lu GIC=%lu VH=%lu EL2=%lu EL3=%lu\n",
+           FIELD_GET(GENMASK(27, 24), mmfr2), FIELD_GET(GENMASK(27, 24), mmfr4),
+           FIELD_GET(ID_AA64PFR0_EL1_GIC, pfr0), FIELD_GET(GENMASK(11, 8), mmfr1),
+           FIELD_GET(GENMASK(11, 8), pfr0), FIELD_GET(GENMASK(15, 12), pfr0));
+}
+
 void hv_init(void)
 {
+    hv_el2_research_dump_id_regs();
     pcie_shutdown();
     // Relinquish every USB controller except the one carrying this proxy.
     // The guest can then reset those DWC3 blocks into host mode and own their

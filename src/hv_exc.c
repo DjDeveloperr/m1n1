@@ -2801,11 +2801,46 @@ void hv_exc_irq(struct exc_info *ctx)
 #endif
 }
 
+/*
+ * research/native-el2 DIAGNOSTIC ONLY -- see
+ * apple_silicon_nt_drivers/docs/native-el2-windows-feasibility.md, "Experiment E2".
+ *
+ * HCR_EL2.FMO routes physical FIQ to EL2 regardless of the guest's own PSTATE.F,
+ * so SPSR_EL2.F captured here is exactly the mask the guest WOULD have applied if
+ * m1n1 stopped trapping FIQ.  If this reports F=1 for every sample once Windows is
+ * up, then a loader-only m1n1 cannot deliver the Apple timer to Windows at all --
+ * patching NT's FIQ vector would not help, because the FIQ would never be taken.
+ *
+ * Read-only: samples SPSR and prints.  Bounded to the first few samples per CPU so
+ * it cannot flood the UART or perturb timing for the rest of the boot.
+ */
+#define EL2RESEARCH_FIQ_SAMPLES 4
+static u8 el2research_fiq_seen[MAX_CPUS];
+
+static void hv_el2_research_sample_guest_daif(void)
+{
+    int cpu = smp_id();
+
+    if (cpu >= MAX_CPUS || el2research_fiq_seen[cpu] >= EL2RESEARCH_FIQ_SAMPLES)
+        return;
+
+    el2research_fiq_seen[cpu]++;
+
+    u64 spsr = hv_get_spsr();
+
+    /* SPSR_EL2 AArch64: D=BIT(9) A=BIT(8) I=BIT(7) F=BIT(6), M[3:0]=target EL/SP. */
+    printf("EL2RESEARCH: cpu%d guest PSTATE at FIQ: SPSR=0x%lx D=%lu A=%lu I=%lu F=%lu "
+           "M=0x%lx elr=0x%lx x18=0x%lx\n",
+           cpu, spsr, (spsr >> 9) & 1, (spsr >> 8) & 1, (spsr >> 7) & 1, (spsr >> 6) & 1,
+           spsr & 0xf, hv_get_elr(), mrs(TPIDR_EL1));
+}
+
 void hv_exc_fiq(struct exc_info *ctx)
 {
     bool tick = false;
 
     hv_maybe_exit();
+    hv_el2_research_sample_guest_daif();
 
     //
     // windows-native-aic: the stale TODO that used to sit here ("inject the FIQ to the
